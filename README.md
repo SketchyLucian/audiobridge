@@ -1,0 +1,136 @@
+# AudioBridge
+
+AudioBridge is a Flutter frontend for a LAN audio relay app targeting Windows
+and Android. The current build includes the product UI, connection state,
+UDP source discovery, USB tethering, USB cable mode, Simple/Advanced audio
+settings, live latency metrics, and native method-channel seams for platform
+audio engines.
+
+## Current Scope
+
+- Windows sender and receiver mode UI
+- Android Wi-Fi sender and receiver mode UI
+- UDP LAN discovery on port `47884`
+- Audio streaming on port `47885`
+- USB tethering mode that uses the phone's USB network interface with UDP
+  discovery/audio
+- Native USB cable audio streaming over Android Open Accessory bulk endpoints
+- Native USB low-latency profile: 48 kHz stereo, 6 ms sender buffer, adaptive
+  receiver buffer starting at 6 ms, and 1 ms packets
+- USB tethering low-latency profile: 48 kHz stereo, 12 ms sender buffer,
+  24 ms receiver buffer, and 2 ms packets
+- Sender-side audio modes for Gaming, Balanced, Music, and saved Custom.
+  Modes travel with the stream and affect receiver adaptive-buffer limits, not
+  just default slider values.
+- Adaptive sender tuning that starts from the Gaming profile, watches receiver
+  underruns, queue pressure, packet loss/drop counters, trims, and latency
+  metrics, then changes receiver buffer and packet time in real time without
+  changing the active audio format
+- Advanced sender-side settings for sender capture buffer, receiver playback
+  buffer, packet time, active codec path, mute, and volume. Receivers apply the
+  profile advertised by the sender.
+- Android `AudioTrack` playback backend for UDP audio packets
+- Android `AudioRecord` microphone capture backend for UDP audio packets
+- Windows WASAPI loopback capture backend for UDP audio packets
+
+The native audio capture/playback engines are isolated behind
+`audio_bridge/native_engine`. The working native codec paths are PCM, Opus,
+AAC-LC, G.711 mu-law, G.711 A-law, and IMA ADPCM over UDP, USB tethering, or
+native USB accessory bulk transfer. Higher-complexity codec options remain in the Flutter model
+until native encoder/decoder integration is added.
+
+## Project Layout
+
+- `lib/app`: app shell and theme
+- `lib/features/audio_relay/domain`: relay models and profile data
+- `lib/features/audio_relay/data`: UDP discovery and native engine adapter
+- `lib/features/audio_relay/application`: session controller
+- `lib/features/audio_relay/presentation`: Flutter dashboard UI
+- `android/app/src/main/kotlin`: Android method-channel entry point
+- `windows/runner`: Windows method-channel entry point
+
+## Run
+
+```powershell
+flutter pub get
+flutter run -d windows
+```
+
+For Android, connect a device or start an emulator:
+
+```powershell
+flutter devices
+flutter run -d <android-device-id>
+```
+
+For USB tethering, enable USB tethering on Android, keep the device attached,
+and select `USB tether` in both apps. The sender and receiver still use UDP
+discovery and UDP audio, but over the tethered USB network interface instead of
+Wi-Fi.
+
+For native USB cable audio between Windows and a physical Android device, keep
+the device attached, select `Native USB` on both apps, choose the sender and
+receiver roles, then start audio. On Android, approve the AudioBridge accessory
+prompt. Wi-Fi mode still uses LAN discovery and UDP audio. Windows may need the
+Android accessory interface bound to the WinUSB driver before native USB can
+open.
+
+## Native Engine Contract
+
+Flutter calls the `audio_bridge/native_engine` method channel:
+
+- `getCapabilities`
+- `getMetrics`
+- `prepareSender`
+- `prepareUsbSender`
+- `prepareUsbReceiver`
+- `prepareReceiver`
+- `connectToSender`
+- `startStream`
+- `stopStream`
+- `setVolume`
+- `setMuted`
+- `disconnect`
+
+Implemented behind that channel:
+
+- Windows: WASAPI loopback capture, PCM16 conversion, PCM/G.711/IMA ADPCM
+  encoding, receiver playback, UDP packet streaming, USB tethering via the
+  normal UDP path, and Android Open Accessory USB bulk streaming in sender or
+  receiver role.
+- Android: microphone capture sender over Wi-Fi/USB tethering, receiver
+  subscription, UDP packet receive loop, adaptive `AudioTrack` playback,
+  PCM/G.711/IMA ADPCM encoding and decoding, USB tethering via the normal UDP
+  path, native USB accessory sender/receiver loops, mute, and volume.
+- Gaming profile: responsiveness/stability tuning, smaller UDP packets, Windows
+  MMCSS capture priority, Android low-latency `AudioTrack`, non-blocking
+  writes, and live Android output-buffer latency reporting.
+- Sender metrics: Android includes estimated audio latency, playback-buffer
+  latency, network latency, and drop/loss counters in its subscribe heartbeat
+  so the Windows sender can show send-to-play latency while streaming.
+- Audio latency metric: v3 audio packets carry sender monotonic timestamps and
+  echoed receiver timing probes. Android estimates one-way sender-send to
+  receiver-playback latency from those probes plus the current `AudioTrack`
+  playback queue. The UI falls back to playback-buffer latency until the
+  end-to-end estimate is available.
+- Advanced transport controls: the sender controls the receiver playback
+  buffer and UDP packet time. PCM, Opus, AAC-LC, G.711 mu-law, G.711 A-law, and
+  IMA ADPCM are implemented; FLAC, MP3, Vorbis, ALAC, and LC3 are visible as
+  unavailable codec paths until native encoders/decoders are added.
+- Tight Wi-Fi transport: low-delay UDP socket options, smaller kernel socket
+  queues, faster receiver heartbeats, 1 ms gaming packets, and receiver-side
+  stale-audio drop/trim logic to keep playback from drifting behind.
+- Tight USB tethering transport: wired-network discovery, UDP audio over the
+  phone's tether interface, and a lower-latency default profile than Wi-Fi.
+- Tight native USB transport: USB bulk packet framing, lower Windows capture
+  minimums, zero-copy Android PCM writes for normal playback, and receiver-side
+  adaptive buffering that raises only after underrun bursts or sustained low
+  queue pressure, with low-latency profiles capped before they drift into
+  high-delay playback.
+
+Remaining production work:
+
+- Jitter buffer and packet-loss handling.
+- Native encoders/decoders for FLAC, MP3, Vorbis, ALAC, and LC3.
+- Android audio focus and foreground-service handling.
+- Windows firewall guidance and explicit output-device selection.
