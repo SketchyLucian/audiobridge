@@ -1913,6 +1913,12 @@ class WindowsAudioEngine::Impl {
       return metrics;
     }
 
+    const bool capture_running = capture_running_.load();
+    if (capture_running) {
+      metrics[flutter::EncodableValue("signalLevel")] =
+          flutter::EncodableValue(TakeSignalLevel());
+    }
+
     const int64_t received_at = remote_metrics_received_at_ms_.load();
     const double output_latency_ms = remote_output_latency_ms_.load();
     const double audio_latency_ms = remote_audio_latency_ms_.load();
@@ -1962,8 +1968,10 @@ class WindowsAudioEngine::Impl {
         flutter::EncodableValue(remote_lost_packet_count_.load());
     metrics[flutter::EncodableValue("trimCount")] =
         flutter::EncodableValue(remote_trim_count_.load());
-    metrics[flutter::EncodableValue("signalLevel")] =
-        flutter::EncodableValue(TakeSignalLevel());
+    if (!capture_running) {
+      metrics[flutter::EncodableValue("signalLevel")] =
+          flutter::EncodableValue(TakeSignalLevel());
+    }
     {
       std::scoped_lock lock(remote_capabilities_mutex_);
       if (!remote_platform_.empty()) {
