@@ -17,11 +17,15 @@ class AudioRelayController extends ChangeNotifier {
     AudioProfileStore? profileStore,
     @visibleForTesting
     Duration profileApplyDelay = const Duration(milliseconds: 250),
+    @visibleForTesting Duration autoCodecWarmup = const Duration(seconds: 60),
+    @visibleForTesting Duration autoCodecQuietHold = const Duration(seconds: 3),
   }) : _engine = engine ?? const MethodChannelAudioRelayEngine(),
        _discoveryService = discoveryService ?? DiscoveryService(),
        _profileStore =
            profileStore ?? const SharedPreferencesAudioProfileStore(),
        _profileApplyDelay = profileApplyDelay,
+       _autoCodecWarmup = autoCodecWarmup,
+       _autoCodecQuietHold = autoCodecQuietHold,
        profile = AudioPreset.balanced.profile,
        role = _defaultRole(),
        localDeviceName = _defaultDeviceName();
@@ -30,6 +34,8 @@ class AudioRelayController extends ChangeNotifier {
   final DiscoveryService _discoveryService;
   final AudioProfileStore _profileStore;
   final Duration _profileApplyDelay;
+  final Duration _autoCodecWarmup;
+  final Duration _autoCodecQuietHold;
   RelayRole role;
   RelayTransport transport = RelayTransport.wifi;
   RelayActivity activity = RelayActivity.idle;
@@ -50,11 +56,19 @@ class AudioRelayController extends ChangeNotifier {
   Timer? _meterTimer;
   Timer? _profileApplyTimer;
   AudioProfile? _appliedSenderProfile;
+  AudioCodec _autoResolvedCodec = AudioCodec.pcm;
+  DateTime? _autoCodecStartedAt;
+  DateTime? _autoCodecQuietSince;
+  DateTime? _autoCodecLastSwitchAt;
+  _AutoCodecMetricsSnapshot? _autoCodecBaseline;
+  bool _autoCodecApplyInFlight = false;
   bool _metricsPollInFlight = false;
   bool _profileApplyPending = false;
   bool _profileApplyInFlight = false;
   AudioProfile _savedCustomProfile = AudioPreset.custom.profile;
   static const _nativeUsbSourceId = 'native-usb-source';
+  static const _autoCodecSwitchCooldown = Duration(seconds: 30);
+  static const _autoCodecQuietSignalThreshold = 0.015;
 
   bool get isBusy => activity == RelayActivity.connecting;
 
@@ -62,8 +76,13 @@ class AudioRelayController extends ChangeNotifier {
 
   bool get canEditAudioSettings => role == RelayRole.sender && !isBusy;
 
+  bool get canEditRestartRequiredAudioSettings =>
+      canEditAudioSettings && !isStreaming;
+
+  bool get canEditLiveAudioSettings => canEditAudioSettings;
+
   bool get canEditReceiverOutputBackend =>
-      role == RelayRole.receiver && !isBusy;
+      role == RelayRole.receiver && !isBusy && !isStreaming;
 
   bool get isNativeUsbTransport => transport == RelayTransport.usb;
 
@@ -169,11 +188,6 @@ class AudioRelayController extends ChangeNotifier {
           ? 'High fidelity, relaxed response'
           : 'High fidelity, moderate response';
     }
-    if (profile.channels == 1) {
-      return effectiveLatencyMs <= 45
-          ? 'Voice/game focused, very responsive'
-          : 'Voice/game focused, stable';
-    }
     if (effectiveLatencyMs <= 60 && profile.packetTimeMs <= 3) {
       return 'Responsive stereo, light buffering';
     }
@@ -195,7 +209,7 @@ class AudioRelayController extends ChangeNotifier {
     final outputBackends = capabilities.supportedOutputBackends
         .map((backend) => backend.label)
         .join(', ');
-    return 'Current engine controls: receiver adaptive buffer, sample rate, mono/stereo, codec ($codecs), sender buffer, receiver buffer, packet time, volume, mute, and role/discovery. Receiver output backends: $outputBackends.';
+    return 'Current engine controls: receiver adaptive buffer, sample rate, stereo format, codec ($codecs), sender buffer, receiver buffer, packet time, volume, mute, and role/discovery. Receiver output backends: $outputBackends.';
   }
 
   String get liveLatencyLabel {
@@ -211,7 +225,16 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   String get profileSummary {
-    return '${profile.codec.label} · $sampleRateLabel · $channelModeLabel';
+    return '$codecStatusLabel · $sampleRateLabel · $channelModeLabel';
+  }
+
+  String get codecStatusLabel {
+    if (profile.codec != AudioCodec.auto) {
+      return profile.codec.label;
+    }
+    return isStreaming
+        ? 'Auto (${_autoResolvedCodec.label})'
+        : 'Auto (${AudioCodec.pcm.label} first)';
   }
 
   String get outputBackendLabel {
@@ -270,7 +293,7 @@ class AudioRelayController extends ChangeNotifier {
 
   String get receiverAdaptiveBufferDetailLabel {
     return profile.receiverAdaptiveBuffer
-        ? 'Can grow to a latency cap on bursts or sustained low queue.'
+        ? 'Tracks packet jitter, underruns, and sustained low queue.'
         : 'Keeps the requested target.';
   }
 
@@ -327,10 +350,13 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   String get streamBitrateLabel {
-    return '${profile.effectiveBitrateKbps} kbps';
+    return '${_displayProfile.effectiveBitrateKbps} kbps';
   }
 
   String get streamBitrateFormatLabel {
+    if (profile.codec == AudioCodec.auto) {
+      return 'Auto target';
+    }
     return switch (profile.codec) {
       AudioCodec.pcm => 'PCM 16-bit',
       AudioCodec.opus => 'Opus target',
@@ -538,17 +564,18 @@ class AudioRelayController extends ChangeNotifier {
         await _refreshLocalAddress(requireUsable: true);
       }
       if (role == RelayRole.sender) {
+        final senderProfile = _materializedSenderProfile(profile);
         if (isUsbTunnelTransport) {
-          await _engine.prepareUsbSender(profile);
-          _appliedSenderProfile = profile;
+          await _engine.prepareUsbSender(senderProfile);
+          _appliedSenderProfile = senderProfile;
           activity = RelayActivity.advertising;
         } else {
           await _engine.prepareSender(
-            profile,
+            senderProfile,
             networkBindAddress: _networkBindAddress,
           );
-          _appliedSenderProfile = profile;
-          await _startAdvertisingCurrentProfile();
+          _appliedSenderProfile = senderProfile;
+          await _startAdvertisingCurrentProfile(senderProfile);
           activity = RelayActivity.advertising;
         }
       } else {
@@ -583,16 +610,18 @@ class AudioRelayController extends ChangeNotifier {
     notifyListeners();
 
     try {
+      _resetAutoCodecSession();
+      final senderProfile = _materializedSenderProfile(profile);
       if (isUsbTunnelTransport) {
-        await _engine.prepareUsbSender(profile);
+        await _engine.prepareUsbSender(senderProfile);
       } else {
         await _engine.prepareSender(
-          profile,
+          senderProfile,
           networkBindAddress: _networkBindAddress,
         );
       }
-      await _engine.startStream(profile);
-      _appliedSenderProfile = profile;
+      await _engine.startStream(senderProfile);
+      _appliedSenderProfile = senderProfile;
       activity = RelayActivity.streaming;
       _startMeters();
       notifyListeners();
@@ -633,6 +662,7 @@ class AudioRelayController extends ChangeNotifier {
   Future<void> stopStream() async {
     await _engine.stopStream();
     _stopMeters();
+    _resetAutoCodecSession();
     signalLevel = 0;
 
     if (role == RelayRole.sender) {
@@ -657,6 +687,7 @@ class AudioRelayController extends ChangeNotifier {
     await _discoveryService.dispose();
     _stopMeters();
     _appliedSenderProfile = null;
+    _resetAutoCodecSession();
     activity = RelayActivity.idle;
     signalLevel = 0;
     notifyListeners();
@@ -670,6 +701,9 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   bool isCodecSupported(AudioCodec codec) {
+    if (codec == AudioCodec.auto) {
+      return _autoCodecLocalCandidates().length > 1;
+    }
     return capabilities.supportsCodec(codec);
   }
 
@@ -678,6 +712,9 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void updatePreset(AudioPreset value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
     selectedPreset = value;
     final nextProfile = value == AudioPreset.custom
         ? _savedCustomProfile
@@ -698,14 +735,20 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void updateCodec(AudioCodec value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
     if (!isCodecSupported(value)) {
       return;
+    }
+    if (profile.codec != value) {
+      _resetAutoCodecSession();
     }
     _updateProfile(_normalizeProfile(profile.copyWith(codec: value)));
   }
 
   void updateOutputBackend(OutputAudioBackend value) {
-    if (role != RelayRole.receiver) {
+    if (!canEditReceiverOutputBackend) {
       return;
     }
     if (!isOutputBackendSupported(value)) {
@@ -718,10 +761,16 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void updateSampleRate(int value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
     _updateProfile(_normalizeProfile(profile.copyWith(sampleRate: value)));
   }
 
   void updateLatency(double value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
     final latencyMs = _clampBufferMs(value);
     _updateProfile(
       profile.copyWith(
@@ -733,6 +782,9 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void updateResponsiveness(double value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
     const minBufferMs = AudioProfile.minBufferMs;
     const maxBufferMs = AudioProfile.maxBufferMs;
     final nextLatencyMs =
@@ -749,14 +801,23 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void updateBitrate(double value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
     _updateProfile(profile.copyWith(bitrateKbps: value.round()));
   }
 
   void updateChannels(int value) {
-    _updateProfile(profile.copyWith(channels: value));
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
+    _updateProfile(_normalizeProfile(profile.copyWith(channels: value)));
   }
 
   void updateCaptureBuffer(double value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
     _updateProfile(profile.copyWith(captureBufferMs: _clampBufferMs(value)));
   }
 
@@ -817,6 +878,7 @@ class AudioRelayController extends ChangeNotifier {
   void dispose() {
     _meterTimer?.cancel();
     _profileApplyTimer?.cancel();
+    _resetAutoCodecSession();
     _engine.disconnect();
     _discoveryService.dispose();
     super.dispose();
@@ -868,6 +930,7 @@ class AudioRelayController extends ChangeNotifier {
       metrics = nextMetrics;
       signalLevel = muted ? 0 : nextMetrics.signalLevel ?? 0;
       _syncReceiverProfileFromMetrics(nextMetrics);
+      _updateAutoCodecFromMetrics(nextMetrics);
       if (isStreaming) {
         notifyListeners();
       }
@@ -894,6 +957,10 @@ class AudioRelayController extends ChangeNotifier {
     _saveCustomProfileIfNeeded(profile);
     notifyListeners();
     _scheduleActiveProfileApply();
+  }
+
+  bool _canChangeRestartRequiredSenderSetting() {
+    return role != RelayRole.sender || !isStreaming;
   }
 
   void _syncReceiverProfileFromMetrics(AudioRelayMetrics nextMetrics) {
@@ -930,6 +997,7 @@ class AudioRelayController extends ChangeNotifier {
     final customProfile = sourceProfile.copyWith(
       mode: AudioPreset.custom,
       outputBackend: OutputAudioBackend.auto,
+      channels: 2,
     );
     final capMs = _effectiveAdaptiveBufferCap(customProfile);
     return customProfile.copyWith(adaptiveBufferCapMs: capMs);
@@ -978,12 +1046,15 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   AudioProfile _normalizeProfile(AudioProfile nextProfile) {
-    final normalized = switch (nextProfile.codec) {
+    final formatNormalized = nextProfile.channels == 2
+        ? nextProfile
+        : nextProfile.copyWith(channels: 2);
+    final normalized = switch (formatNormalized.codec) {
       AudioCodec.opus =>
-        nextProfile.sampleRate == 48000
-            ? nextProfile
-            : nextProfile.copyWith(sampleRate: 48000),
-      _ => nextProfile,
+        formatNormalized.sampleRate == 48000
+            ? formatNormalized
+            : formatNormalized.copyWith(sampleRate: 48000),
+      _ => formatNormalized,
     };
 
     if (normalized.mode != AudioPreset.custom) {
@@ -1063,17 +1134,18 @@ class AudioRelayController extends ChangeNotifier {
       return;
     }
 
+    final senderProfile = _materializedSenderProfile(nextProfile);
     if (activity == RelayActivity.advertising) {
       if (isUsbTunnelTransport) {
-        await _engine.prepareUsbSender(nextProfile);
-        _appliedSenderProfile = nextProfile;
+        await _engine.prepareUsbSender(senderProfile);
+        _appliedSenderProfile = senderProfile;
       } else {
         await _engine.prepareSender(
-          nextProfile,
+          senderProfile,
           networkBindAddress: _networkBindAddress,
         );
-        _appliedSenderProfile = nextProfile;
-        await _startAdvertisingCurrentProfile(nextProfile);
+        _appliedSenderProfile = senderProfile;
+        await _startAdvertisingCurrentProfile(senderProfile);
       }
       return;
     }
@@ -1082,60 +1154,284 @@ class AudioRelayController extends ChangeNotifier {
       return;
     }
 
-    if (usesNetworkDiscovery) {
-      await _startAdvertisingCurrentProfile(nextProfile);
+    if (_canUpdateActiveSenderProfileWithoutRestart(senderProfile)) {
+      if (usesNetworkDiscovery) {
+        await _startAdvertisingCurrentProfile(senderProfile);
+      }
+      if (activity != RelayActivity.streaming || role != RelayRole.sender) {
+        return;
+      }
+      if (isUsbTunnelTransport) {
+        await _engine.prepareUsbSender(senderProfile);
+      } else {
+        await _engine.prepareSender(
+          senderProfile,
+          networkBindAddress: _networkBindAddress,
+        );
+      }
+      _appliedSenderProfile = senderProfile;
     }
-    if (activity != RelayActivity.streaming || role != RelayRole.sender) {
-      return;
-    }
-
-    if (_canUpdateActiveSenderProfileWithoutRestart(nextProfile)) {
-      await _engine.prepareSender(
-        nextProfile,
-        networkBindAddress: _networkBindAddress,
-      );
-      _appliedSenderProfile = nextProfile;
-      return;
-    }
-
-    await _engine.stopStream();
-    if (activity != RelayActivity.streaming || role != RelayRole.sender) {
-      return;
-    }
-
-    if (isUsbTunnelTransport) {
-      await _engine.prepareUsbSender(nextProfile);
-    } else {
-      await _engine.prepareSender(
-        nextProfile,
-        networkBindAddress: _networkBindAddress,
-      );
-    }
-    if (activity != RelayActivity.streaming || role != RelayRole.sender) {
-      return;
-    }
-
-    await _engine.startStream(nextProfile);
-    _appliedSenderProfile = nextProfile;
   }
 
-  bool _canUpdateActiveSenderProfileWithoutRestart(AudioProfile nextProfile) {
-    if (isUsbTunnelTransport) {
-      return false;
-    }
-
+  bool _canUpdateActiveSenderProfileWithoutRestart(
+    AudioProfile nextProfile, {
+    bool allowCodecChange = false,
+  }) {
     final currentProfile = _appliedSenderProfile;
     if (currentProfile == null) {
       return false;
     }
 
-    return currentProfile.codec == nextProfile.codec &&
+    return (allowCodecChange || currentProfile.codec == nextProfile.codec) &&
         currentProfile.outputBackend == nextProfile.outputBackend &&
         currentProfile.sampleRate == nextProfile.sampleRate &&
-        currentProfile.effectiveBitrateKbps ==
-            nextProfile.effectiveBitrateKbps &&
+        (allowCodecChange ||
+            currentProfile.effectiveBitrateKbps ==
+                nextProfile.effectiveBitrateKbps) &&
         currentProfile.captureBufferMs == nextProfile.captureBufferMs &&
         currentProfile.channels == nextProfile.channels;
+  }
+
+  void _resetAutoCodecSession() {
+    _autoResolvedCodec = AudioCodec.pcm;
+    _autoCodecStartedAt = null;
+    _autoCodecQuietSince = null;
+    _autoCodecLastSwitchAt = null;
+    _autoCodecBaseline = null;
+    _autoCodecApplyInFlight = false;
+  }
+
+  AudioProfile get _displayProfile {
+    return profile.codec == AudioCodec.auto
+        ? _normalizeProfile(profile.copyWith(codec: _autoResolvedCodec))
+        : profile;
+  }
+
+  AudioProfile _materializedSenderProfile(AudioProfile sourceProfile) {
+    final codec = _effectiveSenderCodecFor(sourceProfile);
+    return _normalizeProfile(sourceProfile.copyWith(codec: codec));
+  }
+
+  AudioCodec _effectiveSenderCodecFor(AudioProfile sourceProfile) {
+    if (sourceProfile.codec != AudioCodec.auto) {
+      return sourceProfile.codec;
+    }
+    if (isStreaming && metrics.remoteSupportedCodecs.isEmpty) {
+      return _autoResolvedCodec;
+    }
+    final candidates = _autoCodecLocalCandidates(
+      remoteSupportedCodecs: metrics.remoteSupportedCodecs,
+      requireRemoteSupport: isStreaming,
+    );
+    return candidates.contains(_autoResolvedCodec)
+        ? _autoResolvedCodec
+        : AudioCodec.pcm;
+  }
+
+  List<AudioCodec> _autoCodecLocalCandidates({
+    Set<AudioCodec> remoteSupportedCodecs = const {},
+    bool requireRemoteSupport = false,
+  }) {
+    final localCodecs = capabilities.supportedCodecs;
+    final remoteKnown = remoteSupportedCodecs.isNotEmpty;
+    final preferredOrder = [
+      AudioCodec.pcm,
+      AudioCodec.opus,
+      AudioCodec.aac,
+      AudioCodec.imaAdpcm,
+      AudioCodec.g711MuLaw,
+      AudioCodec.g711ALaw,
+    ];
+
+    final candidates = <AudioCodec>[
+      for (final codec in preferredOrder)
+        if (localCodecs.contains(codec) &&
+            (!requireRemoteSupport ||
+                (remoteKnown && remoteSupportedCodecs.contains(codec))))
+          codec,
+    ];
+    if (candidates.isEmpty && localCodecs.contains(AudioCodec.pcm)) {
+      return const [AudioCodec.pcm];
+    }
+    return candidates;
+  }
+
+  void _updateAutoCodecFromMetrics(AudioRelayMetrics nextMetrics) {
+    if (role != RelayRole.sender ||
+        !isStreaming ||
+        profile.codec != AudioCodec.auto ||
+        _autoCodecApplyInFlight) {
+      return;
+    }
+
+    final candidates = _autoCodecLocalCandidates(
+      remoteSupportedCodecs: nextMetrics.remoteSupportedCodecs,
+      requireRemoteSupport: true,
+    );
+    if (candidates.length <= 1) {
+      return;
+    }
+
+    final now = DateTime.now();
+    _autoCodecStartedAt ??= now;
+    _autoCodecBaseline ??= _AutoCodecMetricsSnapshot.fromMetrics(nextMetrics);
+
+    final nextCodec = _chooseAutoCodec(nextMetrics, candidates);
+    final warmingUp = now.difference(_autoCodecStartedAt!) < _autoCodecWarmup;
+    if (warmingUp || nextCodec == _autoResolvedCodec) {
+      _autoCodecQuietSince = null;
+      return;
+    }
+
+    final lastSwitchAt = _autoCodecLastSwitchAt;
+    if (lastSwitchAt != null &&
+        now.difference(lastSwitchAt) < _autoCodecSwitchCooldown) {
+      return;
+    }
+
+    if (!_isQuietForAutoCodecSwitch(nextMetrics)) {
+      _autoCodecQuietSince = null;
+      return;
+    }
+
+    _autoCodecQuietSince ??= now;
+    if (now.difference(_autoCodecQuietSince!) < _autoCodecQuietHold) {
+      return;
+    }
+
+    unawaited(_applyAutoCodecSwitch(nextCodec, nextMetrics));
+  }
+
+  AudioCodec _chooseAutoCodec(
+    AudioRelayMetrics nextMetrics,
+    List<AudioCodec> candidates,
+  ) {
+    final pressureScore = _autoCodecPressureScore(nextMetrics);
+    if (pressureScore <= 1) {
+      return AudioCodec.pcm;
+    }
+
+    final compressedPreference = profile.mode == AudioPreset.music
+        ? [
+            AudioCodec.aac,
+            AudioCodec.opus,
+            AudioCodec.imaAdpcm,
+            AudioCodec.g711MuLaw,
+            AudioCodec.g711ALaw,
+          ]
+        : [
+            AudioCodec.opus,
+            AudioCodec.aac,
+            AudioCodec.imaAdpcm,
+            AudioCodec.g711MuLaw,
+            AudioCodec.g711ALaw,
+          ];
+    for (final codec in compressedPreference) {
+      if (candidates.contains(codec)) {
+        return codec;
+      }
+    }
+    return AudioCodec.pcm;
+  }
+
+  int _autoCodecPressureScore(AudioRelayMetrics nextMetrics) {
+    final baseline = _autoCodecBaseline;
+    var score = 0;
+    final underrunsInWindow = nextMetrics.adaptiveUnderrunsInWindow ?? 0;
+    final underrunsInBurst = nextMetrics.adaptiveUnderrunsInBurst ?? 0;
+    if (underrunsInBurst >= 2 || underrunsInWindow >= 3) {
+      score += 2;
+    } else if (underrunsInBurst > 0 || underrunsInWindow > 0) {
+      score += 1;
+    }
+
+    if (baseline != null) {
+      final eventDelta = baseline.eventDelta(nextMetrics);
+      if (eventDelta >= 6) {
+        score += 2;
+      } else if (eventDelta > 0) {
+        score += 1;
+      }
+    }
+
+    final activeBufferMs = nextMetrics.adaptivePlaybackBufferMs;
+    if (activeBufferMs != null) {
+      final growthMs = activeBufferMs - profile.playbackBufferMs;
+      if (growthMs >= 16) {
+        score += 2;
+      } else if (growthMs >= 8) {
+        score += 1;
+      }
+    }
+    if (nextMetrics.adaptiveLimitReached == true) {
+      score += 2;
+    }
+    final lowQueueSamples = nextMetrics.adaptiveLowQueueSamples ?? 0;
+    if (lowQueueSamples >= 3) {
+      score += 1;
+    }
+    final queueFill = nextMetrics.playbackQueueFillPercent;
+    if (queueFill != null && queueFill < 35) {
+      score += 1;
+    }
+    return score;
+  }
+
+  bool _isQuietForAutoCodecSwitch(AudioRelayMetrics nextMetrics) {
+    final signal = muted ? 0 : nextMetrics.signalLevel ?? signalLevel;
+    return signal <= _autoCodecQuietSignalThreshold;
+  }
+
+  Future<void> _applyAutoCodecSwitch(
+    AudioCodec codec,
+    AudioRelayMetrics nextMetrics,
+  ) async {
+    if (_autoCodecApplyInFlight ||
+        role != RelayRole.sender ||
+        activity != RelayActivity.streaming ||
+        profile.codec != AudioCodec.auto ||
+        codec == _autoResolvedCodec) {
+      return;
+    }
+
+    _autoCodecApplyInFlight = true;
+    try {
+      final nextProfile = _normalizeProfile(profile.copyWith(codec: codec));
+      if (!_canUpdateActiveSenderProfileWithoutRestart(
+        nextProfile,
+        allowCodecChange: true,
+      )) {
+        return;
+      }
+      if (usesNetworkDiscovery) {
+        await _startAdvertisingCurrentProfile(nextProfile);
+      }
+      if (activity != RelayActivity.streaming || role != RelayRole.sender) {
+        return;
+      }
+      if (isUsbTunnelTransport) {
+        await _engine.prepareUsbSender(nextProfile);
+      } else {
+        await _engine.prepareSender(
+          nextProfile,
+          networkBindAddress: _networkBindAddress,
+        );
+      }
+      _appliedSenderProfile = nextProfile;
+      _autoResolvedCodec = codec;
+      _autoCodecQuietSince = null;
+      _autoCodecLastSwitchAt = DateTime.now();
+      _autoCodecBaseline = _AutoCodecMetricsSnapshot.fromMetrics(nextMetrics);
+      notifyListeners();
+    } on PlatformException catch (error) {
+      _fail(error.message ?? 'Unable to apply automatic codec.');
+    } on SocketException catch (error) {
+      _fail('Unable to advertise automatic codec: ${error.message}');
+    } on OSError catch (error) {
+      _fail('Unable to advertise automatic codec: ${error.message}');
+    } finally {
+      _autoCodecApplyInFlight = false;
+    }
   }
 
   Future<void> _refreshActiveReceiverProfile() async {
@@ -1169,6 +1465,11 @@ class AudioRelayController extends ChangeNotifier {
     AudioProfile? advertisedProfile,
   ]) async {
     await _refreshLocalAddress(requireUsable: true);
+    final deviceProfile =
+        advertisedProfile ??
+        (role == RelayRole.sender
+            ? _materializedSenderProfile(profile)
+            : profile);
     final localDevice = RelayDevice(
       id: '$localDeviceName-$localAddress',
       name: localDeviceName,
@@ -1176,7 +1477,7 @@ class AudioRelayController extends ChangeNotifier {
       port: DiscoveryService.audioPort,
       transport: transport,
       platform: _currentPlatform(),
-      profile: advertisedProfile ?? profile,
+      profile: deviceProfile,
       lastSeen: DateTime.now(),
     );
     return _discoveryService.startAdvertising(
@@ -1292,9 +1593,6 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   String _detailFeelLabel() {
-    if (profile.channels == 1) {
-      return 'Audio will be mono, so positioning and stereo width are removed.';
-    }
     if (profile.sampleRate >= 96000) {
       return 'Audio keeps the most high-frequency detail available in this app.';
     }
@@ -1370,5 +1668,40 @@ class AudioRelayController extends ChangeNotifier {
       return 'Tethered network load is light, which helps reliability.';
     }
     return 'Network load is light, which helps reliability.';
+  }
+}
+
+class _AutoCodecMetricsSnapshot {
+  const _AutoCodecMetricsSnapshot({
+    required this.underruns,
+    required this.droppedPackets,
+    required this.lostPackets,
+    required this.trims,
+  });
+
+  final int underruns;
+  final int droppedPackets;
+  final int lostPackets;
+  final int trims;
+
+  factory _AutoCodecMetricsSnapshot.fromMetrics(AudioRelayMetrics metrics) {
+    return _AutoCodecMetricsSnapshot(
+      underruns: metrics.underrunCount ?? 0,
+      droppedPackets: metrics.droppedPacketCount ?? 0,
+      lostPackets: metrics.lostPacketCount ?? 0,
+      trims: metrics.trimCount ?? 0,
+    );
+  }
+
+  int eventDelta(AudioRelayMetrics metrics) {
+    return _positiveDelta(metrics.underrunCount, underruns) +
+        _positiveDelta(metrics.droppedPacketCount, droppedPackets) +
+        _positiveDelta(metrics.lostPacketCount, lostPackets) +
+        _positiveDelta(metrics.trimCount, trims);
+  }
+
+  int _positiveDelta(int? current, int previous) {
+    final delta = (current ?? 0) - previous;
+    return delta > 0 ? delta : 0;
   }
 }

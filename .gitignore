@@ -45,3 +45,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# WiX/MSBuild installer intermediates
+/installer/windows/bin/
+/installer/windows/obj/

@@ -1,0 +1,17 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <ProductName>AudioBridge</ProductName>
+    <Manufacturer>AudioBridge</Manufacturer>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">1.0.0</ProductVersion>
+    <UpgradeCode>C42D3507-9335-4A76-BE0C-5B340A2DF79C</UpgradeCode>
+    <ExecutableName>AudioBridge.exe</ExecutableName>
+    <BundleDir Condition="'$(BundleDir)' == ''">$(MSBuildThisFileDirectory)..\..\build\windows\x64\runner\Release</BundleDir>
+    <RepoRoot Condition="'$(RepoRoot)' == ''">$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..'))</RepoRoot>
+    <OutputName>AudioBridge-$(ProductVersion)-x64</OutputName>
+    <OutputPath>$(RepoRoot)\build\installer\</OutputPath>
+    <IntermediateOutputPath>$(RepoRoot)\build\installer\obj\</IntermediateOutputPath>
+    <SuppressIces>ICE60</SuppressIces>
+    <DefineConstants>ProductName=$(ProductName);Manufacturer=$(Manufacturer);ProductVersion=$(ProductVersion);UpgradeCode=$(UpgradeCode);ExecutableName=$(ExecutableName);BundleDir=$(BundleDir);RepoRoot=$(RepoRoot)</DefineConstants>
+  </PropertyGroup>
+</Project>

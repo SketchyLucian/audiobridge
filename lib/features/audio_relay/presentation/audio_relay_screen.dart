@@ -304,7 +304,7 @@ class _ControlPanel extends StatelessWidget {
               _MetricTile(
                 icon: Icons.graphic_eq_rounded,
                 label: 'Codec',
-                value: profile.codec.label,
+                value: controller.codecStatusLabel,
               ),
               _MetricTile(
                 icon: Icons.surround_sound_rounded,
@@ -631,7 +631,9 @@ class _UnifiedAudioSettings extends StatelessWidget {
     const columns = 2;
     final profile = controller.profile;
     final compact = width < 420;
-    final controlsLocked = settingsLocked;
+    final restartRequiredLocked =
+        !controller.canEditRestartRequiredAudioSettings;
+    final liveControlsLocked = !controller.canEditLiveAudioSettings;
 
     final formatControls = [
       _SettingBlock(
@@ -647,7 +649,7 @@ class _UnifiedAudioSettings extends StatelessWidget {
             ButtonSegment(value: 96000, label: Text('96 kHz')),
           ],
           selected: {profile.sampleRate},
-          onSelectionChanged: controlsLocked
+          onSelectionChanged: restartRequiredLocked
               ? null
               : (selection) {
                   controller.updateSampleRate(selection.first);
@@ -657,28 +659,11 @@ class _UnifiedAudioSettings extends StatelessWidget {
       _SettingBlock(
         compact: true,
         title: 'Channels',
-        description:
-            'Stereo keeps left/right audio. Mono cuts bandwidth in half and can be more stable on weak links.',
-        child: SegmentedButton<int>(
-          showSelectedIcon: false,
-          segments: const [
-            ButtonSegment(
-              value: 1,
-              icon: Icon(Icons.speaker_rounded),
-              label: Text('Mono'),
-            ),
-            ButtonSegment(
-              value: 2,
-              icon: Icon(Icons.surround_sound_rounded),
-              label: Text('Stereo'),
-            ),
-          ],
-          selected: {profile.channels},
-          onSelectionChanged: controlsLocked
-              ? null
-              : (selection) {
-                  controller.updateChannels(selection.first);
-                },
+        description: 'All modes keep left/right playback positioning.',
+        child: _ReadoutValue(
+          icon: Icons.surround_sound_rounded,
+          value: 'Stereo',
+          label: controller.channelModeLabel,
         ),
       ),
       _SettingBlock(
@@ -696,10 +681,10 @@ class _UnifiedAudioSettings extends StatelessWidget {
         compact: true,
         title: 'Codec',
         description:
-            'PCM has the least codec delay. Opus targets real-time streaming on weaker links.',
+            'Auto learns the link for 60 seconds, then changes codec only during silence or very quiet audio.',
         child: _CodecPicker(
           codec: profile.codec,
-          enabled: !controlsLocked,
+          enabled: !restartRequiredLocked,
           onChanged: controller.updateCodec,
           isSupported: controller.isCodecSupported,
         ),
@@ -719,7 +704,9 @@ class _UnifiedAudioSettings extends StatelessWidget {
           divisions: AudioProfile.maxBufferMs - AudioProfile.minBufferMs,
           valueLabel: '${profile.captureBufferMs} ms',
           detail: controller.captureBufferFramesLabel,
-          onChanged: controlsLocked ? null : controller.updateCaptureBuffer,
+          onChanged: restartRequiredLocked
+              ? null
+              : controller.updateCaptureBuffer,
         ),
       ),
       _SettingBlock(
@@ -734,7 +721,9 @@ class _UnifiedAudioSettings extends StatelessWidget {
           divisions: AudioProfile.maxBufferMs - AudioProfile.minBufferMs,
           valueLabel: '${profile.playbackBufferMs} ms',
           detail: controller.receiverBufferDetailLabel,
-          onChanged: controlsLocked ? null : controller.updatePlaybackBuffer,
+          onChanged: liveControlsLocked
+              ? null
+              : controller.updatePlaybackBuffer,
         ),
       ),
       _SettingBlock(
@@ -745,7 +734,7 @@ class _UnifiedAudioSettings extends StatelessWidget {
           value: profile.receiverAdaptiveBuffer,
           valueLabel: controller.receiverAdaptiveBufferLabel,
           detail: controller.receiverAdaptiveBufferDetailLabel,
-          onChanged: controlsLocked
+          onChanged: liveControlsLocked
               ? null
               : controller.updateReceiverAdaptiveBuffer,
         ),
@@ -763,7 +752,7 @@ class _UnifiedAudioSettings extends StatelessWidget {
             divisions: AudioProfile.maxBufferMs - AudioProfile.minBufferMs,
             valueLabel: '${controller.customAdaptiveCapMs} ms',
             detail: controller.customAdaptiveCapDetailLabel,
-            onChanged: controlsLocked
+            onChanged: liveControlsLocked
                 ? null
                 : controller.updateAdaptiveBufferCap,
           ),
@@ -781,7 +770,7 @@ class _UnifiedAudioSettings extends StatelessWidget {
               AudioProfile.maxPacketTimeMs - AudioProfile.minPacketTimeMs,
           valueLabel: '${profile.packetTimeMs} ms',
           detail: controller.packetFramesLabel,
-          onChanged: controlsLocked ? null : controller.updatePacketTime,
+          onChanged: liveControlsLocked ? null : controller.updatePacketTime,
         ),
       ),
     ];
@@ -791,7 +780,7 @@ class _UnifiedAudioSettings extends StatelessWidget {
       children: [
         _PresetPicker(
           controller: controller,
-          settingsLocked: settingsLocked,
+          settingsLocked: restartRequiredLocked,
           compact: compact,
         ),
         const SizedBox(height: 8),
@@ -1130,6 +1119,7 @@ class _CodecPicker extends StatelessWidget {
 
   static IconData _codecIcon(AudioCodec codec) {
     return switch (codec) {
+      AudioCodec.auto => Icons.auto_awesome_rounded,
       AudioCodec.pcm => Icons.blur_linear_rounded,
       AudioCodec.opus => Icons.compress_rounded,
       AudioCodec.aac => Icons.queue_music_rounded,

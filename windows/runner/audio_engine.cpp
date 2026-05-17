@@ -32,7 +32,9 @@
 #include "opus.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -105,7 +107,10 @@ constexpr int kLowDelayTrafficClass = 0xB8;
 constexpr int kAudioSocketBufferBytes = 256 * 1024;
 constexpr int kMinBufferMs = 5;
 constexpr int kMaxBufferMs = 500;
+constexpr int kLowLatencyPerformanceMaxMs = 80;
+constexpr int64_t kSourceIdleTimeoutMs = 1200;
 constexpr char kSubscribePrefix[] = "ABR_SUBSCRIBE";
+constexpr char kReceiverSupportedCodecs[] = "pcm";
 constexpr uint16_t kAoaGetProtocol = 51;
 constexpr uint16_t kAoaSendString = 52;
 constexpr uint16_t kAoaStart = 53;
@@ -154,6 +159,32 @@ constexpr int kOpusShortFrameSamples =
 constexpr int kOpusLongFrameSamples =
     kOpusSampleRate * kOpusLongFrameMs / 1000;
 constexpr int kOpusMaxPacketBytes = 4000;
+constexpr int64_t kSequenceModulus = 0x100000000LL;
+constexpr int kAdaptiveBufferCooldownMs = 1500;
+constexpr int kAdaptiveBufferRelaxMs = 6000;
+constexpr int kAdaptiveBufferFastRelaxMs = 2500;
+constexpr int kAdaptiveUnderrunSlowWindowMs = 15000;
+constexpr int kAdaptiveAcceptableUnderrunsPerSlowWindow = 4;
+constexpr int kAdaptiveUnderrunBurstWindowMs = 2000;
+constexpr int kAdaptiveAcceptableUnderrunsPerBurst = 3;
+constexpr int kAdaptiveLowQueueSamplesToIncrease = 5;
+constexpr int64_t kAdaptiveLowQueueDivisor = 4;
+constexpr int kAdaptiveLowLatencyStepMs = 4;
+constexpr int kAdaptiveBalancedStepMs = 8;
+constexpr int kAdaptiveStableStepMs = 20;
+constexpr int kAdaptiveUltraLowLatencyCapMs = 24;
+constexpr int kAdaptiveGamingCapMs = 30;
+constexpr int kAdaptiveBalancedCapMs = 160;
+constexpr int64_t kAdaptiveDelaySampleIntervalMs = 500;
+constexpr size_t kAdaptiveDelayHistorySamples = 32;
+constexpr size_t kAdaptiveDelayMinHistorySamples = 4;
+constexpr double kAdaptiveDelayQuantile = 0.75;
+constexpr int kAdaptiveDelayHeadroomNumerator = 3;
+constexpr int kAdaptiveDelayHeadroomDenominator = 5;
+constexpr double kAdaptiveDelayMaxMs = 2000.0;
+constexpr int64_t kAdaptiveSequenceResetGap = 50;
+constexpr int kAdaptiveNetworkTargetHysteresisMs = 3;
+constexpr int kAdaptiveFastRelaxMarginMs = 8;
 
 DEFINE_GUID(kAndroidWinUsbInterfaceGuid, 0xf72fe0d4, 0xcbcb, 0x407d, 0x88,
             0x14, 0x9e, 0xd6, 0x73, 0xd0, 0xdd, 0x6b);
@@ -658,6 +689,61 @@ std::optional<int64_t> ParseIntMetric(const std::string& message,
   return static_cast<int64_t>(value);
 }
 
+std::optional<std::string> ParseStringMetric(const std::string& message,
+                                             const char* key) {
+  const std::string token = std::string(key) + "=";
+  const size_t position = message.find(token);
+  if (position == std::string::npos) {
+    return std::nullopt;
+  }
+
+  const size_t value_start = position + token.size();
+  const size_t value_end = message.find(' ', value_start);
+  std::string value = message.substr(
+      value_start,
+      value_end == std::string::npos ? std::string::npos
+                                     : value_end - value_start);
+  value.erase(value.begin(),
+              std::find_if(value.begin(), value.end(), [](unsigned char c) {
+                return !std::isspace(c);
+              }));
+  value.erase(std::find_if(value.rbegin(), value.rend(),
+                           [](unsigned char c) { return !std::isspace(c); })
+                  .base(),
+              value.end());
+  if (value.empty()) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::vector<std::string> SplitMetricList(const std::string& value) {
+  std::vector<std::string> result;
+  size_t start = 0;
+  while (start <= value.size()) {
+    const size_t end = value.find(',', start);
+    std::string item =
+        value.substr(start, end == std::string::npos ? std::string::npos
+                                                     : end - start);
+    item.erase(item.begin(),
+               std::find_if(item.begin(), item.end(), [](unsigned char c) {
+                 return !std::isspace(c);
+               }));
+    item.erase(std::find_if(item.rbegin(), item.rend(),
+                            [](unsigned char c) { return !std::isspace(c); })
+                   .base(),
+               item.end());
+    if (!item.empty()) {
+      result.push_back(item);
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  return result;
+}
+
 AudioProfile ReadProfile(const flutter::EncodableValue* arguments) {
   AudioProfile profile;
   if (!arguments || !std::holds_alternative<flutter::EncodableMap>(*arguments)) {
@@ -668,7 +754,7 @@ AudioProfile ReadProfile(const flutter::EncodableValue* arguments) {
   profile.mode = ReadMode(map);
   profile.codec = ReadCodec(map);
   profile.sample_rate = ReadInt(map, "sampleRate", profile.sample_rate);
-  profile.channels = ReadInt(map, "channels", profile.channels);
+  profile.channels = 2;
   profile.bitrate_kbps = ReadInt(map, "bitrateKbps", profile.bitrate_kbps);
   profile.latency_ms = ReadInt(map, "latencyMs", profile.latency_ms);
   profile.capture_buffer_ms =
@@ -1780,17 +1866,19 @@ class WindowsAudioEngine::Impl {
       metrics[flutter::EncodableValue("targetBufferFrames")] =
           flutter::EncodableValue(local_target_buffer_frames_.load());
       metrics[flutter::EncodableValue("adaptivePlaybackBufferMs")] =
-          flutter::EncodableValue(profile_.playback_buffer_ms);
+          flutter::EncodableValue(local_adaptive_playback_buffer_ms_.load());
       metrics[flutter::EncodableValue("adaptiveMaxPlaybackBufferMs")] =
-          flutter::EncodableValue(profile_.playback_buffer_ms);
+          flutter::EncodableValue(
+              local_adaptive_max_playback_buffer_ms_.load());
       metrics[flutter::EncodableValue("adaptiveLimitReached")] =
-          flutter::EncodableValue(false);
+          flutter::EncodableValue(local_adaptive_limit_reached_.load() > 0);
       metrics[flutter::EncodableValue("adaptiveUnderrunsInWindow")] =
-          flutter::EncodableValue(0);
+          flutter::EncodableValue(
+              local_adaptive_underruns_in_window_.load());
       metrics[flutter::EncodableValue("adaptiveUnderrunsInBurst")] =
-          flutter::EncodableValue(0);
+          flutter::EncodableValue(local_adaptive_underruns_in_burst_.load());
       metrics[flutter::EncodableValue("adaptiveLowQueueSamples")] =
-          flutter::EncodableValue(0);
+          flutter::EncodableValue(local_adaptive_low_queue_samples_.load());
       const int64_t local_target_frames = local_target_buffer_frames_.load();
       const int64_t local_queue_fill_percent =
           local_target_frames > 0
@@ -1876,6 +1964,21 @@ class WindowsAudioEngine::Impl {
         flutter::EncodableValue(remote_trim_count_.load());
     metrics[flutter::EncodableValue("signalLevel")] =
         flutter::EncodableValue(TakeSignalLevel());
+    {
+      std::scoped_lock lock(remote_capabilities_mutex_);
+      if (!remote_platform_.empty()) {
+        metrics[flutter::EncodableValue("remotePlatform")] =
+            flutter::EncodableValue(remote_platform_);
+      }
+      if (!remote_supported_codecs_.empty()) {
+        flutter::EncodableList codec_list;
+        for (const auto& codec : remote_supported_codecs_) {
+          codec_list.emplace_back(flutter::EncodableValue(codec));
+        }
+        metrics[flutter::EncodableValue("remoteSupportedCodecs")] =
+            flutter::EncodableValue(codec_list);
+      }
+    }
     return metrics;
   }
 
@@ -2109,6 +2212,7 @@ class WindowsAudioEngine::Impl {
       if (playback_running_) {
         return std::nullopt;
       }
+      ResetLocalAdaptivePlayback(profile_.sample_rate);
       playback_running_ = true;
       playback_receive_thread_ = std::thread(&Impl::PlaybackReceiveLoop, this);
       playback_render_thread_ = std::thread(&Impl::PlaybackRenderLoop, this);
@@ -2128,6 +2232,7 @@ class WindowsAudioEngine::Impl {
       if (playback_running_) {
         return std::nullopt;
       }
+      ResetLocalAdaptivePlayback(profile_.sample_rate);
       playback_running_ = true;
       playback_receive_thread_ = std::thread(&Impl::PlaybackReceiveLoop, this);
       playback_render_thread_ = std::thread(&Impl::PlaybackRenderLoop, this);
@@ -2187,7 +2292,15 @@ class WindowsAudioEngine::Impl {
     local_output_sample_rate_ = 0;
     local_buffer_size_frames_ = 0;
     local_target_buffer_frames_ = 0;
+    local_adaptive_playback_buffer_ms_ = 0;
+    local_adaptive_max_playback_buffer_ms_ = 0;
+    local_adaptive_limit_reached_ = 0;
+    local_adaptive_underruns_in_window_ = 0;
+    local_adaptive_underruns_in_burst_ = 0;
+    local_adaptive_low_queue_samples_ = 0;
+    local_render_started_ = false;
     local_signal_peak_ = 0.0;
+    ResetLocalAdaptiveDelayTracker();
     opus_codec_.Shutdown();
     aac_codec_.Shutdown();
     ResetPacketizer();
@@ -2259,6 +2372,11 @@ class WindowsAudioEngine::Impl {
     remote_metrics_received_at_ms_ = 0;
     remote_receiver_time_ms_ = 0;
     remote_receiver_time_received_at_ms_ = 0;
+    {
+      std::scoped_lock lock(remote_capabilities_mutex_);
+      remote_platform_.clear();
+      remote_supported_codecs_.clear();
+    }
     local_signal_peak_ = 0.0;
 
     if (winsock_started_) {
@@ -2868,6 +2986,19 @@ class WindowsAudioEngine::Impl {
     }
 
     bool has_metric = false;
+    const auto platform = ParseStringMetric(message, "platform");
+    const auto supported_codecs =
+        ParseStringMetric(message, "supportedCodecs");
+    if (platform.has_value() || supported_codecs.has_value()) {
+      std::scoped_lock lock(remote_capabilities_mutex_);
+      if (platform.has_value()) {
+        remote_platform_ = platform.value();
+      }
+      if (supported_codecs.has_value()) {
+        remote_supported_codecs_ = SplitMetricList(supported_codecs.value());
+      }
+      has_metric = true;
+    }
     const auto latency = ParseDoubleMetric(message, "outputLatencyMs");
     if (latency.has_value()) {
       remote_output_latency_ms_ = latency.value();
@@ -3215,6 +3346,8 @@ class WindowsAudioEngine::Impl {
 
   std::string BuildSubscribeMessage() const {
     std::string message = std::string(kSubscribePrefix) +
+                          " platform=windows supportedCodecs=" +
+                          kReceiverSupportedCodecs +
                           " receiverTimeMs=" +
                           std::to_string(NowMillis());
     const double output_latency_ms = LocalOutputLatencyMs();
@@ -3227,13 +3360,17 @@ class WindowsAudioEngine::Impl {
     message += " targetBufferFrames=" +
                std::to_string(local_target_buffer_frames_.load());
     message += " adaptivePlaybackBufferMs=" +
-               std::to_string(profile_.playback_buffer_ms);
+               std::to_string(local_adaptive_playback_buffer_ms_.load());
     message += " adaptiveMaxPlaybackBufferMs=" +
-               std::to_string(profile_.playback_buffer_ms);
-    message += " adaptiveLimitReached=0";
-    message += " adaptiveUnderrunsInWindow=0";
-    message += " adaptiveUnderrunsInBurst=0";
-    message += " adaptiveLowQueueSamples=0";
+               std::to_string(local_adaptive_max_playback_buffer_ms_.load());
+    message += " adaptiveLimitReached=" +
+               std::to_string(local_adaptive_limit_reached_.load() > 0 ? 1 : 0);
+    message += " adaptiveUnderrunsInWindow=" +
+               std::to_string(local_adaptive_underruns_in_window_.load());
+    message += " adaptiveUnderrunsInBurst=" +
+               std::to_string(local_adaptive_underruns_in_burst_.load());
+    message += " adaptiveLowQueueSamples=" +
+               std::to_string(local_adaptive_low_queue_samples_.load());
     const int64_t local_target_frames = local_target_buffer_frames_.load();
     const int64_t queue_fill_percent =
         local_target_frames > 0
@@ -3281,7 +3418,7 @@ class WindowsAudioEngine::Impl {
       const uint16_t flags = ReadU16Le(data + 14);
       UpdateLocalPacketLoss(sequence);
       QueuePcmPayload(data + kPacketHeaderBytes, length - kPacketHeaderBytes,
-                      sample_rate, channels, flags);
+                      sequence, sample_rate, channels, flags);
       return;
     }
 
@@ -3312,26 +3449,55 @@ class WindowsAudioEngine::Impl {
     }
 
     if (magic == kPacketV4Magic) {
-      profile_.playback_buffer_ms = static_cast<int>(
+      const int playback_buffer_ms = static_cast<int>(
           std::clamp<uint32_t>(ReadU32Le(data + 48), kMinBufferMs,
                                kMaxBufferMs));
       const uint32_t receiver_options = ReadU32Le(data + 52);
-      profile_.receiver_adaptive_buffer =
+      const bool receiver_adaptive_buffer =
           (receiver_options & kReceiverOptionAdaptiveBuffer) != 0;
-      profile_.mode = ModeFromPacketId(
+      const AudioMode mode = ModeFromPacketId(
           (receiver_options & kReceiverOptionModeMask) >>
           kReceiverOptionModeShift);
-      profile_.adaptive_buffer_cap_ms =
+      const int adaptive_buffer_cap_ms =
           static_cast<int>((receiver_options & kReceiverOptionCustomCapMask) >>
                            kReceiverOptionCustomCapShift);
+      const bool adaptive_policy_changed =
+          profile_.receiver_adaptive_buffer != receiver_adaptive_buffer ||
+          profile_.mode != mode ||
+          profile_.adaptive_buffer_cap_ms != adaptive_buffer_cap_ms;
+      const bool playback_target_changed =
+          profile_.playback_buffer_ms != playback_buffer_ms;
+      const int previous_adaptive_buffer_ms =
+          static_cast<int>(local_adaptive_playback_buffer_ms_.load());
+      profile_.playback_buffer_ms = playback_buffer_ms;
+      profile_.receiver_adaptive_buffer = receiver_adaptive_buffer;
+      profile_.mode = mode;
+      profile_.adaptive_buffer_cap_ms = adaptive_buffer_cap_ms;
+      if (adaptive_policy_changed || playback_target_changed) {
+        if (adaptive_policy_changed) {
+          ResetLocalAdaptiveDelayTracker();
+        }
+        const int next_max_buffer_ms =
+            AdaptiveMaxPlaybackBufferMs(playback_buffer_ms);
+        const int next_buffer_ms =
+            !receiver_adaptive_buffer
+                ? playback_buffer_ms
+                : playback_buffer_ms > previous_adaptive_buffer_ms
+                      ? playback_buffer_ms
+                      : previous_adaptive_buffer_ms > next_max_buffer_ms
+                            ? next_max_buffer_ms
+                            : previous_adaptive_buffer_ms;
+        SetLocalAdaptivePlaybackBufferMs(sample_rate, next_buffer_ms);
+      }
     }
 
-    QueuePcmPayload(data + header_bytes, length - header_bytes, sample_rate,
-                    channels, flags);
+    QueuePcmPayload(data + header_bytes, length - header_bytes, sequence,
+                    sample_rate, channels, flags);
   }
 
-  void QueuePcmPayload(const uint8_t* payload, int payload_size, int sample_rate,
-                       int channels, uint16_t flags) {
+  void QueuePcmPayload(const uint8_t* payload, int payload_size,
+                       uint32_t sequence, int sample_rate, int channels,
+                       uint16_t flags) {
     if (sample_rate <= 0 || channels <= 0 || payload_size <= 0) {
       ++local_dropped_packet_count_;
       return;
@@ -3360,14 +3526,14 @@ class WindowsAudioEngine::Impl {
     }
     PublishSignalLevel(PcmPeakLevel(packet.pcm));
 
+    ObserveLocalAdaptivePacketArrival(NowMillis(), sequence, sample_rate,
+                                      frames);
+
     {
       std::scoped_lock lock(playback_queue_mutex_);
       playback_queue_frames_ += frames;
-      const int target_frames =
-          std::max(1, sample_rate *
-                          std::clamp(profile_.playback_buffer_ms, kMinBufferMs,
-                                     kMaxBufferMs) /
-                          1000);
+      AdaptLocalPlaybackBuffer(sample_rate, playback_queue_frames_.load());
+      const int target_frames = LocalAdaptiveTargetFrames(sample_rate);
       const int soft_limit = std::max(target_frames * 2, target_frames + frames);
       while (!playback_queue_.empty() &&
              playback_queue_frames_.load() > soft_limit) {
@@ -3380,6 +3546,385 @@ class WindowsAudioEngine::Impl {
       playback_queue_.push_back(std::move(packet));
     }
     playback_queue_cv_.notify_one();
+  }
+
+  void ResetLocalAdaptivePlayback(int sample_rate) {
+    const int requested_ms = RequestedPlaybackBufferMs();
+    const int adaptive_max_ms = AdaptiveMaxPlaybackBufferMs(requested_ms);
+    local_adaptive_playback_buffer_ms_ = requested_ms;
+    local_adaptive_max_playback_buffer_ms_ = adaptive_max_ms;
+    local_adaptive_limit_reached_ = 0;
+    local_adaptive_underruns_in_window_ = 0;
+    local_adaptive_underruns_in_burst_ = 0;
+    local_adaptive_low_queue_samples_ = 0;
+    local_render_started_ = false;
+    local_target_buffer_frames_ = LatencyFrames(sample_rate, requested_ms);
+    local_last_adaptive_buffer_increase_at_ms_ = 0;
+    local_last_playback_pressure_at_ms_ = 0;
+    local_last_known_underrun_count_ = local_underrun_count_.load();
+    local_adaptive_underrun_window_start_at_ms_ = 0;
+    local_adaptive_underruns_in_window_counter_ = 0;
+    local_adaptive_underrun_burst_start_at_ms_ = 0;
+    local_adaptive_underruns_in_burst_counter_ = 0;
+    local_adaptive_low_queue_sample_count_ = 0;
+    ResetLocalAdaptiveDelayTracker();
+  }
+
+  void ResetLocalAdaptiveDelayTracker() {
+    local_adaptive_last_arrival_sequence_ = -1;
+    local_adaptive_last_arrival_at_ms_ = 0;
+    local_adaptive_last_packet_duration_ms_ = 0.0;
+    local_adaptive_relative_delay_ms_ = 0.0;
+    local_adaptive_delay_window_start_at_ms_ = 0;
+    local_adaptive_delay_window_peak_ms_ = 0.0;
+    local_adaptive_delay_history_ms_.fill(0);
+    local_adaptive_delay_history_index_ = 0;
+    local_adaptive_delay_history_count_ = 0;
+    local_adaptive_network_target_buffer_ms_ = 0;
+  }
+
+  int RequestedPlaybackBufferMs() const {
+    return std::clamp(profile_.playback_buffer_ms, kMinBufferMs, kMaxBufferMs);
+  }
+
+  int AdaptiveMaxPlaybackBufferMs(int requested_ms) const {
+    int cap_ms = kMaxBufferMs;
+    switch (profile_.mode) {
+      case AudioMode::kGaming:
+        cap_ms = requested_ms <= 10
+                     ? std::max(kAdaptiveUltraLowLatencyCapMs, requested_ms * 4)
+                     : std::max(requested_ms, requested_ms + 12);
+        cap_ms = std::min(cap_ms, kAdaptiveGamingCapMs);
+        break;
+      case AudioMode::kBalanced:
+        cap_ms = std::min(std::max(96, requested_ms * 2),
+                          kAdaptiveBalancedCapMs);
+        break;
+      case AudioMode::kMusic:
+        cap_ms = kMaxBufferMs;
+        break;
+      case AudioMode::kCustom:
+        cap_ms = profile_.adaptive_buffer_cap_ms > 0
+                     ? profile_.adaptive_buffer_cap_ms
+                     : kMaxBufferMs;
+        break;
+    }
+    return std::clamp(cap_ms, requested_ms, kMaxBufferMs);
+  }
+
+  int AdaptiveBufferStepMs(int requested_ms) const {
+    const int packet_step_ms = std::clamp(profile_.packet_time_ms, 1, 12) * 2;
+    const int profile_step_ms =
+        requested_ms <= 28
+            ? kAdaptiveLowLatencyStepMs
+            : (requested_ms <= kLowLatencyPerformanceMaxMs
+                   ? kAdaptiveBalancedStepMs
+                   : kAdaptiveStableStepMs);
+    return std::min(std::max(packet_step_ms, profile_step_ms),
+                    kAdaptiveStableStepMs);
+  }
+
+  int LatencyFrames(int sample_rate, int latency_ms) const {
+    return std::max(1, sample_rate *
+                           std::clamp(latency_ms, kMinBufferMs, kMaxBufferMs) /
+                           1000);
+  }
+
+  int LocalAdaptiveTargetFrames(int sample_rate) const {
+    const int adaptive_ms =
+        static_cast<int>(local_adaptive_playback_buffer_ms_.load());
+    return LatencyFrames(sample_rate, adaptive_ms);
+  }
+
+  void SetLocalAdaptivePlaybackBufferMs(int sample_rate, int next_buffer_ms) {
+    const int requested_ms = RequestedPlaybackBufferMs();
+    const int adaptive_max_ms = AdaptiveMaxPlaybackBufferMs(requested_ms);
+    const int next_ms =
+        std::clamp(next_buffer_ms, requested_ms, adaptive_max_ms);
+    local_adaptive_playback_buffer_ms_ = next_ms;
+    local_adaptive_max_playback_buffer_ms_ = adaptive_max_ms;
+    local_adaptive_limit_reached_ = next_ms >= adaptive_max_ms ? 1 : 0;
+    local_target_buffer_frames_ = LatencyFrames(sample_rate, next_ms);
+  }
+
+  void ObserveLocalAdaptivePacketArrival(int64_t now, uint32_t sequence,
+                                         int sample_rate, int packet_frames) {
+    if (!profile_.receiver_adaptive_buffer || sample_rate <= 0 ||
+        packet_frames <= 0) {
+      return;
+    }
+
+    const double packet_duration_ms =
+        static_cast<double>(packet_frames) * 1000.0 / sample_rate;
+    if (local_adaptive_last_arrival_at_ms_ <= 0 ||
+        local_adaptive_last_arrival_sequence_ < 0 ||
+        now - local_adaptive_last_arrival_at_ms_ > kSourceIdleTimeoutMs) {
+      SeedLocalAdaptiveDelayTracker(now, sequence, packet_duration_ms);
+      return;
+    }
+
+    const int64_t sequence_delta =
+        PacketSequenceDelta(sequence, local_adaptive_last_arrival_sequence_);
+    if (sequence_delta <= 0) {
+      return;
+    }
+    if (sequence_delta > kAdaptiveSequenceResetGap) {
+      SeedLocalAdaptiveDelayTracker(now, sequence, packet_duration_ms);
+      return;
+    }
+
+    const double elapsed_ms =
+        static_cast<double>(std::max<int64_t>(
+            0, now - local_adaptive_last_arrival_at_ms_));
+    const double expected_ms =
+        local_adaptive_last_packet_duration_ms_ * sequence_delta;
+    local_adaptive_relative_delay_ms_ =
+        std::clamp(local_adaptive_relative_delay_ms_ + elapsed_ms - expected_ms,
+                   0.0, kAdaptiveDelayMaxMs);
+    if (local_adaptive_delay_window_start_at_ms_ <= 0) {
+      local_adaptive_delay_window_start_at_ms_ =
+          local_adaptive_last_arrival_at_ms_;
+    }
+    local_adaptive_delay_window_peak_ms_ =
+        std::max(local_adaptive_delay_window_peak_ms_,
+                 local_adaptive_relative_delay_ms_);
+
+    while (now - local_adaptive_delay_window_start_at_ms_ >=
+           kAdaptiveDelaySampleIntervalMs) {
+      RecordLocalAdaptiveDelaySample(
+          static_cast<int>(std::ceil(local_adaptive_delay_window_peak_ms_)));
+      local_adaptive_delay_window_start_at_ms_ +=
+          kAdaptiveDelaySampleIntervalMs;
+      local_adaptive_delay_window_peak_ms_ =
+          local_adaptive_relative_delay_ms_;
+    }
+
+    local_adaptive_last_arrival_sequence_ = sequence;
+    local_adaptive_last_arrival_at_ms_ = now;
+    local_adaptive_last_packet_duration_ms_ = packet_duration_ms;
+  }
+
+  void SeedLocalAdaptiveDelayTracker(int64_t now, uint32_t sequence,
+                                     double packet_duration_ms) {
+    local_adaptive_last_arrival_sequence_ = sequence;
+    local_adaptive_last_arrival_at_ms_ = now;
+    local_adaptive_last_packet_duration_ms_ = packet_duration_ms;
+    local_adaptive_relative_delay_ms_ = 0.0;
+    local_adaptive_delay_window_start_at_ms_ = now;
+    local_adaptive_delay_window_peak_ms_ = 0.0;
+  }
+
+  void RecordLocalAdaptiveDelaySample(int delay_ms) {
+    local_adaptive_delay_history_ms_[local_adaptive_delay_history_index_] =
+        std::clamp(delay_ms, 0, static_cast<int>(kAdaptiveDelayMaxMs));
+    local_adaptive_delay_history_index_ =
+        (local_adaptive_delay_history_index_ + 1) %
+        kAdaptiveDelayHistorySamples;
+    local_adaptive_delay_history_count_ =
+        std::min(kAdaptiveDelayHistorySamples,
+                 local_adaptive_delay_history_count_ + 1);
+  }
+
+  int LocalAdaptiveDelayQuantileMs() const {
+    if (local_adaptive_delay_history_count_ == 0) {
+      return 0;
+    }
+    std::vector<int> samples(local_adaptive_delay_history_ms_.begin(),
+                             local_adaptive_delay_history_ms_.begin() +
+                                 local_adaptive_delay_history_count_);
+    std::sort(samples.begin(), samples.end());
+    const size_t quantile_index = std::clamp<size_t>(
+        static_cast<size_t>(
+            std::ceil(local_adaptive_delay_history_count_ *
+                      kAdaptiveDelayQuantile)),
+        static_cast<size_t>(1), local_adaptive_delay_history_count_) -
+                                  1;
+    return samples[quantile_index];
+  }
+
+  int LocalAdaptiveNetworkFloorBufferMs(int requested_ms) {
+    const int estimated_delay_ms = LocalAdaptiveDelayQuantileMs();
+    if (estimated_delay_ms <= 0 ||
+        local_adaptive_delay_history_count_ <
+            kAdaptiveDelayMinHistorySamples) {
+      local_adaptive_network_target_buffer_ms_ = requested_ms;
+      return requested_ms;
+    }
+
+    const int packet_guard_ms =
+        std::max(std::clamp(profile_.packet_time_ms, 1, 12),
+                 std::max(1, static_cast<int>(std::ceil(
+                                 local_adaptive_last_packet_duration_ms_))));
+    if (estimated_delay_ms <= packet_guard_ms) {
+      local_adaptive_network_target_buffer_ms_ = requested_ms;
+      return requested_ms;
+    }
+    const int jitter_beyond_guard_ms = estimated_delay_ms - packet_guard_ms;
+    const int jitter_headroom_ms = static_cast<int>(std::ceil(
+        static_cast<double>(jitter_beyond_guard_ms) *
+        kAdaptiveDelayHeadroomNumerator /
+        kAdaptiveDelayHeadroomDenominator));
+    local_adaptive_network_target_buffer_ms_ =
+        std::clamp(requested_ms + packet_guard_ms + jitter_headroom_ms,
+                   requested_ms, AdaptiveMaxPlaybackBufferMs(requested_ms));
+    return local_adaptive_network_target_buffer_ms_;
+  }
+
+  int64_t PacketSequenceDelta(uint32_t sequence, int64_t previous_sequence) {
+    const int64_t current = static_cast<int64_t>(sequence);
+    const int64_t raw_delta =
+        current >= previous_sequence ? current - previous_sequence
+                                     : current + kSequenceModulus -
+                                           previous_sequence;
+    return raw_delta > kSequenceModulus / 2 ? 0 : raw_delta;
+  }
+
+  bool ExceedsLocalAdaptiveUnderrunBudget(int64_t now, int64_t underrun_delta) {
+    if (local_adaptive_underrun_window_start_at_ms_ <= 0 ||
+        now - local_adaptive_underrun_window_start_at_ms_ >
+            kAdaptiveUnderrunSlowWindowMs) {
+      local_adaptive_underrun_window_start_at_ms_ = now;
+      local_adaptive_underruns_in_window_counter_ = 0;
+    }
+    if (local_adaptive_underrun_burst_start_at_ms_ <= 0 ||
+        now - local_adaptive_underrun_burst_start_at_ms_ >
+            kAdaptiveUnderrunBurstWindowMs) {
+      local_adaptive_underrun_burst_start_at_ms_ = now;
+      local_adaptive_underruns_in_burst_counter_ = 0;
+    }
+
+    local_adaptive_underruns_in_window_counter_ += underrun_delta;
+    local_adaptive_underruns_in_burst_counter_ += underrun_delta;
+    local_adaptive_underruns_in_window_ =
+        local_adaptive_underruns_in_window_counter_;
+    local_adaptive_underruns_in_burst_ =
+        local_adaptive_underruns_in_burst_counter_;
+    return local_adaptive_underruns_in_burst_counter_ >
+               kAdaptiveAcceptableUnderrunsPerBurst ||
+           local_adaptive_underruns_in_window_counter_ >
+               kAdaptiveAcceptableUnderrunsPerSlowWindow;
+  }
+
+  bool IsLocalPlaybackQueueTooLow(int sample_rate, int64_t queued_frames,
+                                  int64_t target_frames) const {
+    const int64_t packet_frames =
+        std::max<int64_t>(1, sample_rate *
+                                 std::clamp(profile_.packet_time_ms, 1, 12) /
+                                 1000);
+    const int64_t low_queue_frames =
+        std::max(packet_frames, target_frames / kAdaptiveLowQueueDivisor);
+    return queued_frames < low_queue_frames;
+  }
+
+  int64_t HealthyLocalPlaybackQueueFrames(int sample_rate,
+                                          int64_t target_frames) const {
+    const int64_t requested_frames =
+        LatencyFrames(sample_rate, RequestedPlaybackBufferMs());
+    return std::max(requested_frames, target_frames * 3 / 4);
+  }
+
+  void AdaptLocalPlaybackBuffer(int sample_rate, int64_t queued_frames) {
+    if (sample_rate <= 0) {
+      return;
+    }
+
+    const int requested_ms = RequestedPlaybackBufferMs();
+    if (!profile_.receiver_adaptive_buffer) {
+      ResetLocalAdaptiveDelayTracker();
+      SetLocalAdaptivePlaybackBufferMs(sample_rate, requested_ms);
+      local_last_known_underrun_count_ = local_underrun_count_.load();
+      local_adaptive_underruns_in_window_ = 0;
+      local_adaptive_underruns_in_burst_ = 0;
+      local_adaptive_low_queue_samples_ = 0;
+      local_adaptive_low_queue_sample_count_ = 0;
+      return;
+    }
+
+    const int64_t now = NowMillis();
+    const int64_t target_frames = LocalAdaptiveTargetFrames(sample_rate);
+    const int network_floor_ms =
+        LocalAdaptiveNetworkFloorBufferMs(requested_ms);
+    const int64_t underruns = local_underrun_count_.load();
+    const int64_t underrun_delta =
+        std::max<int64_t>(0, underruns - local_last_known_underrun_count_);
+    bool should_increase = false;
+    bool pressure_increase = false;
+    if (underrun_delta > 0) {
+      local_last_playback_pressure_at_ms_ = now;
+      should_increase =
+          ExceedsLocalAdaptiveUnderrunBudget(now, underrun_delta);
+      pressure_increase = should_increase;
+    }
+
+    if (local_render_started_.load() &&
+        IsLocalPlaybackQueueTooLow(sample_rate, queued_frames, target_frames)) {
+      local_last_playback_pressure_at_ms_ = now;
+      ++local_adaptive_low_queue_sample_count_;
+      local_adaptive_low_queue_samples_ =
+          local_adaptive_low_queue_sample_count_;
+      const bool sustained_low_queue =
+          local_adaptive_low_queue_sample_count_ >=
+          kAdaptiveLowQueueSamplesToIncrease;
+      should_increase =
+          should_increase || sustained_low_queue;
+      pressure_increase = pressure_increase || sustained_low_queue;
+    } else {
+      local_adaptive_low_queue_sample_count_ = 0;
+      local_adaptive_low_queue_samples_ = 0;
+    }
+
+    const int current_ms =
+        static_cast<int>(local_adaptive_playback_buffer_ms_.load());
+    if (network_floor_ms > current_ms + kAdaptiveNetworkTargetHysteresisMs) {
+      should_increase = true;
+    }
+
+    if (should_increase &&
+        now - local_last_adaptive_buffer_increase_at_ms_ >=
+            kAdaptiveBufferCooldownMs) {
+      const int step_target_ms =
+          current_ms + AdaptiveBufferStepMs(requested_ms);
+      SetLocalAdaptivePlaybackBufferMs(
+          sample_rate,
+          pressure_increase ? std::max(step_target_ms, network_floor_ms)
+                            : step_target_ms);
+      local_last_adaptive_buffer_increase_at_ms_ = now;
+      local_adaptive_low_queue_sample_count_ = 0;
+      local_adaptive_low_queue_samples_ = 0;
+    } else if (ShouldRelaxLocalAdaptiveBuffer(
+                   now, current_ms, network_floor_ms, queued_frames,
+                   target_frames, sample_rate)) {
+      SetLocalAdaptivePlaybackBufferMs(
+          sample_rate,
+          std::max(network_floor_ms,
+                   current_ms - AdaptiveBufferStepMs(requested_ms)));
+    }
+
+    local_last_known_underrun_count_ = underruns;
+  }
+
+  bool ShouldRelaxLocalAdaptiveBuffer(int64_t now, int current_ms,
+                                      int network_floor_ms,
+                                      int64_t queued_frames,
+                                      int64_t target_frames,
+                                      int sample_rate) const {
+    if (current_ms <=
+        network_floor_ms + kAdaptiveNetworkTargetHysteresisMs) {
+      return false;
+    }
+    if (queued_frames <
+        HealthyLocalPlaybackQueueFrames(sample_rate, target_frames)) {
+      return false;
+    }
+
+    const bool queue_at_or_above_target = queued_frames >= target_frames;
+    const bool has_room_to_fast_relax =
+        current_ms - network_floor_ms >= kAdaptiveFastRelaxMarginMs;
+    const int relax_delay_ms =
+        queue_at_or_above_target && has_room_to_fast_relax
+            ? kAdaptiveBufferFastRelaxMs
+            : kAdaptiveBufferRelaxMs;
+    return now - local_last_playback_pressure_at_ms_ >= relax_delay_ms;
   }
 
   void UpdateLocalPacketLoss(uint32_t sequence) {
@@ -3462,12 +4007,10 @@ class WindowsAudioEngine::Impl {
     UINT32 buffer_frames = 0;
     audio_client->GetBufferSize(&buffer_frames);
     local_buffer_size_frames_ = buffer_frames;
-    local_target_buffer_frames_ = std::max<UINT32>(
-        1, mix_format->nSamplesPerSec *
-               std::clamp(profile_.playback_buffer_ms, kMinBufferMs,
-                          kMaxBufferMs) /
-               1000);
     local_output_sample_rate_ = mix_format->nSamplesPerSec;
+    SetLocalAdaptivePlaybackBufferMs(
+        mix_format->nSamplesPerSec,
+        static_cast<int>(local_adaptive_playback_buffer_ms_.load()));
 
     Microsoft::WRL::ComPtr<IAudioRenderClient> render_client;
     hr = audio_client->GetService(IID_PPV_ARGS(&render_client));
@@ -3483,19 +4026,33 @@ class WindowsAudioEngine::Impl {
       AvSetMmThreadPriority(task_handle, AVRT_PRIORITY_CRITICAL);
     }
 
-    audio_client->Start();
+    bool render_started = false;
+    bool needs_prebuffer = true;
     while (playback_running_) {
       PcmPlaybackPacket packet;
       {
         std::unique_lock lock(playback_queue_mutex_);
-        playback_queue_cv_.wait_for(lock, std::chrono::milliseconds(20), [this] {
-          return !playback_running_ || !playback_queue_.empty();
+        playback_queue_cv_.wait_for(lock, std::chrono::milliseconds(20), [this, needs_prebuffer] {
+          if (!playback_running_) {
+            return true;
+          }
+          if (needs_prebuffer) {
+            return playback_queue_frames_.load() >=
+                   local_target_buffer_frames_.load();
+          }
+          return !playback_queue_.empty();
         });
         if (!playback_running_) {
           break;
         }
+        if (needs_prebuffer &&
+            playback_queue_frames_.load() < local_target_buffer_frames_.load()) {
+          continue;
+        }
+        needs_prebuffer = false;
         if (playback_queue_.empty()) {
           ++local_underrun_count_;
+          needs_prebuffer = true;
           continue;
         }
         packet = std::move(playback_queue_.front());
@@ -3506,13 +4063,21 @@ class WindowsAudioEngine::Impl {
                                       packet.channels,
                                       mix_format->nSamplesPerSec,
                                       mix_format->nChannels);
+      if (!render_started) {
+        audio_client->Start();
+        render_started = true;
+        local_render_started_ = true;
+      }
       WriteRenderPcm(render_client.Get(), audio_client.Get(), buffer_frames,
                      *mix_format, output);
       playback_queue_frames_ -=
           static_cast<int64_t>(packet.pcm.size()) / std::max(1, packet.channels);
     }
 
-    audio_client->Stop();
+    if (render_started) {
+      audio_client->Stop();
+    }
+    local_render_started_ = false;
     if (task_handle != nullptr) {
       AvRevertMmThreadCharacteristics(task_handle);
     }
@@ -3886,9 +4451,18 @@ class WindowsAudioEngine::Impl {
   std::atomic<int64_t> remote_metrics_received_at_ms_ = 0;
   std::atomic<int64_t> remote_receiver_time_ms_ = 0;
   std::atomic<int64_t> remote_receiver_time_received_at_ms_ = 0;
+  std::string remote_platform_;
+  std::vector<std::string> remote_supported_codecs_;
   mutable std::atomic<double> local_signal_peak_ = 0.0;
   std::atomic<int64_t> local_buffer_size_frames_ = 0;
   std::atomic<int64_t> local_target_buffer_frames_ = 0;
+  std::atomic<int64_t> local_adaptive_playback_buffer_ms_ = 0;
+  std::atomic<int64_t> local_adaptive_max_playback_buffer_ms_ = 0;
+  std::atomic<int64_t> local_adaptive_limit_reached_ = 0;
+  std::atomic<int64_t> local_adaptive_underruns_in_window_ = 0;
+  std::atomic<int64_t> local_adaptive_underruns_in_burst_ = 0;
+  std::atomic<int64_t> local_adaptive_low_queue_samples_ = 0;
+  std::atomic_bool local_render_started_ = false;
   std::atomic<int64_t> local_underrun_count_ = 0;
   std::atomic<int64_t> local_dropped_packet_count_ = 0;
   std::atomic<int64_t> local_lost_packet_count_ = 0;
@@ -3899,6 +4473,7 @@ class WindowsAudioEngine::Impl {
   std::atomic<int> local_codec_id_ = kCodecPcm;
   std::mutex endpoint_mutex_;
   std::mutex receiver_source_mutex_;
+  mutable std::mutex remote_capabilities_mutex_;
   std::mutex playback_queue_mutex_;
   std::condition_variable playback_queue_cv_;
   Endpoint endpoint_;
@@ -3911,6 +4486,24 @@ class WindowsAudioEngine::Impl {
   G711CodecAdapter g711_mu_law_codec_{true};
   G711CodecAdapter g711_a_law_codec_{false};
   ImaAdpcmCodecAdapter ima_adpcm_codec_;
+  int64_t local_last_adaptive_buffer_increase_at_ms_ = 0;
+  int64_t local_last_playback_pressure_at_ms_ = 0;
+  int64_t local_last_known_underrun_count_ = 0;
+  int64_t local_adaptive_underrun_window_start_at_ms_ = 0;
+  int64_t local_adaptive_underruns_in_window_counter_ = 0;
+  int64_t local_adaptive_underrun_burst_start_at_ms_ = 0;
+  int64_t local_adaptive_underruns_in_burst_counter_ = 0;
+  int local_adaptive_low_queue_sample_count_ = 0;
+  int64_t local_adaptive_last_arrival_sequence_ = -1;
+  int64_t local_adaptive_last_arrival_at_ms_ = 0;
+  double local_adaptive_last_packet_duration_ms_ = 0.0;
+  double local_adaptive_relative_delay_ms_ = 0.0;
+  int64_t local_adaptive_delay_window_start_at_ms_ = 0;
+  double local_adaptive_delay_window_peak_ms_ = 0.0;
+  std::array<int, kAdaptiveDelayHistorySamples> local_adaptive_delay_history_ms_{};
+  size_t local_adaptive_delay_history_index_ = 0;
+  size_t local_adaptive_delay_history_count_ = 0;
+  int local_adaptive_network_target_buffer_ms_ = 0;
   std::vector<int16_t> packetizer_pending_pcm_;
   uint64_t packetizer_sent_frames_ = 0;
   uint64_t packetizer_packet_count_ = 0;

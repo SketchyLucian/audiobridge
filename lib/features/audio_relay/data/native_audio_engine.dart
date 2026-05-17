@@ -159,6 +159,8 @@ class AudioRelayMetrics {
     this.lostPacketCount,
     this.trimCount,
     this.activeProfile,
+    this.remotePlatform,
+    this.remoteSupportedCodecs = const {},
   });
 
   final double? audioLatencyMs;
@@ -180,6 +182,8 @@ class AudioRelayMetrics {
   final int? lostPacketCount;
   final int? trimCount;
   final AudioProfile? activeProfile;
+  final String? remotePlatform;
+  final Set<AudioCodec> remoteSupportedCodecs;
 
   double? get effectiveLatencyMs => audioLatencyMs ?? outputLatencyMs;
 
@@ -211,6 +215,8 @@ class AudioRelayMetrics {
       activeProfile: activeProfilePayload is Map
           ? AudioProfile.fromMap(activeProfilePayload.cast<Object?, Object?>())
           : null,
+      remotePlatform: payload['remotePlatform']?.toString(),
+      remoteSupportedCodecs: _readCodecSet(payload['remoteSupportedCodecs']),
     );
   }
 
@@ -240,6 +246,16 @@ class AudioRelayMetrics {
       'false' || '0' || 'no' => false,
       _ => null,
     };
+  }
+
+  static Set<AudioCodec> _readCodecSet(Object? value) {
+    if (value is! List) {
+      return const {};
+    }
+    return value
+        .map((item) => AudioCodec.fromName(item?.toString()))
+        .where((codec) => codec != AudioCodec.auto)
+        .toSet();
   }
 }
 

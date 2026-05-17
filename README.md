@@ -63,6 +63,22 @@ flutter devices
 flutter run -d <android-device-id>
 ```
 
+## Windows MSI
+
+The Windows app can be packaged as an MSI with WiX Toolset SDK 5. The packaging
+script builds the Flutter Windows release bundle, then wraps
+`build/windows/x64/runner/Release` into an MSI that installs AudioBridge under
+Program Files and adds a Start menu shortcut.
+
+Prerequisite: install the .NET SDK 6 or newer so the WiX SDK project can be
+restored and built.
+
+```powershell
+.\scripts\package_windows_msi.ps1
+```
+
+The MSI is written to `build/installer/AudioBridge-<version>-x64.msi`.
+
 For USB tethering, enable USB tethering on Android, keep the device attached,
 and select `USB tether` in both apps. The sender and receiver still use UDP
 discovery and UDP audio, but over the tethered USB network interface instead of

@@ -54,6 +54,7 @@ enum RelayActivity {
 }
 
 enum AudioCodec {
+  auto,
   pcm,
   opus,
   aac,
@@ -68,6 +69,7 @@ enum AudioCodec {
 
   String get label {
     return switch (this) {
+      AudioCodec.auto => 'Auto',
       AudioCodec.pcm => 'PCM',
       AudioCodec.opus => 'Opus',
       AudioCodec.aac => 'AAC',
@@ -84,6 +86,7 @@ enum AudioCodec {
 
   bool get isImplemented {
     return switch (this) {
+      AudioCodec.auto ||
       AudioCodec.pcm ||
       AudioCodec.opus ||
       AudioCodec.aac ||
@@ -95,11 +98,16 @@ enum AudioCodec {
   }
 
   String get availabilityLabel {
-    return isImplemented ? 'Native required' : 'Encoder pending';
+    return this == AudioCodec.auto
+        ? 'Automatic'
+        : isImplemented
+        ? 'Native required'
+        : 'Encoder pending';
   }
 
   int get packetId {
     return switch (this) {
+      AudioCodec.auto => -1,
       AudioCodec.pcm => 0,
       AudioCodec.opus => 1,
       AudioCodec.aac => 2,
@@ -128,7 +136,8 @@ enum AudioCodec {
 
   static AudioCodec fromPacketId(int value) {
     return AudioCodec.values.firstWhere(
-      (candidate) => candidate.packetId == value,
+      (candidate) =>
+          candidate != AudioCodec.auto && candidate.packetId == value,
       orElse: () => AudioCodec.pcm,
     );
   }
@@ -194,12 +203,12 @@ enum AudioPreset {
         mode: AudioPreset.gaming,
         codec: AudioCodec.pcm,
         sampleRate: 48000,
-        bitrateKbps: 768,
+        bitrateKbps: 1536,
         latencyMs: 18,
         captureBufferMs: 10,
         playbackBufferMs: 18,
         packetTimeMs: 1,
-        channels: 1,
+        channels: 2,
       ),
       AudioPreset.balanced => const AudioProfile(
         mode: AudioPreset.balanced,
@@ -341,6 +350,7 @@ class AudioProfile {
 
   int get effectiveBitrateKbps {
     return switch (codec) {
+      AudioCodec.auto => bitrateKbps,
       AudioCodec.pcm => (sampleRate * channels * 16 / 1000).round(),
       AudioCodec.opus => bitrateKbps.clamp(64, 256).toInt(),
       AudioCodec.aac => bitrateKbps.clamp(96, 192).toInt(),
@@ -444,7 +454,7 @@ class AudioProfile {
         fallback: _readInt(payload['latencyMs'], fallback: 35),
       ),
       packetTimeMs: _readInt(payload['packetTimeMs'], fallback: 3),
-      channels: _readInt(payload['channels'], fallback: 2),
+      channels: 2,
       receiverAdaptiveBuffer: _readBool(
         payload['receiverAdaptiveBuffer'],
         fallback: true,
@@ -486,7 +496,6 @@ class AudioProfile {
     );
     final packetTimeMs = _readInt(payload['packetTimeMs'], fallback: 3);
     final sampleRate = _readInt(payload['sampleRate'], fallback: 48000);
-    final channels = _readInt(payload['channels'], fallback: 2);
 
     if (playbackBufferMs <= 28 || packetTimeMs <= 2) {
       return AudioPreset.gaming;
@@ -496,9 +505,6 @@ class AudioProfile {
         captureBufferMs >= 120 ||
         packetTimeMs >= 10) {
       return AudioPreset.music;
-    }
-    if (channels == 1 && latencyMs <= 30) {
-      return AudioPreset.gaming;
     }
     return AudioPreset.balanced;
   }

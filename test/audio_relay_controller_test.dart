@@ -43,6 +43,25 @@ void main() {
     expect(music.receiverAdaptiveBuffer, true);
   });
 
+  test('all presets and loaded profiles stay stereo', () {
+    for (final preset in AudioPreset.values) {
+      expect(preset.profile.channels, 2);
+    }
+
+    final parsedProfile = AudioProfile.fromMap({
+      'mode': 'gaming',
+      'sampleRate': 48000,
+      'channels': 1,
+    });
+    expect(parsedProfile.channels, 2);
+
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine());
+    controller.updateChannels(1);
+    expect(controller.profile.channels, 2);
+
+    controller.dispose();
+  });
+
   test('manual values auto-match a known preset again', () {
     final controller = AudioRelayController(engine: _FakeAudioRelayEngine());
 
@@ -167,6 +186,38 @@ void main() {
     expect(engine.calls, ['prepareSender']);
     expect(engine.profiles.single.packetTimeMs, 5);
     expect(discoveryService.advertisedProfiles.single.packetTimeMs, 5);
+
+    controller.dispose();
+  });
+
+  test('restart-required sender changes are held while streaming', () async {
+    final engine = _FakeAudioRelayEngine();
+    final discoveryService = _FakeDiscoveryService();
+    final controller = AudioRelayController(
+      engine: engine,
+      discoveryService: discoveryService,
+      profileApplyDelay: Duration.zero,
+    )..role = RelayRole.sender;
+
+    await controller.startSenderStream();
+    final streamingProfile = controller.profile;
+    engine.calls.clear();
+    engine.profiles.clear();
+    discoveryService.advertisedProfiles.clear();
+
+    controller.updateSampleRate(96000);
+    controller.updateCaptureBuffer(96);
+    controller.updateChannels(1);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(controller.profile.sampleRate, streamingProfile.sampleRate);
+    expect(
+      controller.profile.captureBufferMs,
+      streamingProfile.captureBufferMs,
+    );
+    expect(controller.profile.channels, streamingProfile.channels);
+    expect(engine.calls, isEmpty);
+    expect(discoveryService.advertisedProfiles, isEmpty);
 
     controller.dispose();
   });
@@ -341,6 +392,13 @@ void main() {
     const profile = AudioProfile(codec: AudioCodec.opus, bitrateKbps: 999);
 
     expect(profile.effectiveBitrateKbps, 256);
+  });
+
+  test('auto codec is a controller policy, not a packet codec', () {
+    expect(AudioCodec.auto.isImplemented, true);
+    expect(AudioCodec.auto.packetId, -1);
+    expect(AudioCodec.fromName('auto'), AudioCodec.auto);
+    expect(AudioCodec.fromPacketId(-1), AudioCodec.pcm);
   });
 
   test('capabilities parse aac support from the native backend', () {
@@ -532,6 +590,128 @@ void main() {
 
     expect(controller.profile.codec, AudioCodec.opus);
     expect(controller.profile.sampleRate, 48000);
+
+    controller.dispose();
+  });
+
+  test('auto codec starts sender with concrete pcm profile', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..capabilities = const PlatformAudioCapabilities(
+        platform: 'test',
+        canSend: true,
+        canReceive: true,
+        backend: 'fake',
+        supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+        supportedOutputBackends: {OutputAudioBackend.auto},
+        codecBitrateRanges: {},
+      );
+
+    controller.updateCodec(AudioCodec.auto);
+    await controller.startSenderStream();
+
+    expect(controller.profile.codec, AudioCodec.auto);
+    expect(engine.profiles.first.codec, AudioCodec.pcm);
+    expect(engine.startedProfiles.single.codec, AudioCodec.pcm);
+
+    controller.dispose();
+  });
+
+  test(
+    'auto codec switches after warmup only when receiver is quiet',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final discoveryService = _FakeDiscoveryService();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: discoveryService,
+              profileApplyDelay: Duration.zero,
+              autoCodecWarmup: Duration.zero,
+              autoCodecQuietHold: Duration.zero,
+            )
+            ..role = RelayRole.sender
+            ..capabilities = const PlatformAudioCapabilities(
+              platform: 'test',
+              canSend: true,
+              canReceive: true,
+              backend: 'fake',
+              supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+              supportedOutputBackends: {OutputAudioBackend.auto},
+              codecBitrateRanges: {},
+            );
+
+      controller.updateCodec(AudioCodec.auto);
+      await controller.startSenderStream();
+      engine.calls.clear();
+      engine.profiles.clear();
+      discoveryService.advertisedProfiles.clear();
+
+      engine.metrics = const AudioRelayMetrics(
+        signalLevel: 0.4,
+        adaptiveUnderrunsInWindow: 4,
+        adaptivePlaybackBufferMs: 64,
+        remoteSupportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+      );
+      await controller.pollMetricsForTesting();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(engine.calls, isEmpty);
+
+      engine.metrics = const AudioRelayMetrics(
+        signalLevel: 0.001,
+        adaptiveUnderrunsInWindow: 4,
+        adaptivePlaybackBufferMs: 64,
+        remoteSupportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+      );
+      await controller.pollMetricsForTesting();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(engine.calls, ['prepareSender']);
+      expect(engine.profiles.single.codec, AudioCodec.opus);
+      expect(discoveryService.advertisedProfiles.single.codec, AudioCodec.opus);
+      expect(controller.profile.codec, AudioCodec.auto);
+      expect(controller.codecStatusLabel, 'Auto (Opus)');
+
+      controller.dispose();
+    },
+  );
+
+  test('auto codec keeps pcm until receiver codec support is known', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            autoCodecWarmup: Duration.zero,
+            autoCodecQuietHold: Duration.zero,
+          )
+          ..role = RelayRole.sender
+          ..capabilities = const PlatformAudioCapabilities(
+            platform: 'test',
+            canSend: true,
+            canReceive: true,
+            backend: 'fake',
+            supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+            supportedOutputBackends: {OutputAudioBackend.auto},
+            codecBitrateRanges: {},
+          );
+
+    controller.updateCodec(AudioCodec.auto);
+    await controller.startSenderStream();
+    engine.calls.clear();
+    engine.profiles.clear();
+
+    engine.metrics = const AudioRelayMetrics(
+      signalLevel: 0.001,
+      adaptiveUnderrunsInWindow: 4,
+      adaptivePlaybackBufferMs: 64,
+    );
+    await controller.pollMetricsForTesting();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(engine.calls, isEmpty);
+    expect(controller.codecStatusLabel, 'Auto (PCM)');
 
     controller.dispose();
   });
@@ -809,6 +989,20 @@ void main() {
     },
   );
 
+  test('receiver output backend is held while streaming', () {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
+      ..role = RelayRole.receiver
+      ..activity = RelayActivity.streaming
+      ..capabilities = _receiverBackendCapabilities;
+
+    controller.updateOutputBackend(OutputAudioBackend.audioTrack);
+
+    expect(controller.receiverOutputBackend, OutputAudioBackend.auto);
+    expect(controller.profile.outputBackend, OutputAudioBackend.auto);
+
+    controller.dispose();
+  });
+
   test(
     'receiver profile follows sender discovery updates while streaming',
     () async {
@@ -951,6 +1145,7 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   final PlatformException? prepareUsbError;
   final List<String> calls = [];
   final List<AudioProfile> profiles = [];
+  final List<AudioProfile> startedProfiles = [];
   final List<AudioProfile> connectedProfiles = [];
   final List<String?> senderBindAddresses = [];
   AudioRelayMetrics metrics = AudioRelayMetrics.empty;
@@ -1014,6 +1209,7 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   @override
   Future<void> startStream(AudioProfile profile) async {
     calls.add('startStream');
+    startedProfiles.add(profile);
   }
 
   @override
