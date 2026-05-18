@@ -24,7 +24,9 @@
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)" />
+      <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)">
+        <Directory Id="VIRTUALMICFOLDER" Name="VirtualMic" />
+      </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
@@ -34,6 +36,12 @@
               Id="ApplicationStartMenuShortcut"
               Name="$(var.ProductName)"
               Target="[INSTALLFOLDER]$(var.ExecutableName)"
+              WorkingDirectory="INSTALLFOLDER" />
+          <Shortcut
+              Id="VirtualMicSetupShortcut"
+              Name="$(var.ProductName) Virtual Mic Setup"
+              Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
+              Arguments="-NoExit -NoProfile -ExecutionPolicy Bypass -File &quot;[#VirtualMicSetupScriptFile]&quot; -OpenDownloadPage"
               WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
           <RegistryValue
@@ -49,6 +57,7 @@
 
     <Feature Id="MainFeature" Title="$(var.ProductName)" Level="1">
       <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentGroupRef Id="VirtualMicSetupFiles" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
   </Package>
@@ -56,6 +65,15 @@
   <Fragment>
     <ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
       <Files Include="$(var.BundleDir)\**" />
+    </ComponentGroup>
+
+    <ComponentGroup Id="VirtualMicSetupFiles" Directory="VIRTUALMICFOLDER">
+      <Component Id="VirtualMicSetupScript" Guid="*">
+        <File
+            Id="VirtualMicSetupScriptFile"
+            Source="$(var.RepoRoot)\scripts\setup_windows_virtual_mic.ps1"
+            KeyPath="yes" />
+      </Component>
     </ComponentGroup>
   </Fragment>
 </Wix>

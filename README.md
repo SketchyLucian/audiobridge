@@ -101,6 +101,12 @@ restored and built.
 
 The MSI is written to `build/installer/AudioBridge-<version>-x64.msi`.
 
+The MSI also installs an `AudioBridge Virtual Mic Setup` Start menu shortcut.
+Run it after installation to check for a supported virtual cable driver and, if
+needed, open the official VB-CABLE setup page. Install the VB-CABLE driver as
+Administrator and reboot Windows before selecting `CABLE Input` in AudioBridge
+and `CABLE Output` in the call app.
+
 For USB tethering, enable USB tethering on Android, keep the device attached,
 and select `USB tether` in both apps. The sender and receiver still use UDP
 discovery and UDP audio, but over the tethered USB network interface instead of
