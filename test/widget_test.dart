@@ -22,6 +22,7 @@ void main() {
     expect(find.text('Custom'), findsOneWidget);
     expect(find.text('Format and bandwidth'), findsOneWidget);
     expect(find.text('Latency and stability'), findsOneWidget);
+    expect(find.text('Bitrate'), findsWidgets);
     expect(find.text('Sender buffer'), findsOneWidget);
     expect(find.text('Receiver buffer'), findsOneWidget);
     expect(find.text('Receiver adaptive buffer'), findsOneWidget);

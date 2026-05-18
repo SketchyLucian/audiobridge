@@ -7,6 +7,12 @@ class OpusNative {
 
     external fun destroyDecoder(handle: Long)
 
+    external fun createEncoder(channels: Int, bitrateBps: Int, lowDelay: Boolean): Long
+
+    external fun encode(handle: Long, input: ShortArray, frameSamples: Int): ByteArray?
+
+    external fun destroyEncoder(handle: Long)
+
     companion object {
         init {
             System.loadLibrary("audiobridge_opus")

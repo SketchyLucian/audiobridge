@@ -14,4 +14,8 @@
     <SuppressIces>ICE60</SuppressIces>
     <DefineConstants>ProductName=$(ProductName);Manufacturer=$(Manufacturer);ProductVersion=$(ProductVersion);UpgradeCode=$(UpgradeCode);ExecutableName=$(ExecutableName);BundleDir=$(BundleDir);RepoRoot=$(RepoRoot)</DefineConstants>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
+  </ItemGroup>
 </Project>

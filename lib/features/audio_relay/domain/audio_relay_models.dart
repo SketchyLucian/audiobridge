@@ -201,7 +201,7 @@ enum AudioPreset {
     return switch (this) {
       AudioPreset.gaming => const AudioProfile(
         mode: AudioPreset.gaming,
-        codec: AudioCodec.pcm,
+        codec: AudioCodec.auto,
         sampleRate: 48000,
         bitrateKbps: 1536,
         latencyMs: 18,
@@ -298,7 +298,7 @@ class AudioProfile {
 
   static const usbLowLatency = AudioProfile(
     mode: AudioPreset.gaming,
-    codec: AudioCodec.pcm,
+    codec: AudioCodec.auto,
     sampleRate: 48000,
     bitrateKbps: 1536,
     latencyMs: 6,
@@ -310,7 +310,7 @@ class AudioProfile {
 
   static const usbTetheringLowLatency = AudioProfile(
     mode: AudioPreset.gaming,
-    codec: AudioCodec.pcm,
+    codec: AudioCodec.auto,
     sampleRate: 48000,
     bitrateKbps: 1536,
     latencyMs: 24,
@@ -326,6 +326,8 @@ class AudioProfile {
     this.outputBackend = OutputAudioBackend.auto,
     this.sampleRate = 48000,
     this.bitrateKbps = 192,
+    this.adaptiveSampleRate = false,
+    this.adaptiveBitrate = false,
     this.latencyMs = 35,
     this.captureBufferMs = 35,
     this.playbackBufferMs = 35,
@@ -340,6 +342,8 @@ class AudioProfile {
   final OutputAudioBackend outputBackend;
   final int sampleRate;
   final int bitrateKbps;
+  final bool adaptiveSampleRate;
+  final bool adaptiveBitrate;
   final int latencyMs;
   final int captureBufferMs;
   final int playbackBufferMs;
@@ -363,6 +367,8 @@ class AudioProfile {
 
   bool hasSameSettings(AudioProfile other) {
     return hasSameStreamSettings(other) &&
+        adaptiveSampleRate == other.adaptiveSampleRate &&
+        adaptiveBitrate == other.adaptiveBitrate &&
         receiverAdaptiveBuffer == other.receiverAdaptiveBuffer;
   }
 
@@ -386,6 +392,8 @@ class AudioProfile {
     OutputAudioBackend? outputBackend,
     int? sampleRate,
     int? bitrateKbps,
+    bool? adaptiveSampleRate,
+    bool? adaptiveBitrate,
     int? latencyMs,
     int? captureBufferMs,
     int? playbackBufferMs,
@@ -400,6 +408,8 @@ class AudioProfile {
       outputBackend: outputBackend ?? this.outputBackend,
       sampleRate: sampleRate ?? this.sampleRate,
       bitrateKbps: bitrateKbps ?? this.bitrateKbps,
+      adaptiveSampleRate: adaptiveSampleRate ?? this.adaptiveSampleRate,
+      adaptiveBitrate: adaptiveBitrate ?? this.adaptiveBitrate,
       latencyMs: latencyMs ?? this.latencyMs,
       captureBufferMs: captureBufferMs ?? this.captureBufferMs,
       playbackBufferMs: playbackBufferMs ?? this.playbackBufferMs,
@@ -418,6 +428,8 @@ class AudioProfile {
       'outputBackend': outputBackend.name,
       'sampleRate': sampleRate,
       'bitrateKbps': effectiveBitrateKbps,
+      'adaptiveSampleRate': adaptiveSampleRate,
+      'adaptiveBitrate': adaptiveBitrate,
       'latencyMs': latencyMs,
       'captureBufferMs': captureBufferMs,
       'playbackBufferMs': playbackBufferMs,
@@ -444,6 +456,11 @@ class AudioProfile {
       outputBackend: outputBackend,
       sampleRate: _readInt(payload['sampleRate'], fallback: 48000),
       bitrateKbps: _readInt(payload['bitrateKbps'], fallback: 192),
+      adaptiveSampleRate: _readBool(
+        payload['adaptiveSampleRate'],
+        fallback: false,
+      ),
+      adaptiveBitrate: _readBool(payload['adaptiveBitrate'], fallback: false),
       latencyMs: _readInt(payload['latencyMs'], fallback: 35),
       captureBufferMs: _readInt(
         payload['captureBufferMs'],

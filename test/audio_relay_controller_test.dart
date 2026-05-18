@@ -43,6 +43,14 @@ void main() {
     expect(music.receiverAdaptiveBuffer, true);
   });
 
+  test('gaming preset defaults to auto codec for low latency', () {
+    final gaming = AudioPreset.gaming.profile;
+
+    expect(gaming.codec, AudioCodec.auto);
+    expect(AudioProfile.usbLowLatency.codec, AudioCodec.auto);
+    expect(AudioProfile.usbTetheringLowLatency.codec, AudioCodec.auto);
+  });
+
   test('all presets and loaded profiles stay stereo', () {
     for (final preset in AudioPreset.values) {
       expect(preset.profile.channels, 2);
@@ -311,6 +319,24 @@ void main() {
     controller.dispose();
   });
 
+  test(
+    'streaming latency uses requested playback buffer before metrics arrive',
+    () {
+      final controller = AudioRelayController(engine: _FakeAudioRelayEngine());
+
+      controller.updatePreset(AudioPreset.gaming);
+      controller.activity = RelayActivity.streaming;
+
+      expect(controller.latencyMetricLabel, 'Playback buffer');
+      expect(controller.liveLatencyLabel, '18 ms');
+      expect(controller.activePlaybackBufferLabel, 'Requested 18 ms');
+      expect(controller.playbackQueueFillLabel, '0%');
+      expect(controller.adaptiveBufferCapLabel, '30 ms');
+
+      controller.dispose();
+    },
+  );
+
   test('metrics parse audio and network latency fields', () {
     final metrics = AudioRelayMetrics.fromMap({
       'audioLatencyMs': 51,
@@ -370,6 +396,22 @@ void main() {
     expect(profile.toMap()['receiverAdaptiveBuffer'], false);
   });
 
+  test('audio profile parses adaptive format settings', () {
+    final profile = AudioProfile.fromMap({
+      'mode': 'balanced',
+      'codec': 'opus',
+      'sampleRate': 48000,
+      'bitrateKbps': 128,
+      'adaptiveSampleRate': 'true',
+      'adaptiveBitrate': 1,
+    });
+
+    expect(profile.adaptiveSampleRate, true);
+    expect(profile.adaptiveBitrate, true);
+    expect(profile.toMap()['adaptiveSampleRate'], true);
+    expect(profile.toMap()['adaptiveBitrate'], true);
+  });
+
   test('aac is modeled as an implemented native codec path', () {
     expect(AudioCodec.aac.isImplemented, true);
     expect(AudioCodec.aac.availabilityLabel, 'Native required');
@@ -393,6 +435,382 @@ void main() {
 
     expect(profile.effectiveBitrateKbps, 256);
   });
+
+  test('opus bitrate target is editable and clamped to codec range', () {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
+      ..role = RelayRole.sender
+      ..capabilities = const PlatformAudioCapabilities(
+        platform: 'test',
+        canSend: true,
+        canReceive: true,
+        backend: 'fake',
+        supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+        supportedOutputBackends: {OutputAudioBackend.auto},
+        codecBitrateRanges: {
+          AudioCodec.opus: CodecBitrateRange(minKbps: 64, maxKbps: 256),
+        },
+      );
+
+    controller.updateCodec(AudioCodec.opus);
+    controller.updateBitrate(128);
+
+    expect(controller.hasBitrateTarget, true);
+    expect(controller.bitrateTargetLabel, '128 kbps');
+    expect(controller.profile.effectiveBitrateKbps, 128);
+
+    controller.updateBitrate(999);
+
+    expect(controller.bitrateTargetLabel, '256 kbps');
+    expect(controller.profile.effectiveBitrateKbps, 256);
+
+    controller.dispose();
+  });
+
+  test('manual format picks turn adaptive format settings off', () {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
+      ..role = RelayRole.sender
+      ..capabilities = const PlatformAudioCapabilities(
+        platform: 'test',
+        canSend: true,
+        canReceive: true,
+        backend: 'fake',
+        supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+        supportedOutputBackends: {OutputAudioBackend.auto},
+        codecBitrateRanges: {
+          AudioCodec.opus: CodecBitrateRange(minKbps: 64, maxKbps: 256),
+        },
+      );
+
+    controller.updateAdaptiveSampleRate(true);
+    controller.updateSampleRate(96000);
+    controller.updateCodec(AudioCodec.opus);
+    controller.updateAdaptiveBitrate(true);
+    controller.updateBitrate(128);
+
+    expect(controller.profile.adaptiveSampleRate, false);
+    expect(controller.profile.sampleRate, 48000);
+    expect(controller.profile.adaptiveBitrate, false);
+    expect(controller.profile.bitrateKbps, 128);
+
+    controller.dispose();
+  });
+
+  test(
+    'adaptive stream matrix materializes every sender format axis',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final controller = AudioRelayController(engine: engine)
+        ..role = RelayRole.sender
+        ..capabilities = _adaptiveCodecCapabilities;
+
+      controller.updatePreset(AudioPreset.music);
+      controller.updateCodec(AudioCodec.aac);
+      controller.updateAdaptiveSampleRate(true);
+      controller.updateAdaptiveBitrate(true);
+      await controller.startSenderStream();
+
+      final startedProfile = engine.startedProfiles.single;
+      expect(startedProfile.codec, AudioCodec.aac);
+      expect(startedProfile.sampleRate, 96000);
+      expect(startedProfile.bitrateKbps, 192);
+      expect(startedProfile.adaptiveSampleRate, false);
+      expect(startedProfile.adaptiveBitrate, false);
+      expect(startedProfile.receiverAdaptiveBuffer, true);
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'adaptive bitrate matrix uses recent transport pressure bands',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: _FakeDiscoveryService(),
+              profileApplyDelay: Duration.zero,
+            )
+            ..role = RelayRole.sender
+            ..capabilities = _adaptiveCodecCapabilities;
+
+      controller.updateCodec(AudioCodec.opus);
+      controller.updateAdaptiveBitrate(true);
+      await controller.startSenderStream();
+
+      engine.metrics = AudioRelayMetrics.empty;
+      await controller.pollMetricsForTesting();
+      await Future<void>.delayed(Duration.zero);
+
+      Future<void> expectBitrateForDroppedPackets(
+        int droppedPackets,
+        int expectedKbps,
+      ) async {
+        engine.calls.clear();
+        engine.profiles.clear();
+        engine.metrics = AudioRelayMetrics(droppedPacketCount: droppedPackets);
+        await controller.pollMetricsForTesting();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(engine.calls, ['prepareSender']);
+        expect(engine.profiles.single.bitrateKbps, expectedKbps);
+        expect(controller.streamBitrateLabel, '$expectedKbps kbps');
+      }
+
+      await expectBitrateForDroppedPackets(1, 152);
+      await expectBitrateForDroppedPackets(7, 136);
+      await expectBitrateForDroppedPackets(19, 112);
+      await expectBitrateForDroppedPackets(43, 64);
+
+      controller.dispose();
+    },
+  );
+
+  test('adaptive bitrate lowers on recent transport pressure', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: _FakeDiscoveryService(),
+            profileApplyDelay: Duration.zero,
+          )
+          ..role = RelayRole.sender
+          ..capabilities = const PlatformAudioCapabilities(
+            platform: 'test',
+            canSend: true,
+            canReceive: true,
+            backend: 'fake',
+            supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+            supportedOutputBackends: {OutputAudioBackend.auto},
+            codecBitrateRanges: {
+              AudioCodec.opus: CodecBitrateRange(minKbps: 64, maxKbps: 256),
+            },
+          );
+
+    controller.updateCodec(AudioCodec.opus);
+    controller.updateAdaptiveBitrate(true);
+    await controller.startSenderStream();
+
+    expect(controller.profile.adaptiveBitrate, true);
+    expect(engine.startedProfiles.single.adaptiveBitrate, false);
+    expect(engine.startedProfiles.single.bitrateKbps, 160);
+    expect(controller.bitrateSettingDetailLabel, contains('64-256 kbps'));
+
+    engine.metrics = AudioRelayMetrics.empty;
+    await controller.pollMetricsForTesting();
+    await Future<void>.delayed(Duration.zero);
+
+    engine.calls.clear();
+    engine.profiles.clear();
+    engine.metrics = const AudioRelayMetrics(droppedPacketCount: 12);
+    await controller.pollMetricsForTesting();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(engine.calls, ['prepareSender']);
+    expect(engine.profiles.single.bitrateKbps, 112);
+    expect(controller.streamBitrateLabel, '112 kbps');
+
+    engine.calls.clear();
+    engine.profiles.clear();
+    for (var index = 0; index < 6; index += 1) {
+      await controller.pollMetricsForTesting();
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    expect(engine.calls, ['prepareSender']);
+    expect(engine.profiles.single.bitrateKbps, 136);
+    expect(controller.streamBitrateLabel, '136 kbps');
+
+    controller.dispose();
+  });
+
+  test('receiver buffer pressure does not lower adaptive bitrate', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: _FakeDiscoveryService(),
+            profileApplyDelay: Duration.zero,
+          )
+          ..role = RelayRole.sender
+          ..capabilities = const PlatformAudioCapabilities(
+            platform: 'test',
+            canSend: true,
+            canReceive: true,
+            backend: 'fake',
+            supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+            supportedOutputBackends: {OutputAudioBackend.auto},
+            codecBitrateRanges: {
+              AudioCodec.opus: CodecBitrateRange(minKbps: 64, maxKbps: 256),
+            },
+          );
+
+    controller.updateCodec(AudioCodec.opus);
+    controller.updateAdaptiveBitrate(true);
+    await controller.startSenderStream();
+
+    engine.calls.clear();
+    engine.profiles.clear();
+    engine.metrics = const AudioRelayMetrics(
+      adaptiveLimitReached: true,
+      adaptiveUnderrunsInWindow: 4,
+      adaptiveLowQueueSamples: 3,
+    );
+    await controller.pollMetricsForTesting();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(engine.calls, isEmpty);
+    expect(controller.streamBitrateLabel, '160 kbps');
+
+    controller.dispose();
+  });
+
+  test(
+    'receiver adaptive toggle preserves concrete sender format while streaming',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final discoveryService = _FakeDiscoveryService();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: discoveryService,
+              profileApplyDelay: Duration.zero,
+            )
+            ..role = RelayRole.sender
+            ..capabilities = const PlatformAudioCapabilities(
+              platform: 'test',
+              canSend: true,
+              canReceive: true,
+              backend: 'fake',
+              supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+              supportedOutputBackends: {OutputAudioBackend.auto},
+              codecBitrateRanges: {
+                AudioCodec.opus: CodecBitrateRange(minKbps: 64, maxKbps: 256),
+              },
+            );
+
+      controller.updateCodec(AudioCodec.opus);
+      controller.updateAdaptiveBitrate(true);
+      await controller.startSenderStream();
+      final startedProfile = engine.startedProfiles.single;
+      engine.calls.clear();
+      engine.profiles.clear();
+      discoveryService.advertisedProfiles.clear();
+
+      engine.metrics = const AudioRelayMetrics(
+        adaptiveLimitReached: true,
+        adaptiveUnderrunsInWindow: 4,
+        adaptiveLowQueueSamples: 3,
+      );
+      controller.updateReceiverAdaptiveBuffer(false);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(engine.calls, ['prepareSender']);
+      expect(engine.profiles.single.codec, startedProfile.codec);
+      expect(engine.profiles.single.sampleRate, startedProfile.sampleRate);
+      expect(engine.profiles.single.bitrateKbps, startedProfile.bitrateKbps);
+      expect(engine.profiles.single.packetTimeMs, startedProfile.packetTimeMs);
+      expect(engine.profiles.single.receiverAdaptiveBuffer, false);
+      expect(
+        discoveryService.advertisedProfiles.single.bitrateKbps,
+        startedProfile.bitrateKbps,
+      );
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'live buffering changes resolve together without format side effects',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: _FakeDiscoveryService(),
+              profileApplyDelay: Duration.zero,
+            )
+            ..role = RelayRole.sender
+            ..capabilities = const PlatformAudioCapabilities(
+              platform: 'test',
+              canSend: true,
+              canReceive: true,
+              backend: 'fake',
+              supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+              supportedOutputBackends: {OutputAudioBackend.auto},
+              codecBitrateRanges: {
+                AudioCodec.opus: CodecBitrateRange(minKbps: 64, maxKbps: 256),
+              },
+            );
+
+      controller.updateCodec(AudioCodec.opus);
+      controller.updateAdaptiveBitrate(true);
+      await controller.startSenderStream();
+      final startedProfile = engine.startedProfiles.single;
+      engine.calls.clear();
+      engine.profiles.clear();
+
+      controller.updatePlaybackBuffer(24);
+      controller.updatePacketTime(2);
+      controller.updateReceiverAdaptiveBuffer(false);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(engine.calls, ['prepareSender']);
+      expect(engine.profiles.single.codec, startedProfile.codec);
+      expect(engine.profiles.single.sampleRate, startedProfile.sampleRate);
+      expect(engine.profiles.single.bitrateKbps, startedProfile.bitrateKbps);
+      expect(engine.profiles.single.playbackBufferMs, 24);
+      expect(engine.profiles.single.packetTimeMs, 2);
+      expect(engine.profiles.single.receiverAdaptiveBuffer, false);
+
+      controller.dispose();
+    },
+  );
+
+  test('adaptive sample rate materializes a concrete sender rate', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..metrics = const AudioRelayMetrics(
+        adaptiveLimitReached: true,
+        adaptiveUnderrunsInWindow: 4,
+        adaptiveLowQueueSamples: 3,
+      );
+
+    controller.updateAdaptiveSampleRate(true);
+    await controller.startSenderStream();
+
+    expect(controller.profile.adaptiveSampleRate, true);
+    expect(engine.startedProfiles.single.adaptiveSampleRate, false);
+    expect(engine.startedProfiles.single.sampleRate, 48000);
+    expect(controller.sampleRateLabel, 'Adaptive (48 kHz)');
+    expect(
+      controller.sampleRateSettingDetailLabel,
+      contains('44.1 kHz-96 kHz'),
+    );
+
+    controller.dispose();
+  });
+
+  test(
+    'pcm bitrate is calculated and ignores manual bitrate target changes',
+    () {
+      final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
+        ..role = RelayRole.sender
+        ..capabilities = _supportedCapabilities;
+
+      controller.updateBitrate(128);
+
+      expect(controller.hasBitrateTarget, false);
+      expect(controller.streamBitrateLabel, '1536 kbps');
+      expect(
+        controller.profile.bitrateKbps,
+        AudioPreset.balanced.profile.bitrateKbps,
+      );
+
+      controller.dispose();
+    },
+  );
 
   test('auto codec is a controller policy, not a packet codec', () {
     expect(AudioCodec.auto.isImplemented, true);
@@ -573,6 +991,28 @@ void main() {
     controller.dispose();
   });
 
+  test('opus packet label reports the effective low delay frame size', () {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
+      ..role = RelayRole.sender
+      ..capabilities = const PlatformAudioCapabilities(
+        platform: 'test',
+        canSend: true,
+        canReceive: true,
+        backend: 'fake',
+        supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+        supportedOutputBackends: {OutputAudioBackend.auto},
+        codecBitrateRanges: {},
+      );
+
+    controller.updatePreset(AudioPreset.gaming);
+    controller.updateCodec(AudioCodec.opus);
+
+    expect(controller.profile.packetTimeMs, 1);
+    expect(controller.packetFramesLabel, '120 frames per packet · 2.5 ms Opus');
+
+    controller.dispose();
+  });
+
   test('opus profile ignores non-48 kHz sample rate changes', () {
     final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
       ..capabilities = const PlatformAudioCapabilities(
@@ -617,6 +1057,125 @@ void main() {
 
     controller.dispose();
   });
+
+  test(
+    'gaming auto codec starts with opus when receiver support is known',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final controller = AudioRelayController(engine: engine)
+        ..role = RelayRole.sender
+        ..capabilities = const PlatformAudioCapabilities(
+          platform: 'test',
+          canSend: true,
+          canReceive: true,
+          backend: 'fake',
+          supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+          supportedOutputBackends: {OutputAudioBackend.auto},
+          codecBitrateRanges: {},
+        );
+
+      controller.updatePreset(AudioPreset.gaming);
+      controller.updateCodec(AudioCodec.auto);
+      controller.metrics = const AudioRelayMetrics(
+        remoteSupportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+      );
+      await controller.startSenderStream();
+
+      expect(controller.profile.codec, AudioCodec.auto);
+      expect(engine.profiles.first.codec, AudioCodec.opus);
+      expect(engine.startedProfiles.single.codec, AudioCodec.opus);
+      expect(controller.codecStatusLabel, 'Auto (Opus)');
+      expect(controller.streamBitrateLabel, '256 kbps');
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'gaming auto codec prefers low-delay adpcm over aac without opus',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final controller = AudioRelayController(engine: engine)
+        ..role = RelayRole.sender
+        ..capabilities = const PlatformAudioCapabilities(
+          platform: 'test',
+          canSend: true,
+          canReceive: true,
+          backend: 'fake',
+          supportedCodecs: {
+            AudioCodec.pcm,
+            AudioCodec.aac,
+            AudioCodec.imaAdpcm,
+          },
+          supportedOutputBackends: {OutputAudioBackend.auto},
+          codecBitrateRanges: {},
+        );
+
+      controller.updatePreset(AudioPreset.gaming);
+      controller.updateCodec(AudioCodec.auto);
+      controller.metrics = const AudioRelayMetrics(
+        remoteSupportedCodecs: {
+          AudioCodec.pcm,
+          AudioCodec.aac,
+          AudioCodec.imaAdpcm,
+        },
+      );
+      await controller.startSenderStream();
+
+      expect(controller.profile.codec, AudioCodec.auto);
+      expect(engine.profiles.first.codec, AudioCodec.imaAdpcm);
+      expect(engine.startedProfiles.single.codec, AudioCodec.imaAdpcm);
+      expect(controller.codecStatusLabel, 'Auto (IMA ADPCM)');
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'gaming auto codec upgrades to opus as soon as receiver supports it',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final discoveryService = _FakeDiscoveryService();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: discoveryService,
+            )
+            ..role = RelayRole.sender
+            ..capabilities = const PlatformAudioCapabilities(
+              platform: 'test',
+              canSend: true,
+              canReceive: true,
+              backend: 'fake',
+              supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+              supportedOutputBackends: {OutputAudioBackend.auto},
+              codecBitrateRanges: {},
+            );
+
+      controller.updatePreset(AudioPreset.gaming);
+      controller.updateCodec(AudioCodec.auto);
+      await controller.startSenderStream();
+
+      expect(engine.startedProfiles.single.codec, AudioCodec.pcm);
+      engine.calls.clear();
+      engine.profiles.clear();
+      discoveryService.advertisedProfiles.clear();
+
+      engine.metrics = const AudioRelayMetrics(
+        signalLevel: 0.8,
+        remoteSupportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+      );
+      await controller.pollMetricsForTesting();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(engine.calls, ['prepareSender']);
+      expect(engine.profiles.single.codec, AudioCodec.opus);
+      expect(discoveryService.advertisedProfiles.single.codec, AudioCodec.opus);
+      expect(controller.codecStatusLabel, 'Auto (Opus)');
+
+      controller.dispose();
+    },
+  );
 
   test(
     'auto codec switches after warmup only when receiver is quiet',
@@ -808,9 +1367,12 @@ void main() {
 
     expect(engine.calls, ['prepareUsbSender']);
     expect(
-      engine.profiles.single.hasSameSettings(AudioProfile.usbLowLatency),
+      engine.profiles.single.hasSameSettings(
+        AudioProfile.usbLowLatency.copyWith(codec: AudioCodec.pcm),
+      ),
       true,
     );
+    expect(controller.profile.codec, AudioCodec.auto);
     expect(controller.activity, RelayActivity.advertising);
 
     controller.dispose();
@@ -891,10 +1453,11 @@ void main() {
     expect(engine.senderBindAddresses.single, '192.168.11.87');
     expect(
       engine.profiles.single.hasSameSettings(
-        AudioProfile.usbTetheringLowLatency,
+        AudioProfile.usbTetheringLowLatency.copyWith(codec: AudioCodec.pcm),
       ),
       true,
     );
+    expect(controller.profile.codec, AudioCodec.auto);
     expect(
       discoveryService.advertisedDevices.single.transport,
       RelayTransport.usbTethering,
@@ -1137,6 +1700,19 @@ const _receiverBackendCapabilities = PlatformAudioCapabilities(
     OutputAudioBackend.audioTrack,
   },
   codecBitrateRanges: {},
+);
+
+const _adaptiveCodecCapabilities = PlatformAudioCapabilities(
+  platform: 'test',
+  canSend: true,
+  canReceive: true,
+  backend: 'fake',
+  supportedCodecs: {AudioCodec.pcm, AudioCodec.opus, AudioCodec.aac},
+  supportedOutputBackends: {OutputAudioBackend.auto},
+  codecBitrateRanges: {
+    AudioCodec.opus: CodecBitrateRange(minKbps: 64, maxKbps: 256),
+    AudioCodec.aac: CodecBitrateRange(minKbps: 96, maxKbps: 192),
+  },
 );
 
 class _FakeAudioRelayEngine implements AudioRelayEngine {

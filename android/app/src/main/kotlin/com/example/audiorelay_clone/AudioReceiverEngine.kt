@@ -15,6 +15,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.Process
@@ -36,6 +37,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
@@ -70,7 +72,10 @@ private const val RECEIVER_OPTION_MODE_SHIFT = 4
 private const val RECEIVER_OPTION_MODE_MASK = 3 shl RECEIVER_OPTION_MODE_SHIFT
 private const val RECEIVER_OPTION_CUSTOM_CAP_SHIFT = 8
 private const val RECEIVER_OPTION_CUSTOM_CAP_MASK = 0x1FF shl RECEIVER_OPTION_CUSTOM_CAP_SHIFT
+private const val RECEIVER_OPTION_BITRATE_SHIFT = 20
+private const val RECEIVER_OPTION_BITRATE_MASK = 0xFFF
 private const val AAC_SAMPLES_PER_FRAME = 1024
+private const val AAC_CODEC_TIMEOUT_US = 5000L
 private const val SUBSCRIBE_MESSAGE = "ABR_SUBSCRIBE v1"
 private const val MIN_LATENCY_MS = 5
 private const val USB_MIN_LATENCY_MS = 5
@@ -79,19 +84,23 @@ private const val LOW_LATENCY_PERFORMANCE_MAX_MS = 80
 private const val LOW_DELAY_TRAFFIC_CLASS = 0xB8
 private const val UDP_BUFFER_BYTES = 256 * 1024
 private const val SUBSCRIBE_INTERVAL_MS = 300L
+private const val SUBSCRIBE_MAX_BYTES = 2048
 private const val SOURCE_IDLE_TIMEOUT_MS = 1200L
 private const val START_BUFFER_PACKETS = 4
 private const val START_BUFFER_EXTRA_MS = 2
 private const val ADAPTIVE_BUFFER_COOLDOWN_MS = 1500L
 private const val ADAPTIVE_BUFFER_RELAX_MS = 6000L
 private const val ADAPTIVE_BUFFER_FAST_RELAX_MS = 2500L
+private const val ADAPTIVE_GAMING_BUFFER_RELAX_MS = 1800L
+private const val ADAPTIVE_GAMING_BUFFER_FAST_RELAX_MS = 1000L
+private const val ADAPTIVE_PLAYBACK_START_GRACE_MS = 1000L
 private const val ADAPTIVE_UNDERRUN_SLOW_WINDOW_MS = 15000L
 private const val ADAPTIVE_ACCEPTABLE_UNDERRUNS_PER_SLOW_WINDOW = 4
 private const val ADAPTIVE_UNDERRUN_BURST_WINDOW_MS = 2000L
 private const val ADAPTIVE_ACCEPTABLE_UNDERRUNS_PER_BURST = 3
-private const val ADAPTIVE_LOW_QUEUE_SAMPLES_TO_INCREASE = 5
 private const val ADAPTIVE_LOW_QUEUE_DIVISOR = 4L
 private const val ADAPTIVE_LOW_LATENCY_STEP_MS = 4
+private const val ADAPTIVE_GAMING_RELAX_STEP_MS = 1
 private const val ADAPTIVE_BALANCED_STEP_MS = 8
 private const val ADAPTIVE_STABLE_STEP_MS = 20
 private const val ADAPTIVE_ULTRA_LOW_LATENCY_CAP_MS = 24
@@ -107,9 +116,19 @@ private const val ADAPTIVE_DELAY_MAX_MS = 2000.0
 private const val ADAPTIVE_SEQUENCE_RESET_GAP = 50L
 private const val ADAPTIVE_NETWORK_TARGET_HYSTERESIS_MS = 3
 private const val ADAPTIVE_FAST_RELAX_MARGIN_MS = 8
+private const val ADAPTIVE_AUDIBLE_SIGNAL_FLOOR = 0.001
+private const val ADAPTIVE_LINK_MEMORY_PREFS = "audio_bridge_adaptive_link_memory"
+private const val ADAPTIVE_LINK_MEMORY_VERSION = 1
+private const val ADAPTIVE_LINK_MEMORY_MAX_AGE_MS = 14L * 24L * 60L * 60L * 1000L
+private const val ADAPTIVE_LINK_MEMORY_WRITE_COOLDOWN_MS = 1500L
 private const val SEQUENCE_MODULUS = 0x1_0000_0000L
 private const val AAC_MIME_TYPE = "audio/mp4a-latm"
 private const val OPUS_SAMPLE_RATE = 48000
+private const val OPUS_LOW_FRAME_SAMPLES = OPUS_SAMPLE_RATE * 25 / 10000
+private const val OPUS_SHORT_FRAME_MS = 5
+private const val OPUS_LONG_FRAME_MS = 10
+private const val OPUS_SHORT_FRAME_SAMPLES = OPUS_SAMPLE_RATE * OPUS_SHORT_FRAME_MS / 1000
+private const val OPUS_LONG_FRAME_SAMPLES = OPUS_SAMPLE_RATE * OPUS_LONG_FRAME_MS / 1000
 private const val CD_SAMPLE_RATE = 44100
 private const val MAX_OUTPUT_SAMPLE_RATE = 192000
 private const val ACCESSORY_MANUFACTURER = "AudioBridge"
@@ -187,6 +206,14 @@ private data class EncodedAudioPacket(
     val flags: Int
 )
 
+private data class AdaptiveNetworkIdentity(
+    val interfaceName: String,
+    val interfaceDescription: String,
+    val prefixLength: Int,
+    val localSubnet: String,
+    val peerSubnet: String
+)
+
 class AudioReceiverEngine(private val context: Context) {
     private var profile = AudioProfile()
     private var engineRole = EngineRole.RECEIVER
@@ -229,7 +256,9 @@ class AudioReceiverEngine(private val context: Context) {
     private var currentUseBlockingWrites = false
     private var adaptivePlaybackBufferMs = 35
     private var lastAdaptiveBufferIncreaseAtMs = 0L
+    private var lastAdaptiveBufferRelaxAtMs = 0L
     private var lastPlaybackPressureAtMs = 0L
+    private var playbackStartedAtMs = 0L
     private var lastKnownUnderrunCount = 0
     private var adaptiveUnderrunWindowStartAtMs = 0L
     private var adaptiveUnderrunsInWindow = 0
@@ -246,6 +275,11 @@ class AudioReceiverEngine(private val context: Context) {
     private var adaptiveDelayHistoryIndex = 0
     private var adaptiveDelayHistoryCount = 0
     private var adaptiveNetworkTargetBufferMs = 0
+    private val adaptiveLinkPreferences by lazy {
+        context.getSharedPreferences(ADAPTIVE_LINK_MEMORY_PREFS, Context.MODE_PRIVATE)
+    }
+    private var adaptiveLinkMemoryKey: String? = null
+    private var lastAdaptiveLinkMemoryWriteAtMs = 0L
     private var lastPlaybackHead = 0
     private var playbackHeadWraps = 0L
     private var lastSequence = -1L
@@ -255,6 +289,10 @@ class AudioReceiverEngine(private val context: Context) {
     private val opusNative = OpusNative()
     private var opusDecoderHandle = 0L
     private var opusChannels = 0
+    private var opusEncoderHandle = 0L
+    private var opusEncoderChannels = 0
+    private var opusEncoderBitrateBps = 0
+    private var opusEncoderLowDelay = false
     private var aacDecoder: MediaCodec? = null
     private var aacSampleRate = 0
     private var aacChannels = 0
@@ -338,10 +376,11 @@ class AudioReceiverEngine(private val context: Context) {
         "canReceive" to true,
         "backend" to "android-audiorecord-audiotrack-codecs-udp-native-usb",
         "detail" to "Low-latency UDP microphone capture plus UDP, USB tethering, and Android Open Accessory USB playback",
-        "supportedCodecs" to listOf("pcm", "aac", "g711MuLaw", "g711ALaw", "imaAdpcm"),
+        "supportedCodecs" to listOf("pcm", "opus", "aac", "g711MuLaw", "g711ALaw", "imaAdpcm"),
         "supportedOutputBackends" to listOf("auto", "audioTrack"),
         "codecBitrateRanges" to mapOf(
             "pcm" to mapOf("minKbps" to 0, "maxKbps" to 0),
+            "opus" to mapOf("minKbps" to 64, "maxKbps" to 256),
             "aac" to mapOf("minKbps" to 96, "maxKbps" to 192),
             "g711MuLaw" to mapOf("minKbps" to 64, "maxKbps" to 1536),
             "g711ALaw" to mapOf("minKbps" to 64, "maxKbps" to 1536),
@@ -351,12 +390,17 @@ class AudioReceiverEngine(private val context: Context) {
 
     fun getMetrics(): Map<String, Any> {
         if (engineRole == EngineRole.SENDER) {
-            val receivedAt = remoteMetricsReceivedAtMs.get()
-            if (receivedAt <= 0 || SystemClock.elapsedRealtime() - receivedAt > 3000L) {
-                return emptyMap()
+            val metrics = mutableMapOf<String, Any>()
+            if (running) {
+                metrics["signalLevel"] = signalLevel
             }
 
-            val metrics = mutableMapOf<String, Any>(
+            val receivedAt = remoteMetricsReceivedAtMs.get()
+            if (receivedAt <= 0 || SystemClock.elapsedRealtime() - receivedAt > 3000L) {
+                return metrics
+            }
+
+            metrics.putAll(mapOf(
                 "queuedFrames" to remoteQueuedFrames.get(),
                 "bufferSizeFrames" to remoteBufferSizeFrames.get(),
                 "targetBufferFrames" to remoteTargetBufferFrames.get(),
@@ -370,9 +414,11 @@ class AudioReceiverEngine(private val context: Context) {
                 "underrunCount" to remoteUnderrunCount.get(),
                 "droppedPacketCount" to remoteDroppedPacketCount.get(),
                 "lostPacketCount" to remoteLostPacketCount.get(),
-                "trimCount" to remoteTrimCount.get(),
-                "signalLevel" to remoteSignalLevel
-            )
+                "trimCount" to remoteTrimCount.get()
+            ))
+            if (!running) {
+                metrics["signalLevel"] = remoteSignalLevel
+            }
             if (!remoteAudioLatencyMs.isNaN()) {
                 metrics["audioLatencyMs"] = remoteAudioLatencyMs
             }
@@ -456,9 +502,10 @@ class AudioReceiverEngine(private val context: Context) {
             minLatencyMs(),
             MAX_LATENCY_MS
         )
-        val targetFrames = latencyFrames(activeSampleRate, requestedLatencyMs)
+        val activeLatencyMs = initialAdaptivePlaybackBufferMs()
+        val targetFrames = latencyFrames(activeSampleRate, activeLatencyMs)
         val adaptiveMaxBufferMs = adaptiveMaxPlaybackBufferMs(requestedLatencyMs)
-        adaptivePlaybackBufferMs = requestedLatencyMs
+        adaptivePlaybackBufferMs = activeLatencyMs
         resetAdaptiveDelayTracker()
         signalLevel = 0.0
 
@@ -471,7 +518,7 @@ class AudioReceiverEngine(private val context: Context) {
             } else {
                 targetFrames
             },
-            "adaptivePlaybackBufferMs" to requestedLatencyMs,
+            "adaptivePlaybackBufferMs" to activeLatencyMs,
             "adaptiveMaxPlaybackBufferMs" to adaptiveMaxBufferMs,
             "adaptiveLimitReached" to false,
             "adaptiveUnderrunsInWindow" to 0,
@@ -505,7 +552,8 @@ class AudioReceiverEngine(private val context: Context) {
         resetAdaptiveDelayTracker()
         updateAdaptivePlaybackBuffer(
             sampleRate,
-            profile.playbackBufferMs.coerceIn(minLatencyMs(), MAX_LATENCY_MS)
+            initialAdaptivePlaybackBufferMs(),
+            remember = false
         )
         signalLevel = 0.0
     }
@@ -539,6 +587,7 @@ class AudioReceiverEngine(private val context: Context) {
         profile = AudioProfile.from(arguments)
         transportMode = TransportMode.WIFI
         networkBindAddress = null
+        adaptiveLinkMemoryKey = null
         validateOutputBackend()
         closeUsbConnection()
     }
@@ -562,6 +611,7 @@ class AudioReceiverEngine(private val context: Context) {
         transportMode = TransportMode.WIFI
         networkBindAddress = null
         source = null
+        adaptiveLinkMemoryKey = null
         closeUsbConnection()
         releaseAudioTrack()
         if (socket == null || socket?.isClosed == true) {
@@ -582,6 +632,7 @@ class AudioReceiverEngine(private val context: Context) {
         networkBindAddress = null
         source = null
         senderEndpoint = null
+        adaptiveLinkMemoryKey = null
         socket?.close()
         socket = null
         releaseAudioTrack()
@@ -614,6 +665,7 @@ class AudioReceiverEngine(private val context: Context) {
         val hostAddress = InetAddress.getByName(host)
         source = InetSocketAddress(hostAddress, port)
         networkBindAddress = receiverBindAddressForPeer(hostAddress, host)
+        refreshAdaptiveLinkMemoryKey()
 
         if (transportMode == TransportMode.USB) {
             socket?.close()
@@ -659,12 +711,13 @@ class AudioReceiverEngine(private val context: Context) {
         trimCount.set(0)
         releaseOpusDecoder()
         releaseAacDecoder()
-        adaptivePlaybackBufferMs = profile.playbackBufferMs.coerceIn(
-            minLatencyMs(),
-            MAX_LATENCY_MS
-        )
+        val now = SystemClock.elapsedRealtime()
+        refreshAdaptiveLinkMemoryKey()
+        adaptivePlaybackBufferMs = initialAdaptivePlaybackBufferMs()
         lastAdaptiveBufferIncreaseAtMs = 0L
-        lastPlaybackPressureAtMs = 0L
+        lastAdaptiveBufferRelaxAtMs = now
+        lastPlaybackPressureAtMs = now
+        playbackStartedAtMs = 0L
         lastKnownUnderrunCount = 0
         adaptiveUnderrunWindowStartAtMs = 0L
         adaptiveUnderrunsInWindow = 0
@@ -728,6 +781,7 @@ class AudioReceiverEngine(private val context: Context) {
         source = null
         transportMode = TransportMode.WIFI
         networkBindAddress = null
+        adaptiveLinkMemoryKey = null
         engineRole = EngineRole.RECEIVER
         closeUsbConnection()
         releaseOpusDecoder()
@@ -845,6 +899,101 @@ class AudioReceiverEngine(private val context: Context) {
         return null
     }
 
+    private fun adaptiveLinkIdentityKey(): String? {
+        if (transportMode == TransportMode.USB) {
+            return null
+        }
+
+        val peerAddress = source?.address as? Inet4Address ?: return null
+        val localAddress = (networkBindAddress as? Inet4Address)
+            ?: (localAddressForPeer(peerAddress) as? Inet4Address)
+            ?: return null
+        val networkIdentity = adaptiveNetworkIdentity(localAddress, peerAddress) ?: return null
+        val accessPoint = wifiAccessPointIdentity()?.let { "ap:${linkKeyPart(it)}" }
+            ?: "ap:unknown"
+        val transport = transportMode.name.lowercase(Locale.US)
+        val mode = profile.mode.name.lowercase(Locale.US)
+        val format = "fmt:${profile.sampleRate}:${profile.channels}:${profile.packetTimeMs}"
+
+        val rawKey = listOf(
+            "v$ADAPTIVE_LINK_MEMORY_VERSION",
+            transport,
+            accessPoint,
+            "if:${linkKeyPart(networkIdentity.interfaceName)}",
+            "desc:${linkKeyPart(networkIdentity.interfaceDescription)}",
+            "local:${networkIdentity.localSubnet}",
+            "peer:${networkIdentity.peerSubnet}",
+            "host:${peerAddress.hostAddress}",
+            mode,
+            format
+        ).joinToString("|")
+        return "link:${sha256Hex(rawKey)}"
+    }
+
+    private fun adaptiveNetworkIdentity(
+        localAddress: Inet4Address,
+        peerAddress: Inet4Address
+    ): AdaptiveNetworkIdentity? {
+        val interfaces = try {
+            NetworkInterface.getNetworkInterfaces()
+        } catch (_: SocketException) {
+            null
+        } ?: return null
+
+        for (networkInterface in Collections.list(interfaces)) {
+            val usable = try {
+                networkInterface.isUp && !networkInterface.isLoopback
+            } catch (_: SocketException) {
+                false
+            }
+            if (!usable) {
+                continue
+            }
+
+            for (interfaceAddress in networkInterface.interfaceAddresses) {
+                val address = interfaceAddress.address as? Inet4Address ?: continue
+                if (address != localAddress) {
+                    continue
+                }
+
+                val prefixLength = interfaceAddress.networkPrefixLength
+                    .toInt()
+                    .coerceIn(0, 32)
+                return AdaptiveNetworkIdentity(
+                    interfaceName = networkInterface.name,
+                    interfaceDescription = networkInterface.displayName ?: networkInterface.name,
+                    prefixLength = prefixLength,
+                    localSubnet = ipv4SubnetLabel(localAddress, prefixLength),
+                    peerSubnet = ipv4SubnetLabel(peerAddress, prefixLength)
+                )
+            }
+        }
+
+        return null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun wifiAccessPointIdentity(): String? {
+        if (transportMode != TransportMode.WIFI) {
+            return null
+        }
+
+        val wifiManager = context.applicationContext
+            .getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return null
+        val connectionInfo = wifiManager.connectionInfo ?: return null
+        val ssid = connectionInfo.ssid
+            ?.trim('"')
+            ?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
+        val bssid = connectionInfo.bssid
+            ?.takeIf {
+                it.isNotBlank() &&
+                    it != "02:00:00:00:00:00" &&
+                    it != "00:00:00:00:00:00"
+            }
+
+        return listOfNotNull(ssid, bssid).takeIf { it.isNotEmpty() }?.joinToString("@")
+    }
+
     private fun isUsableLocalIPv4(address: Inet4Address): Boolean {
         return !address.isAnyLocalAddress &&
             !address.isLoopbackAddress &&
@@ -866,6 +1015,33 @@ class AudioReceiverEngine(private val context: Context) {
             ((bytes[1].toInt() and 0xFF) shl 16) or
             ((bytes[2].toInt() and 0xFF) shl 8) or
             (bytes[3].toInt() and 0xFF)
+    }
+
+    private fun ipv4SubnetLabel(address: Inet4Address, prefixLength: Int): String {
+        val mask = if (prefixLength == 0) 0 else -1 shl (32 - prefixLength)
+        val network = ipv4ToInt(address) and mask
+        return "${ipv4IntToString(network)}/$prefixLength"
+    }
+
+    private fun ipv4IntToString(value: Int): String {
+        return listOf(
+            (value ushr 24) and 0xFF,
+            (value ushr 16) and 0xFF,
+            (value ushr 8) and 0xFF,
+            value and 0xFF
+        ).joinToString(".")
+    }
+
+    private fun linkKeyPart(value: String): String {
+        return value.lowercase(Locale.US).replace(Regex("[^a-z0-9.:-]+"), "_")
+    }
+
+    private fun sha256Hex(value: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(value.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { byte ->
+            String.format(Locale.US, "%02x", byte.toInt() and 0xFF)
+        }
     }
 
     private fun DatagramSocket.applyLowDelaySocketOptions() {
@@ -921,7 +1097,7 @@ class AudioReceiverEngine(private val context: Context) {
 
     private fun senderControlLoop() {
         val activeSocket = socket ?: return
-        val buffer = ByteArray(512)
+        val buffer = ByteArray(SUBSCRIBE_MAX_BYTES)
 
         while (senderControlRunning) {
             try {
@@ -1018,6 +1194,7 @@ class AudioReceiverEngine(private val context: Context) {
         captureThread?.join(800)
         captureThread = null
         releaseAudioRecord()
+        releaseOpusEncoder()
         resetSenderPacketizer()
     }
 
@@ -1063,11 +1240,19 @@ class AudioReceiverEngine(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     private fun createAudioRecord(): SenderAudioCapture? {
-        val requestedSampleRate = profile.sampleRate.coerceIn(8000, MAX_OUTPUT_SAMPLE_RATE)
+        val requestedSampleRate = if (profile.codec == CODEC_OPUS) {
+            OPUS_SAMPLE_RATE
+        } else {
+            profile.sampleRate.coerceIn(8000, MAX_OUTPUT_SAMPLE_RATE)
+        }
         val requestedChannels = profile.channels.coerceIn(1, 2)
-        val sampleRates = listOf(requestedSampleRate, 48000, 44100)
-            .distinct()
-            .filter { it in 8000..MAX_OUTPUT_SAMPLE_RATE }
+        val sampleRates = if (profile.codec == CODEC_OPUS) {
+            listOf(OPUS_SAMPLE_RATE)
+        } else {
+            listOf(requestedSampleRate, 48000, 44100)
+                .distinct()
+                .filter { it in 8000..MAX_OUTPUT_SAMPLE_RATE }
+        }
         val channelCounts = listOf(requestedChannels, 1).distinct()
 
         for (sampleRate in sampleRates) {
@@ -1144,6 +1329,11 @@ class AudioReceiverEngine(private val context: Context) {
         }
 
         val codecId = senderCodecId()
+        signalLevel = if (muted) {
+            0.0
+        } else {
+            pcmPeakLevel(packetData, packetSampleCount)
+        }
         val packetTimeMs = profile.packetTimeMs.coerceIn(1, 12)
         if (
             packetizerSampleRate != sampleRate ||
@@ -1254,6 +1444,12 @@ class AudioReceiverEngine(private val context: Context) {
         val decodedFrameCount = if (channels <= 0) 0 else pcm.size / channels
 
         return when (codecId) {
+            CODEC_OPUS -> EncodedAudioPacket(
+                codecId = CODEC_OPUS,
+                payload = encodeOpusPayload(pcm, channels),
+                decodedFrameCount = decodedFrameCount,
+                flags = flags
+            )
             CODEC_AAC -> {
                 val payload = encodeAacPayload(pcm, channels)
                 val encodedFrameCount = aacPayloadFrameCount(payload)
@@ -1293,6 +1489,53 @@ class AudioReceiverEngine(private val context: Context) {
                 flags = flags
             )
         }
+    }
+
+    private fun encodeOpusPayload(pcm: ShortArray, channels: Int): ByteArray {
+        val channelCount = channels.coerceIn(1, 2)
+        val frameSamples = if (channelCount <= 0) 0 else pcm.size / channelCount
+        if (!isSupportedOpusFrameSamples(frameSamples)) {
+            return ByteArray(0)
+        }
+
+        val encoder = ensureOpusEncoder(channelCount) ?: return ByteArray(0)
+        val input = ShortArray(pcm.size)
+        for (index in pcm.indices) {
+            input[index] = scaledSample(pcm[index])
+        }
+        return opusNative.encode(encoder, input, frameSamples) ?: ByteArray(0)
+    }
+
+    private fun ensureOpusEncoder(channels: Int): Long? {
+        val channelCount = channels.coerceIn(1, 2)
+        val bitrateBps = profile.bitrateKbps.coerceIn(64, 256) * 1000
+        val lowDelay = shouldUseLowDelayOpus()
+        if (
+            opusEncoderHandle != 0L &&
+            opusEncoderChannels == channelCount &&
+            opusEncoderBitrateBps == bitrateBps &&
+            opusEncoderLowDelay == lowDelay
+        ) {
+            return opusEncoderHandle
+        }
+
+        releaseOpusEncoder()
+
+        val nextHandle = opusNative.createEncoder(channelCount, bitrateBps, lowDelay)
+        if (nextHandle == 0L) {
+            return null
+        }
+        opusEncoderHandle = nextHandle
+        opusEncoderChannels = channelCount
+        opusEncoderBitrateBps = bitrateBps
+        opusEncoderLowDelay = lowDelay
+        return opusEncoderHandle
+    }
+
+    private fun shouldUseLowDelayOpus(): Boolean {
+        return profile.mode == AudioMode.GAMING ||
+            profile.packetTimeMs <= 2 ||
+            profile.playbackBufferMs <= 28
     }
 
     private fun encodeAacPayload(pcm: ShortArray, channels: Int): ByteArray {
@@ -1532,6 +1775,14 @@ class AudioReceiverEngine(private val context: Context) {
             ((data[offset + 5].toInt() and 0xE0) shr 5)
     }
 
+    private fun adtsHeaderSize(data: ByteArray, offset: Int, available: Int): Int {
+        if (available < 7) {
+            return 7
+        }
+        val protectionAbsent = (data[offset + 1].toInt() and 0x01) != 0
+        return if (protectionAbsent) 7 else 9
+    }
+
     private fun findNextAdtsFrameOffset(data: ByteArray, startOffset: Int, endOffset: Int): Int {
         var offset = startOffset
         while (offset + 7 <= endOffset) {
@@ -1754,6 +2005,9 @@ class AudioReceiverEngine(private val context: Context) {
         maxFrames: Int
     ): Int {
         val targetFrames = sampleRate.toDouble() * packetTimeMs / 1000.0
+        if (packetizerCodecId == CODEC_OPUS) {
+            return min(opusFrameSamplesForPacketTime(packetTimeMs), maxFrames)
+        }
         if (packetizerCodecId == CODEC_AAC) {
             return AAC_SAMPLES_PER_FRAME
         }
@@ -1771,6 +2025,9 @@ class AudioReceiverEngine(private val context: Context) {
     }
 
     private fun maxPacketFrames(codecId: Int, channels: Int): Int {
+        if (codecId == CODEC_OPUS) {
+            return OPUS_LONG_FRAME_SAMPLES
+        }
         if (codecId == CODEC_AAC) {
             return AAC_SAMPLES_PER_FRAME
         }
@@ -1787,8 +2044,25 @@ class AudioReceiverEngine(private val context: Context) {
         return max(1, maxPayloadBytes / max(1, encodedBytesPerFrame))
     }
 
+    private fun opusFrameSamplesForPacketTime(packetTimeMs: Int): Int {
+        return if (packetTimeMs <= 2) {
+            OPUS_LOW_FRAME_SAMPLES
+        } else if (packetTimeMs <= OPUS_SHORT_FRAME_MS) {
+            OPUS_SHORT_FRAME_SAMPLES
+        } else {
+            OPUS_LONG_FRAME_SAMPLES
+        }
+    }
+
+    private fun isSupportedOpusFrameSamples(frameSamples: Int): Boolean {
+        return frameSamples == OPUS_LOW_FRAME_SAMPLES ||
+            frameSamples == OPUS_SHORT_FRAME_SAMPLES ||
+            frameSamples == OPUS_LONG_FRAME_SAMPLES
+    }
+
     private fun senderCodecId(): Int {
         return when (profile.codec) {
+            CODEC_OPUS,
             CODEC_AAC,
             CODEC_G711_MU_LAW,
             CODEC_G711_A_LAW,
@@ -1812,6 +2086,9 @@ class AudioReceiverEngine(private val context: Context) {
         packetizerPacketTimeMs = packetTimeMs
         packetizerCodecId = codecId
         releaseAacEncoder()
+        if (codecId != CODEC_OPUS) {
+            releaseOpusEncoder()
+        }
     }
 
     private fun releaseAudioRecord() {
@@ -2472,6 +2749,9 @@ class AudioReceiverEngine(private val context: Context) {
         val adaptiveBufferCapMs =
             (receiverOptions and RECEIVER_OPTION_CUSTOM_CAP_MASK) shr
                 RECEIVER_OPTION_CUSTOM_CAP_SHIFT
+        val activeBitrateKbps =
+            (receiverOptions ushr RECEIVER_OPTION_BITRATE_SHIFT) and
+                RECEIVER_OPTION_BITRATE_MASK
         updatePacketLoss(sequence)
 
         if (packetKind != PACKET_KIND_AUDIO) {
@@ -2484,31 +2764,52 @@ class AudioReceiverEngine(private val context: Context) {
                 profile.adaptiveBufferCapMs != adaptiveBufferCapMs ||
                 profile.receiverAdaptiveBuffer != receiverAdaptiveBuffer
         val playbackTargetChanged = profile.playbackBufferMs != playbackBufferMs
-        if (adaptivePolicyChanged || playbackTargetChanged) {
+        val bitrateChanged =
+            activeBitrateKbps > 0 && profile.bitrateKbps != activeBitrateKbps
+        if (adaptivePolicyChanged || playbackTargetChanged || bitrateChanged) {
             val previousAdaptiveBufferMs = adaptivePlaybackBufferMs
             profile = profile.copy(
                 mode = mode,
+                bitrateKbps = if (activeBitrateKbps > 0) {
+                    activeBitrateKbps
+                } else {
+                    profile.bitrateKbps
+                },
                 playbackBufferMs = playbackBufferMs,
                 adaptiveBufferCapMs = adaptiveBufferCapMs,
                 receiverAdaptiveBuffer = receiverAdaptiveBuffer
             )
-            if (adaptivePolicyChanged) {
-                resetAdaptiveDelayTracker()
-            }
-            if (audioTrack != null) {
-                val nextMaxBufferMs = adaptiveMaxPlaybackBufferMs(playbackBufferMs)
-                val nextBufferMs = when {
-                    !receiverAdaptiveBuffer -> playbackBufferMs
-                    playbackBufferMs > previousAdaptiveBufferMs -> playbackBufferMs
-                    previousAdaptiveBufferMs > nextMaxBufferMs -> nextMaxBufferMs
-                    else -> previousAdaptiveBufferMs
+            if (adaptivePolicyChanged || playbackTargetChanged) {
+                if (adaptivePolicyChanged) {
+                    resetAdaptiveDelayTracker()
                 }
-                updateAdaptivePlaybackBuffer(
-                    outputSampleRateForPlayback(sampleRate),
-                    nextBufferMs
-                )
-            } else {
-                adaptivePlaybackBufferMs = playbackBufferMs
+                refreshAdaptiveLinkMemoryKey()
+                val rememberedBufferMs = initialAdaptivePlaybackBufferMs()
+                val now = SystemClock.elapsedRealtime()
+                lastAdaptiveBufferRelaxAtMs = now
+                lastPlaybackPressureAtMs = now
+                if (audioTrack != null) {
+                    val nextMaxBufferMs = adaptiveMaxPlaybackBufferMs(playbackBufferMs)
+                    val nextBufferMs = when {
+                        !receiverAdaptiveBuffer -> playbackBufferMs
+                        adaptivePolicyChanged &&
+                            shouldStartAdaptiveBufferAtRequested(playbackBufferMs) ->
+                            playbackBufferMs
+                        playbackBufferMs > previousAdaptiveBufferMs -> max(
+                            playbackBufferMs,
+                            rememberedBufferMs
+                        )
+                        previousAdaptiveBufferMs > nextMaxBufferMs -> nextMaxBufferMs
+                        else -> max(previousAdaptiveBufferMs, rememberedBufferMs)
+                    }
+                    updateAdaptivePlaybackBuffer(
+                        outputSampleRateForPlayback(sampleRate),
+                        nextBufferMs,
+                        remember = false
+                    )
+                } else {
+                    adaptivePlaybackBufferMs = rememberedBufferMs
+                }
             }
         }
         writeAudioPayload(
@@ -2676,10 +2977,19 @@ class AudioReceiverEngine(private val context: Context) {
         while (readOffset < endOffset) {
             val available = endOffset - readOffset
             val frameSize = adtsFrameSize(data, readOffset, available)
-            val inputSize = when {
+            val inputOffset: Int
+            val inputSize: Int
+            val advanceSize: Int
+            when {
                 frameSize > 0 && frameSize <= available -> {
                     foundAdtsFrame = true
-                    frameSize
+                    val headerSize = adtsHeaderSize(data, readOffset, frameSize)
+                    if (frameSize <= headerSize) {
+                        break
+                    }
+                    inputOffset = readOffset + headerSize
+                    inputSize = frameSize - headerSize
+                    advanceSize = frameSize
                 }
                 foundAdtsFrame -> break
                 else -> {
@@ -2688,25 +2998,30 @@ class AudioReceiverEngine(private val context: Context) {
                         readOffset = nextFrameOffset
                         continue
                     }
-                    available
+                    inputOffset = readOffset
+                    inputSize = available
+                    advanceSize = inputSize
                 }
             }
 
-            when (queueAacDecoderInput(decoder, data, readOffset, inputSize)) {
+            when (queueAacDecoderInput(decoder, data, inputOffset, inputSize)) {
                 true -> Unit
                 false -> return ByteArray(0)
                 null -> return null
             }
-            if (!drainAacDecoderOutput(decoder, output)) {
+            if (!drainAacDecoderOutput(decoder, output, AAC_CODEC_TIMEOUT_US)) {
                 return null
             }
 
-            readOffset += inputSize
+            readOffset += advanceSize
             if (frameSize <= 0) {
                 break
             }
         }
 
+        if (!drainAacDecoderOutput(decoder, output)) {
+            return null
+        }
         return mergeAacDecoderOutput(output)
     }
 
@@ -2717,7 +3032,7 @@ class AudioReceiverEngine(private val context: Context) {
         inputSize: Int
     ): Boolean? {
         val inputIndex = try {
-            decoder.dequeueInputBuffer(0)
+            decoder.dequeueInputBuffer(AAC_CODEC_TIMEOUT_US)
         } catch (_: IllegalStateException) {
             releaseAacDecoder()
             return null
@@ -2751,16 +3066,19 @@ class AudioReceiverEngine(private val context: Context) {
 
     private fun drainAacDecoderOutput(
         decoder: MediaCodec,
-        output: MutableList<ByteArray>
+        output: MutableList<ByteArray>,
+        timeoutUs: Long = 0L
     ): Boolean {
         val info = MediaCodec.BufferInfo()
+        var nextTimeoutUs = timeoutUs
         while (true) {
             val outputIndex = try {
-                decoder.dequeueOutputBuffer(info, 0)
+                decoder.dequeueOutputBuffer(info, nextTimeoutUs)
             } catch (_: IllegalStateException) {
                 releaseAacDecoder()
                 return false
             }
+            nextTimeoutUs = 0L
             if (outputIndex >= 0) {
                 val outputBuffer = decoder.getOutputBuffer(outputIndex)
                 if (outputBuffer != null && info.size > 0) {
@@ -2795,8 +3113,16 @@ class AudioReceiverEngine(private val context: Context) {
     }
 
     private fun ensureAacDecoder(sampleRate: Int, channels: Int): MediaCodec? {
-        if (aacDecoder != null && aacSampleRate == sampleRate && aacChannels == channels) {
+        val channelCount = channels.coerceIn(1, 2)
+        if (
+            aacDecoder != null &&
+            aacSampleRate == sampleRate &&
+            aacChannels == channelCount
+        ) {
             return aacDecoder
+        }
+        if (aacSampleRateIndex(sampleRate) == null) {
+            return null
         }
 
         releaseAacDecoder()
@@ -2805,20 +3131,20 @@ class AudioReceiverEngine(private val context: Context) {
             val format = MediaFormat.createAudioFormat(
                 AAC_MIME_TYPE,
                 sampleRate,
-                max(1, channels)
+                channelCount
             ).apply {
                 setInteger(
                     MediaFormat.KEY_AAC_PROFILE,
                     MediaCodecInfo.CodecProfileLevel.AACObjectLC
                 )
-                setInteger(MediaFormat.KEY_IS_ADTS, 1)
+                setByteBuffer("csd-0", aacAudioSpecificConfig(sampleRate, channelCount))
             }
             MediaCodec.createDecoderByType(AAC_MIME_TYPE).apply {
                 configure(format, null, null, 0)
                 start()
                 aacDecoder = this
                 aacSampleRate = sampleRate
-                aacChannels = channels
+                aacChannels = channelCount
             }
         } catch (_: IOException) {
             releaseAacDecoder()
@@ -2830,6 +3156,16 @@ class AudioReceiverEngine(private val context: Context) {
             releaseAacDecoder()
             null
         }
+    }
+
+    private fun aacAudioSpecificConfig(sampleRate: Int, channels: Int): ByteBuffer {
+        val audioObjectType = 2
+        val sampleRateIndex = aacSampleRateIndex(sampleRate) ?: 3
+        val channelConfig = channels.coerceIn(1, 2)
+        val config = ByteArray(2)
+        config[0] = ((audioObjectType shl 3) or (sampleRateIndex shr 1)).toByte()
+        config[1] = (((sampleRateIndex and 0x01) shl 7) or (channelConfig shl 3)).toByte()
+        return ByteBuffer.wrap(config)
     }
 
     private fun updatePacketLoss(sequence: Long) {
@@ -2883,6 +3219,15 @@ class AudioReceiverEngine(private val context: Context) {
             val sample = ((data[cursor].toInt() and 0xFF) or (data[cursor + 1].toInt() shl 8)).toShort()
             peak = max(peak, kotlin.math.abs(sample.toInt()))
             cursor += 2
+        }
+        return (peak / 32768.0).coerceIn(0.0, 1.0)
+    }
+
+    private fun pcmPeakLevel(data: ShortArray, sampleCount: Int): Double {
+        val end = min(data.size, sampleCount)
+        var peak = 0
+        for (index in 0 until end) {
+            peak = max(peak, kotlin.math.abs(data[index].toInt()))
         }
         return (peak / 32768.0).coerceIn(0.0, 1.0)
     }
@@ -3049,18 +3394,33 @@ class AudioReceiverEngine(private val context: Context) {
         if (!profile.receiverAdaptiveBuffer) {
             resetAdaptiveBufferPressure(underruns)
             if (adaptivePlaybackBufferMs != requestedLatencyMs) {
-                updateAdaptivePlaybackBuffer(sampleRate, requestedLatencyMs)
+                updateAdaptivePlaybackBuffer(sampleRate, requestedLatencyMs, remember = false)
             }
             return
         }
 
         val now = SystemClock.elapsedRealtime()
+        val hasPlaybackSignal = hasAdaptivePlaybackSignal()
+        if (!hasPlaybackSignal) {
+            resetAdaptiveGrowthPressure(underruns)
+            val currentBufferMs = adaptivePlaybackBufferMs
+            if (currentBufferMs > requestedLatencyMs) {
+                updateAdaptivePlaybackBuffer(sampleRate, requestedLatencyMs)
+                lastAdaptiveBufferRelaxAtMs = now
+            }
+            return
+        }
+
         val targetFrames = adaptiveTargetFrames(sampleRate).toLong()
         val networkFloorMs = adaptiveNetworkFloorBufferMs(requestedLatencyMs)
         val isPlaying = track.playState == AudioTrack.PLAYSTATE_PLAYING
-        val underrunDelta = if (isPlaying) {
+        val isPlaybackStable = isPlaying &&
+            playbackStartedAtMs > 0L &&
+            now - playbackStartedAtMs >= ADAPTIVE_PLAYBACK_START_GRACE_MS
+        val underrunDelta = if (isPlaybackStable) {
             (underruns - lastKnownUnderrunCount).coerceAtLeast(0)
         } else {
+            lastKnownUnderrunCount = underruns
             0
         }
         var shouldIncrease = false
@@ -3071,13 +3431,8 @@ class AudioReceiverEngine(private val context: Context) {
             pressureIncrease = shouldIncrease
         }
 
-        if (isPlaying && isPlaybackQueueTooLow(sampleRate, queuedFrames, targetFrames)) {
-            lastPlaybackPressureAtMs = now
+        if (isPlaybackStable && isPlaybackQueueTooLow(sampleRate, queuedFrames, targetFrames)) {
             adaptiveLowQueueSamples += 1
-            val sustainedLowQueue =
-                adaptiveLowQueueSamples >= ADAPTIVE_LOW_QUEUE_SAMPLES_TO_INCREASE
-            shouldIncrease = shouldIncrease || sustainedLowQueue
-            pressureIncrease = pressureIncrease || sustainedLowQueue
         } else {
             adaptiveLowQueueSamples = 0
         }
@@ -3108,9 +3463,10 @@ class AudioReceiverEngine(private val context: Context) {
                 sampleRate,
                 max(
                     networkFloorMs,
-                    currentBufferMs - adaptiveBufferStepMs(requestedLatencyMs)
+                    currentBufferMs - adaptiveBufferRelaxStepMs(requestedLatencyMs)
                 )
             )
+            lastAdaptiveBufferRelaxAtMs = now
         }
 
         lastKnownUnderrunCount = underruns
@@ -3135,14 +3491,21 @@ class AudioReceiverEngine(private val context: Context) {
         val hasRoomToFastRelax =
             currentBufferMs - networkFloorMs >= ADAPTIVE_FAST_RELAX_MARGIN_MS
         val relaxDelayMs = if (queueAtOrAboveTarget && hasRoomToFastRelax) {
-            ADAPTIVE_BUFFER_FAST_RELAX_MS
+            adaptiveFastRelaxDelayMs()
         } else {
-            ADAPTIVE_BUFFER_RELAX_MS
+            adaptiveRelaxDelayMs()
         }
-        return now - lastPlaybackPressureAtMs >= relaxDelayMs
+        val relaxGateMs = max(lastPlaybackPressureAtMs, lastAdaptiveBufferRelaxAtMs)
+        return now - relaxGateMs >= relaxDelayMs
     }
 
     private fun resetAdaptiveBufferPressure(underruns: Int) {
+        lastKnownUnderrunCount = underruns
+        playbackStartedAtMs = 0L
+        resetAdaptiveGrowthPressure(underruns)
+    }
+
+    private fun resetAdaptiveGrowthPressure(underruns: Int) {
         lastKnownUnderrunCount = underruns
         adaptiveUnderrunWindowStartAtMs = 0L
         adaptiveUnderrunsInWindow = 0
@@ -3150,6 +3513,10 @@ class AudioReceiverEngine(private val context: Context) {
         adaptiveUnderrunsInBurst = 0
         adaptiveLowQueueSamples = 0
         resetAdaptiveDelayTracker()
+    }
+
+    private fun hasAdaptivePlaybackSignal(): Boolean {
+        return !muted && signalLevel >= ADAPTIVE_AUDIBLE_SIGNAL_FLOOR
     }
 
     private fun resetAdaptiveDelayTracker() {
@@ -3343,6 +3710,32 @@ class AudioReceiverEngine(private val context: Context) {
         return max(packetStepMs, profileStepMs).coerceAtMost(ADAPTIVE_STABLE_STEP_MS)
     }
 
+    private fun adaptiveBufferRelaxStepMs(requestedLatencyMs: Int): Int {
+        if (
+            profile.mode == AudioMode.GAMING &&
+            requestedLatencyMs <= LOW_LATENCY_PERFORMANCE_MAX_MS
+        ) {
+            return ADAPTIVE_GAMING_RELAX_STEP_MS
+        }
+        return adaptiveBufferStepMs(requestedLatencyMs)
+    }
+
+    private fun adaptiveRelaxDelayMs(): Long {
+        return if (profile.mode == AudioMode.GAMING) {
+            ADAPTIVE_GAMING_BUFFER_RELAX_MS
+        } else {
+            ADAPTIVE_BUFFER_RELAX_MS
+        }
+    }
+
+    private fun adaptiveFastRelaxDelayMs(): Long {
+        return if (profile.mode == AudioMode.GAMING) {
+            ADAPTIVE_GAMING_BUFFER_FAST_RELAX_MS
+        } else {
+            ADAPTIVE_BUFFER_FAST_RELAX_MS
+        }
+    }
+
     private fun adaptiveMaxPlaybackBufferMs(
         requestedLatencyMs: Int = profile.playbackBufferMs.coerceIn(
             minLatencyMs(),
@@ -3382,7 +3775,10 @@ class AudioReceiverEngine(private val context: Context) {
         val capFlag =
             (profile.adaptiveBufferCapMs.coerceIn(0, MAX_LATENCY_MS) shl
                 RECEIVER_OPTION_CUSTOM_CAP_SHIFT) and RECEIVER_OPTION_CUSTOM_CAP_MASK
-        return adaptiveFlag or modeFlag or capFlag
+        val bitrateFlag =
+            profile.bitrateKbps.coerceIn(0, RECEIVER_OPTION_BITRATE_MASK) shl
+                RECEIVER_OPTION_BITRATE_SHIFT
+        return adaptiveFlag or modeFlag or capFlag or bitrateFlag
     }
 
     private fun playbackQueueFillPercent(queuedFrames: Long, targetFrames: Int): Int {
@@ -3394,7 +3790,77 @@ class AudioReceiverEngine(private val context: Context) {
             .toInt()
     }
 
-    private fun updateAdaptivePlaybackBuffer(sampleRate: Int, nextBufferMs: Int) {
+    private fun refreshAdaptiveLinkMemoryKey() {
+        adaptiveLinkMemoryKey = adaptiveLinkIdentityKey()
+    }
+
+    private fun initialAdaptivePlaybackBufferMs(): Int {
+        val requestedLatencyMs = profile.playbackBufferMs.coerceIn(
+            minLatencyMs(),
+            MAX_LATENCY_MS
+        )
+        if (!profile.receiverAdaptiveBuffer) {
+            return requestedLatencyMs
+        }
+        if (shouldStartAdaptiveBufferAtRequested(requestedLatencyMs)) {
+            return requestedLatencyMs
+        }
+
+        val rememberedLatencyMs = rememberedAdaptivePlaybackBufferMs() ?: return requestedLatencyMs
+        return rememberedLatencyMs.coerceIn(
+            requestedLatencyMs,
+            adaptiveMaxPlaybackBufferMs(requestedLatencyMs)
+        )
+    }
+
+    private fun shouldStartAdaptiveBufferAtRequested(requestedLatencyMs: Int): Boolean {
+        return profile.mode == AudioMode.GAMING ||
+            requestedLatencyMs <= LOW_LATENCY_PERFORMANCE_MAX_MS
+    }
+
+    private fun rememberedAdaptivePlaybackBufferMs(): Int? {
+        val key = adaptiveLinkMemoryKey ?: return null
+        val storedAtMs = adaptiveLinkPreferences.getLong("${key}:updatedAtMs", 0L)
+        if (
+            storedAtMs <= 0L ||
+            System.currentTimeMillis() - storedAtMs > ADAPTIVE_LINK_MEMORY_MAX_AGE_MS
+        ) {
+            return null
+        }
+
+        val storedBufferMs = adaptiveLinkPreferences.getInt("${key}:bufferMs", 0)
+        return storedBufferMs.takeIf { it > 0 }
+    }
+
+    private fun rememberAdaptivePlaybackBufferMs(now: Long = SystemClock.elapsedRealtime()) {
+        if (!profile.receiverAdaptiveBuffer) {
+            return
+        }
+        val key = adaptiveLinkMemoryKey ?: return
+        if (now - lastAdaptiveLinkMemoryWriteAtMs < ADAPTIVE_LINK_MEMORY_WRITE_COOLDOWN_MS) {
+            return
+        }
+
+        val requestedLatencyMs = profile.playbackBufferMs.coerceIn(
+            minLatencyMs(),
+            MAX_LATENCY_MS
+        )
+        val learnedBufferMs = adaptivePlaybackBufferMs.coerceIn(
+            requestedLatencyMs,
+            adaptiveMaxPlaybackBufferMs(requestedLatencyMs)
+        )
+        adaptiveLinkPreferences.edit()
+            .putInt("${key}:bufferMs", learnedBufferMs)
+            .putLong("${key}:updatedAtMs", System.currentTimeMillis())
+            .apply()
+        lastAdaptiveLinkMemoryWriteAtMs = now
+    }
+
+    private fun updateAdaptivePlaybackBuffer(
+        sampleRate: Int,
+        nextBufferMs: Int,
+        remember: Boolean = true
+    ) {
         val requestedLatencyMs = profile.playbackBufferMs.coerceIn(
             minLatencyMs(),
             MAX_LATENCY_MS
@@ -3412,9 +3878,13 @@ class AudioReceiverEngine(private val context: Context) {
             }
         }
         currentTargetBufferFrames = max(1, nextTargetFrames)
+        val previousPlaybackBufferMs = adaptivePlaybackBufferMs
         adaptivePlaybackBufferMs = (currentTargetBufferFrames * 1000L / sampleRate)
             .toInt()
             .coerceIn(minLatencyMs(), MAX_LATENCY_MS)
+        if (remember && adaptivePlaybackBufferMs != previousPlaybackBufferMs) {
+            rememberAdaptivePlaybackBufferMs()
+        }
     }
 
     private fun adaptiveTargetFrames(sampleRate: Int): Int {
@@ -3431,6 +3901,12 @@ class AudioReceiverEngine(private val context: Context) {
 
         try {
             track.play()
+            playbackStartedAtMs = SystemClock.elapsedRealtime()
+            lastKnownUnderrunCount = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                track.underrunCount
+            } else {
+                0
+            }
             Log.i(LOG_TAG, "AudioTrack started queuedFrames=$queuedFrames target=$currentTargetBufferFrames")
         } catch (_: IllegalStateException) {
             Log.w(LOG_TAG, "AudioTrack play failed")
@@ -3541,7 +4017,7 @@ class AudioReceiverEngine(private val context: Context) {
                     sampleRate = sampleRate,
                     multiplier = START_BUFFER_PACKETS
                 )
-            )
+            ).coerceAtMost(capacityBufferFrames)
         } else {
             requestedBufferFrames
         }
@@ -3608,6 +4084,7 @@ class AudioReceiverEngine(private val context: Context) {
         playbackHeadWraps = 0
         lastSequence = -1L
         lastKnownUnderrunCount = 0
+        playbackStartedAtMs = 0L
         audioLatencyMs = Double.NaN
         networkLatencyMs = Double.NaN
         writtenFrames.set(0)
@@ -3670,6 +4147,16 @@ class AudioReceiverEngine(private val context: Context) {
         }
         opusDecoderHandle = 0
         opusChannels = 0
+    }
+
+    private fun releaseOpusEncoder() {
+        if (opusEncoderHandle != 0L) {
+            opusNative.destroyEncoder(opusEncoderHandle)
+        }
+        opusEncoderHandle = 0
+        opusEncoderChannels = 0
+        opusEncoderBitrateBps = 0
+        opusEncoderLowDelay = false
     }
 
     private fun releaseAacDecoder() {

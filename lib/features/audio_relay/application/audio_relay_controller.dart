@@ -10,6 +10,14 @@ import '../data/audio_profile_store.dart';
 import '../data/native_audio_engine.dart';
 import '../domain/audio_relay_models.dart';
 
+enum _AdaptiveProfileApplyReason {
+  settings,
+  metrics,
+  liveBufferPolicy,
+  autoCodecSwitch,
+  display,
+}
+
 class AudioRelayController extends ChangeNotifier {
   AudioRelayController({
     AudioRelayEngine? engine,
@@ -60,15 +68,31 @@ class AudioRelayController extends ChangeNotifier {
   DateTime? _autoCodecStartedAt;
   DateTime? _autoCodecQuietSince;
   DateTime? _autoCodecLastSwitchAt;
-  _AutoCodecMetricsSnapshot? _autoCodecBaseline;
+  _AdaptiveMetricsSnapshot? _autoCodecBaseline;
+  _AdaptiveMetricsSnapshot? _adaptiveFormatBaseline;
+  int _adaptiveFormatPressureScoreValue = 0;
+  int _adaptiveFormatQuietPolls = 0;
   bool _autoCodecApplyInFlight = false;
   bool _metricsPollInFlight = false;
   bool _profileApplyPending = false;
   bool _profileApplyInFlight = false;
+  _AdaptiveProfileApplyReason _pendingProfileApplyReason =
+      _AdaptiveProfileApplyReason.settings;
   AudioProfile _savedCustomProfile = AudioPreset.custom.profile;
   static const _nativeUsbSourceId = 'native-usb-source';
   static const _autoCodecSwitchCooldown = Duration(seconds: 30);
   static const _autoCodecQuietSignalThreshold = 0.015;
+  static const _adaptiveUltraLowLatencyCapMs = 24;
+  static const _adaptiveGamingCapMs = 30;
+  static const _adaptiveBalancedCapMs = 160;
+  static const _adaptiveFormatRecoveryPolls = 6;
+  static const _sampleRateOptions = [44100, 48000, 96000];
+  static const _lowLatencyAutoCodecPreference = [
+    AudioCodec.opus,
+    AudioCodec.imaAdpcm,
+    AudioCodec.g711MuLaw,
+    AudioCodec.g711ALaw,
+  ];
 
   bool get isBusy => activity == RelayActivity.connecting;
 
@@ -209,7 +233,7 @@ class AudioRelayController extends ChangeNotifier {
     final outputBackends = capabilities.supportedOutputBackends
         .map((backend) => backend.label)
         .join(', ');
-    return 'Current engine controls: receiver adaptive buffer, sample rate, stereo format, codec ($codecs), sender buffer, receiver buffer, packet time, volume, mute, and role/discovery. Receiver output backends: $outputBackends.';
+    return 'Current engine controls: receiver adaptive buffer, adaptive sample rate, stereo format, codec ($codecs), adaptive bitrate target, sender buffer, receiver buffer, packet time, volume, mute, and role/discovery. Receiver output backends: $outputBackends.';
   }
 
   String get liveLatencyLabel {
@@ -259,7 +283,7 @@ class AudioRelayController extends ChangeNotifier {
     }
     final capMs = metrics.adaptiveMaxPlaybackBufferMs;
     if (!isStreaming || capMs == null || capMs <= 0) {
-      return 'Measuring';
+      return '${_adaptiveMaxPlaybackBufferMsForProfile(profile)} ms';
     }
     return metrics.adaptiveLimitReached == true ? '$capMs ms hit' : '$capMs ms';
   }
@@ -281,10 +305,10 @@ class AudioRelayController extends ChangeNotifier {
 
   String get playbackQueueFillLabel {
     final percent = metrics.playbackQueueFillPercent;
-    if (!isStreaming || percent == null) {
+    if (!isStreaming) {
       return 'Waiting';
     }
-    return '$percent%';
+    return '${percent ?? 0}%';
   }
 
   String get receiverAdaptiveBufferLabel {
@@ -335,10 +359,51 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   String get sampleRateLabel {
-    if (profile.sampleRate % 1000 == 0) {
-      return '${profile.sampleRate ~/ 1000} kHz';
+    final label = _formatSampleRate(_displayProfile.sampleRate);
+    return profile.adaptiveSampleRate ? 'Adaptive ($label)' : label;
+  }
+
+  String get appliedSampleRateLabel {
+    return _formatSampleRate(_displayProfile.sampleRate);
+  }
+
+  String get sampleRateSettingLabel {
+    return profile.adaptiveSampleRate
+        ? 'Adaptive'
+        : _formatSampleRate(profile.sampleRate);
+  }
+
+  String? get sampleRateSettingDetailLabel {
+    if (!profile.adaptiveSampleRate) {
+      return null;
     }
-    return '${(profile.sampleRate / 1000).toStringAsFixed(1)} kHz';
+    return 'Current $appliedSampleRateLabel · limits $adaptiveSampleRateRangeLabel';
+  }
+
+  String get adaptiveSampleRateRangeLabel {
+    final options = adaptiveSampleRateOptions;
+    if (options.isEmpty) {
+      return appliedSampleRateLabel;
+    }
+    return '${_formatSampleRate(options.first)}-${_formatSampleRate(options.last)}';
+  }
+
+  List<int> get sampleRateOptions {
+    if (profile.codec == AudioCodec.opus) {
+      return const [48000];
+    }
+    final values = <int>{..._sampleRateOptions, profile.sampleRate};
+    return values.toList()..sort();
+  }
+
+  List<int> get adaptiveSampleRateOptions {
+    return profile.codec == AudioCodec.opus
+        ? const [48000]
+        : _sampleRateOptions;
+  }
+
+  bool get canUseAdaptiveSampleRate {
+    return adaptiveSampleRateOptions.length > 1;
   }
 
   String get channelModeLabel {
@@ -367,6 +432,96 @@ class AudioRelayController extends ChangeNotifier {
     };
   }
 
+  bool get hasBitrateTarget {
+    return bitrateTargetRange != null;
+  }
+
+  int get bitrateTargetKbps {
+    final range = bitrateTargetRange;
+    if (range == null) {
+      return profile.effectiveBitrateKbps;
+    }
+    return _clampBitrateKbps(profile.bitrateKbps, range);
+  }
+
+  String get bitrateTargetLabel {
+    return '$bitrateTargetKbps kbps';
+  }
+
+  String get appliedBitrateLabel {
+    return streamBitrateLabel;
+  }
+
+  String get bitrateSettingLabel {
+    return profile.adaptiveBitrate && bitrateTargetRange != null
+        ? 'Adaptive'
+        : bitrateTargetLabel;
+  }
+
+  String? get bitrateSettingDetailLabel {
+    final range = bitrateTargetRange;
+    if (!profile.adaptiveBitrate || range == null) {
+      return null;
+    }
+    final targetCodec = _bitrateTargetCodec;
+    final targetLabel = profile.codec == AudioCodec.auto
+        ? ' · ${targetCodec.label} target'
+        : '';
+    return 'Current $appliedBitrateLabel · limits ${range.minKbps}-${range.maxKbps} kbps$targetLabel';
+  }
+
+  String get bitrateTargetDetailLabel {
+    final targetCodec = _bitrateTargetCodec;
+    final range = bitrateTargetRange;
+    if (range == null) {
+      return 'Fixed by ${profile.codec.label}';
+    }
+    if (profile.codec == AudioCodec.auto) {
+      return '${targetCodec.label} target · ${range.minKbps}-${range.maxKbps} kbps';
+    }
+    return '${range.minKbps}-${range.maxKbps} kbps range';
+  }
+
+  String get bitrateTargetDescription {
+    if (profile.codec == AudioCodec.auto) {
+      return 'Sets the compressed target when Auto selects Opus or AAC. PCM stays calculated from sample rate and channels.';
+    }
+    if (hasBitrateTarget) {
+      return 'Sets the encoder target for the selected compressed codec. Lower reduces network load; higher preserves more detail.';
+    }
+    return 'This codec has a fixed bitrate calculated from the selected format.';
+  }
+
+  int get bitrateTargetDivisions {
+    final range = bitrateTargetRange;
+    if (range == null) {
+      return 1;
+    }
+    return max(1, ((range.maxKbps - range.minKbps) / 8).round());
+  }
+
+  CodecBitrateRange? get bitrateTargetRange {
+    final targetCodec = _bitrateTargetCodec;
+    if (!_hasConfigurableBitrate(targetCodec)) {
+      return null;
+    }
+    return _bitrateRangeFor(targetCodec);
+  }
+
+  List<int> get bitrateTargetOptions {
+    final range = bitrateTargetRange;
+    if (range == null) {
+      return const [];
+    }
+
+    const stepKbps = 16;
+    final values = <int>{range.minKbps, range.maxKbps, bitrateTargetKbps};
+    for (var value = range.minKbps; value <= range.maxKbps; value += stepKbps) {
+      values.add(_clampBitrateKbps(value, range));
+    }
+    return values.toList()..sort();
+  }
+
   String get captureBufferFramesLabel {
     return '${_framesForMs(profile.captureBufferMs)} frames';
   }
@@ -376,6 +531,15 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   String get packetFramesLabel {
+    final displayProfile = _displayProfile;
+    if (displayProfile.codec == AudioCodec.opus) {
+      final frames = _opusFrameSamplesForPacketTime(profile.packetTimeMs);
+      final milliseconds = frames * 1000 / 48000;
+      final label = milliseconds == milliseconds.roundToDouble()
+          ? '${milliseconds.round()} ms'
+          : '${milliseconds.toStringAsFixed(1)} ms';
+      return '$frames frames per packet · $label Opus';
+    }
     return '${_framesForMs(profile.packetTimeMs)} frames per packet';
   }
 
@@ -399,7 +563,8 @@ class AudioRelayController extends ChangeNotifier {
     final measuredLatencyMs = metrics.effectiveLatencyMs;
     final activeBufferMs = activePlaybackBufferMs;
     if (activeBufferMs == null) {
-      return measuredLatencyMs;
+      return measuredLatencyMs ??
+          (isStreaming ? profile.playbackBufferMs.toDouble() : null);
     }
 
     final bufferedFloorMs = metrics.audioLatencyMs == null
@@ -622,6 +787,7 @@ class AudioRelayController extends ChangeNotifier {
       }
       await _engine.startStream(senderProfile);
       _appliedSenderProfile = senderProfile;
+      _rememberAutoResolvedCodec(senderProfile);
       activity = RelayActivity.streaming;
       _startMeters();
       notifyListeners();
@@ -764,7 +930,23 @@ class AudioRelayController extends ChangeNotifier {
     if (!_canChangeRestartRequiredSenderSetting()) {
       return;
     }
-    _updateProfile(_normalizeProfile(profile.copyWith(sampleRate: value)));
+    _updateProfile(
+      _normalizeProfile(
+        profile.copyWith(sampleRate: value, adaptiveSampleRate: false),
+      ),
+    );
+  }
+
+  void updateAdaptiveSampleRate(bool value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
+    if (value && !canUseAdaptiveSampleRate) {
+      return;
+    }
+    _updateProfile(
+      _normalizeProfile(profile.copyWith(adaptiveSampleRate: value)),
+    );
   }
 
   void updateLatency(double value) {
@@ -804,7 +986,26 @@ class AudioRelayController extends ChangeNotifier {
     if (!_canChangeRestartRequiredSenderSetting()) {
       return;
     }
-    _updateProfile(profile.copyWith(bitrateKbps: value.round()));
+    final range = bitrateTargetRange;
+    if (range == null) {
+      return;
+    }
+    _updateProfile(
+      profile.copyWith(
+        bitrateKbps: _snapBitrateKbps(value, range),
+        adaptiveBitrate: false,
+      ),
+    );
+  }
+
+  void updateAdaptiveBitrate(bool value) {
+    if (!_canChangeRestartRequiredSenderSetting()) {
+      return;
+    }
+    if (value && bitrateTargetRange == null) {
+      return;
+    }
+    _updateProfile(profile.copyWith(adaptiveBitrate: value));
   }
 
   void updateChannels(int value) {
@@ -917,6 +1118,9 @@ class AudioRelayController extends ChangeNotifier {
     _meterTimer?.cancel();
     _meterTimer = null;
     metrics = AudioRelayMetrics.empty;
+    _adaptiveFormatBaseline = null;
+    _adaptiveFormatPressureScoreValue = 0;
+    _adaptiveFormatQuietPolls = 0;
   }
 
   Future<void> _pollMetrics() async {
@@ -929,8 +1133,10 @@ class AudioRelayController extends ChangeNotifier {
       final nextMetrics = await _engine.getMetrics();
       metrics = nextMetrics;
       signalLevel = muted ? 0 : nextMetrics.signalLevel ?? 0;
+      _updateAdaptiveFormatPressureFromMetrics(nextMetrics);
       _syncReceiverProfileFromMetrics(nextMetrics);
       _updateAutoCodecFromMetrics(nextMetrics);
+      _updateAdaptiveSenderProfileFromMetrics();
       if (isStreaming) {
         notifyListeners();
       }
@@ -948,19 +1154,118 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void _updateProfile(AudioProfile nextProfile) {
+    final previousProfile = profile;
     nextProfile = _profileForCurrentRole(_normalizeProfile(nextProfile));
     if (profile.hasSameSettings(nextProfile)) {
       return;
+    }
+    final applyReason = _profileChangeApplyReason(previousProfile, nextProfile);
+    if (applyReason == _AdaptiveProfileApplyReason.liveBufferPolicy ||
+        previousProfile.adaptiveBitrate != nextProfile.adaptiveBitrate ||
+        previousProfile.adaptiveSampleRate != nextProfile.adaptiveSampleRate ||
+        previousProfile.codec != nextProfile.codec) {
+      _resetAdaptiveFormatBaselines();
     }
     profile = nextProfile;
     selectedPreset = profile.mode;
     _saveCustomProfileIfNeeded(profile);
     notifyListeners();
-    _scheduleActiveProfileApply();
+    _scheduleActiveProfileApply(reason: applyReason);
   }
 
   bool _canChangeRestartRequiredSenderSetting() {
     return role != RelayRole.sender || !isStreaming;
+  }
+
+  _AdaptiveProfileApplyReason _profileChangeApplyReason(
+    AudioProfile previousProfile,
+    AudioProfile nextProfile,
+  ) {
+    if (role == RelayRole.sender &&
+        isStreaming &&
+        _isLiveBufferPolicyOnlyChange(previousProfile, nextProfile)) {
+      return _AdaptiveProfileApplyReason.liveBufferPolicy;
+    }
+    return _AdaptiveProfileApplyReason.settings;
+  }
+
+  bool _isLiveBufferPolicyOnlyChange(
+    AudioProfile previousProfile,
+    AudioProfile nextProfile,
+  ) {
+    final sameConcreteFormat =
+        previousProfile.mode == nextProfile.mode &&
+        previousProfile.codec == nextProfile.codec &&
+        previousProfile.outputBackend == nextProfile.outputBackend &&
+        previousProfile.sampleRate == nextProfile.sampleRate &&
+        previousProfile.effectiveBitrateKbps ==
+            nextProfile.effectiveBitrateKbps &&
+        previousProfile.adaptiveSampleRate == nextProfile.adaptiveSampleRate &&
+        previousProfile.adaptiveBitrate == nextProfile.adaptiveBitrate &&
+        previousProfile.captureBufferMs == nextProfile.captureBufferMs &&
+        previousProfile.channels == nextProfile.channels;
+    if (!sameConcreteFormat) {
+      return false;
+    }
+
+    return previousProfile.latencyMs != nextProfile.latencyMs ||
+        previousProfile.playbackBufferMs != nextProfile.playbackBufferMs ||
+        previousProfile.packetTimeMs != nextProfile.packetTimeMs ||
+        previousProfile.receiverAdaptiveBuffer !=
+            nextProfile.receiverAdaptiveBuffer ||
+        previousProfile.adaptiveBufferCapMs != nextProfile.adaptiveBufferCapMs;
+  }
+
+  void _resetAdaptiveFormatBaselines() {
+    final snapshot = _AdaptiveMetricsSnapshot.fromMetrics(metrics);
+    _adaptiveFormatBaseline = snapshot;
+    _autoCodecBaseline = snapshot;
+    _adaptiveFormatPressureScoreValue = 0;
+    _adaptiveFormatQuietPolls = 0;
+  }
+
+  void _updateAdaptiveFormatPressureFromMetrics(AudioRelayMetrics nextMetrics) {
+    if (role != RelayRole.sender ||
+        !isStreaming ||
+        (!profile.adaptiveBitrate && !profile.adaptiveSampleRate)) {
+      _adaptiveFormatBaseline = null;
+      _adaptiveFormatPressureScoreValue = 0;
+      _adaptiveFormatQuietPolls = 0;
+      return;
+    }
+
+    final snapshot = _AdaptiveMetricsSnapshot.fromMetrics(nextMetrics);
+    final baseline = _adaptiveFormatBaseline;
+    if (baseline == null) {
+      _adaptiveFormatBaseline = snapshot;
+      _adaptiveFormatPressureScoreValue = 0;
+      _adaptiveFormatQuietPolls = 0;
+      return;
+    }
+
+    final nextScore = _adaptiveFormatPressureScoreFromEvents(
+      baseline.transportEventDelta(nextMetrics),
+    );
+    _adaptiveFormatBaseline = snapshot;
+    if (nextScore > 0) {
+      _adaptiveFormatPressureScoreValue = max(
+        _adaptiveFormatPressureScoreValue,
+        nextScore,
+      );
+      _adaptiveFormatQuietPolls = 0;
+      return;
+    }
+
+    if (_adaptiveFormatPressureScoreValue <= 0) {
+      _adaptiveFormatQuietPolls = 0;
+      return;
+    }
+
+    _adaptiveFormatQuietPolls += 1;
+    if (_adaptiveFormatQuietPolls >= _adaptiveFormatRecoveryPolls) {
+      _adaptiveFormatPressureScoreValue -= 1;
+      _adaptiveFormatQuietPolls = 0;
+    }
   }
 
   void _syncReceiverProfileFromMetrics(AudioRelayMetrics nextMetrics) {
@@ -980,6 +1285,47 @@ class AudioRelayController extends ChangeNotifier {
 
     profile = nextProfile;
     selectedPreset = profile.mode;
+  }
+
+  void _updateAdaptiveSenderProfileFromMetrics() {
+    if (role != RelayRole.sender ||
+        !isStreaming ||
+        (!profile.adaptiveBitrate && !profile.adaptiveSampleRate)) {
+      return;
+    }
+
+    final currentProfile = _appliedSenderProfile;
+    if (currentProfile == null) {
+      return;
+    }
+
+    final nextProfile = _resolveSenderProfile(
+      profile,
+      reason: _AdaptiveProfileApplyReason.metrics,
+    );
+    if (_concreteSenderProfilesMatch(currentProfile, nextProfile)) {
+      return;
+    }
+
+    _scheduleActiveProfileApply(reason: _AdaptiveProfileApplyReason.metrics);
+  }
+
+  bool _concreteSenderProfilesMatch(
+    AudioProfile currentProfile,
+    AudioProfile nextProfile,
+  ) {
+    return currentProfile.codec == nextProfile.codec &&
+        currentProfile.outputBackend == nextProfile.outputBackend &&
+        currentProfile.sampleRate == nextProfile.sampleRate &&
+        currentProfile.effectiveBitrateKbps ==
+            nextProfile.effectiveBitrateKbps &&
+        currentProfile.captureBufferMs == nextProfile.captureBufferMs &&
+        currentProfile.playbackBufferMs == nextProfile.playbackBufferMs &&
+        currentProfile.packetTimeMs == nextProfile.packetTimeMs &&
+        currentProfile.channels == nextProfile.channels &&
+        currentProfile.receiverAdaptiveBuffer ==
+            nextProfile.receiverAdaptiveBuffer &&
+        currentProfile.adaptiveBufferCapMs == nextProfile.adaptiveBufferCapMs;
   }
 
   AudioProfile _profileForPreset(AudioPreset preset) {
@@ -1049,13 +1395,21 @@ class AudioRelayController extends ChangeNotifier {
     final formatNormalized = nextProfile.channels == 2
         ? nextProfile
         : nextProfile.copyWith(channels: 2);
-    final normalized = switch (formatNormalized.codec) {
+    final sampleRateNormalized = switch (formatNormalized.codec) {
       AudioCodec.opus =>
         formatNormalized.sampleRate == 48000
             ? formatNormalized
             : formatNormalized.copyWith(sampleRate: 48000),
       _ => formatNormalized,
     };
+    final normalized = sampleRateNormalized.copyWith(
+      adaptiveSampleRate: sampleRateNormalized.codec == AudioCodec.opus
+          ? false
+          : sampleRateNormalized.adaptiveSampleRate,
+      adaptiveBitrate: _supportsAdaptiveBitrate(sampleRateNormalized)
+          ? sampleRateNormalized.adaptiveBitrate
+          : false,
+    );
 
     if (normalized.mode != AudioPreset.custom) {
       return normalized.copyWith(adaptiveBufferCapMs: 0);
@@ -1064,6 +1418,14 @@ class AudioRelayController extends ChangeNotifier {
     return normalized.copyWith(
       adaptiveBufferCapMs: _effectiveAdaptiveBufferCap(normalized),
     );
+  }
+
+  bool _supportsAdaptiveBitrate(AudioProfile nextProfile) {
+    if (nextProfile.codec == AudioCodec.auto) {
+      return capabilities.supportsCodec(AudioCodec.opus) ||
+          capabilities.supportsCodec(AudioCodec.aac);
+    }
+    return _hasConfigurableBitrate(nextProfile.codec);
   }
 
   int _effectiveAdaptiveBufferCap(AudioProfile nextProfile) {
@@ -1081,18 +1443,64 @@ class AudioRelayController extends ChangeNotifier {
     return capMs.clamp(requestedMs, AudioProfile.maxBufferMs).toInt();
   }
 
-  void _scheduleActiveProfileApply() {
+  int _adaptiveMaxPlaybackBufferMsForProfile(AudioProfile nextProfile) {
+    final requestedMs = nextProfile.playbackBufferMs.clamp(
+      AudioProfile.minBufferMs,
+      AudioProfile.maxBufferMs,
+    );
+    final capMs = switch (nextProfile.mode) {
+      AudioPreset.gaming =>
+        requestedMs <= 10
+            ? max(_adaptiveUltraLowLatencyCapMs, requestedMs * 4)
+            : max(requestedMs, requestedMs + 12),
+      AudioPreset.balanced => min(
+        max(96, requestedMs * 2),
+        _adaptiveBalancedCapMs,
+      ),
+      AudioPreset.music => AudioProfile.maxBufferMs,
+      AudioPreset.custom => _effectiveAdaptiveBufferCap(nextProfile),
+    };
+    final modeCapMs = nextProfile.mode == AudioPreset.gaming
+        ? min(capMs, _adaptiveGamingCapMs)
+        : capMs;
+    return modeCapMs.clamp(requestedMs, AudioProfile.maxBufferMs).toInt();
+  }
+
+  void _scheduleActiveProfileApply({
+    _AdaptiveProfileApplyReason reason = _AdaptiveProfileApplyReason.settings,
+  }) {
     if (role != RelayRole.sender ||
         (activity != RelayActivity.advertising &&
             activity != RelayActivity.streaming)) {
       return;
     }
 
+    _pendingProfileApplyReason = _mergeProfileApplyReasons(
+      _profileApplyPending
+          ? _pendingProfileApplyReason
+          : _AdaptiveProfileApplyReason.settings,
+      reason,
+    );
     _profileApplyPending = true;
     _profileApplyTimer?.cancel();
     _profileApplyTimer = Timer(_profileApplyDelay, () {
       unawaited(_applyPendingProfile());
     });
+  }
+
+  _AdaptiveProfileApplyReason _mergeProfileApplyReasons(
+    _AdaptiveProfileApplyReason current,
+    _AdaptiveProfileApplyReason next,
+  ) {
+    if (current == _AdaptiveProfileApplyReason.liveBufferPolicy ||
+        next == _AdaptiveProfileApplyReason.liveBufferPolicy) {
+      return _AdaptiveProfileApplyReason.liveBufferPolicy;
+    }
+    if (current == _AdaptiveProfileApplyReason.metrics ||
+        next == _AdaptiveProfileApplyReason.metrics) {
+      return _AdaptiveProfileApplyReason.metrics;
+    }
+    return next;
   }
 
   Future<void> _applyPendingProfile() async {
@@ -1104,9 +1512,11 @@ class AudioRelayController extends ChangeNotifier {
     try {
       while (_profileApplyPending) {
         _profileApplyPending = false;
+        final applyReason = _pendingProfileApplyReason;
+        _pendingProfileApplyReason = _AdaptiveProfileApplyReason.settings;
         final nextProfile = profile;
         try {
-          await _refreshActiveSenderProfile(nextProfile);
+          await _refreshActiveSenderProfile(nextProfile, reason: applyReason);
         } on PlatformException catch (error) {
           _fail(error.message ?? 'Unable to apply audio settings.');
           return;
@@ -1129,22 +1539,32 @@ class AudioRelayController extends ChangeNotifier {
     }
   }
 
-  Future<void> _refreshActiveSenderProfile(AudioProfile nextProfile) async {
+  Future<void> _refreshActiveSenderProfile(
+    AudioProfile nextProfile, {
+    required _AdaptiveProfileApplyReason reason,
+  }) async {
     if (role != RelayRole.sender) {
       return;
     }
 
-    final senderProfile = _materializedSenderProfile(nextProfile);
+    final senderProfile = _resolveSenderProfile(
+      nextProfile,
+      reason: activity == RelayActivity.streaming
+          ? reason
+          : _AdaptiveProfileApplyReason.settings,
+    );
     if (activity == RelayActivity.advertising) {
       if (isUsbTunnelTransport) {
         await _engine.prepareUsbSender(senderProfile);
         _appliedSenderProfile = senderProfile;
+        _rememberAutoResolvedCodec(senderProfile);
       } else {
         await _engine.prepareSender(
           senderProfile,
           networkBindAddress: _networkBindAddress,
         );
         _appliedSenderProfile = senderProfile;
+        _rememberAutoResolvedCodec(senderProfile);
         await _startAdvertisingCurrentProfile(senderProfile);
       }
       return;
@@ -1154,7 +1574,10 @@ class AudioRelayController extends ChangeNotifier {
       return;
     }
 
-    if (_canUpdateActiveSenderProfileWithoutRestart(senderProfile)) {
+    if (_canUpdateActiveSenderProfileWithoutRestart(
+      senderProfile,
+      allowBitrateChange: profile.adaptiveBitrate,
+    )) {
       if (usesNetworkDiscovery) {
         await _startAdvertisingCurrentProfile(senderProfile);
       }
@@ -1170,12 +1593,14 @@ class AudioRelayController extends ChangeNotifier {
         );
       }
       _appliedSenderProfile = senderProfile;
+      _rememberAutoResolvedCodec(senderProfile);
     }
   }
 
   bool _canUpdateActiveSenderProfileWithoutRestart(
     AudioProfile nextProfile, {
     bool allowCodecChange = false,
+    bool allowBitrateChange = false,
   }) {
     final currentProfile = _appliedSenderProfile;
     if (currentProfile == null) {
@@ -1186,6 +1611,7 @@ class AudioRelayController extends ChangeNotifier {
         currentProfile.outputBackend == nextProfile.outputBackend &&
         currentProfile.sampleRate == nextProfile.sampleRate &&
         (allowCodecChange ||
+            allowBitrateChange ||
             currentProfile.effectiveBitrateKbps ==
                 nextProfile.effectiveBitrateKbps) &&
         currentProfile.captureBufferMs == nextProfile.captureBufferMs &&
@@ -1198,18 +1624,197 @@ class AudioRelayController extends ChangeNotifier {
     _autoCodecQuietSince = null;
     _autoCodecLastSwitchAt = null;
     _autoCodecBaseline = null;
+    _adaptiveFormatBaseline = null;
+    _adaptiveFormatPressureScoreValue = 0;
+    _adaptiveFormatQuietPolls = 0;
     _autoCodecApplyInFlight = false;
   }
 
   AudioProfile get _displayProfile {
-    return profile.codec == AudioCodec.auto
+    final appliedProfile = _appliedSenderProfile;
+    if (role == RelayRole.sender && isStreaming && appliedProfile != null) {
+      return appliedProfile;
+    }
+
+    final displayProfile = profile.codec == AudioCodec.auto
         ? _normalizeProfile(profile.copyWith(codec: _autoResolvedCodec))
         : profile;
+    return _resolveSenderProfile(
+      displayProfile,
+      reason: _AdaptiveProfileApplyReason.display,
+    );
   }
 
   AudioProfile _materializedSenderProfile(AudioProfile sourceProfile) {
-    final codec = _effectiveSenderCodecFor(sourceProfile);
-    return _normalizeProfile(sourceProfile.copyWith(codec: codec));
+    return _resolveSenderProfile(
+      sourceProfile,
+      reason: _AdaptiveProfileApplyReason.settings,
+    );
+  }
+
+  AudioProfile _resolveSenderProfile(
+    AudioProfile sourceProfile, {
+    required _AdaptiveProfileApplyReason reason,
+  }) {
+    return _adaptiveStreamDecisionMatrix(sourceProfile, reason: reason).profile;
+  }
+
+  _AdaptiveStreamMatrixResult _adaptiveStreamDecisionMatrix(
+    AudioProfile sourceProfile, {
+    required _AdaptiveProfileApplyReason reason,
+  }) {
+    final pressureScore = _adaptiveFormatPressureScore();
+    final currentProfile = _appliedSenderProfile;
+
+    final codec =
+        reason == _AdaptiveProfileApplyReason.liveBufferPolicy &&
+            currentProfile != null
+        ? currentProfile.codec
+        : _effectiveSenderCodecFor(sourceProfile);
+    final normalizedSource = _normalizeProfile(
+      sourceProfile.copyWith(codec: codec),
+    );
+
+    if (reason == _AdaptiveProfileApplyReason.liveBufferPolicy &&
+        currentProfile != null) {
+      final profile = _normalizeProfile(
+        normalizedSource.copyWith(
+          codec: currentProfile.codec,
+          outputBackend: currentProfile.outputBackend,
+          sampleRate: currentProfile.sampleRate,
+          bitrateKbps: currentProfile.bitrateKbps,
+          adaptiveSampleRate: false,
+          adaptiveBitrate: false,
+          captureBufferMs: currentProfile.captureBufferMs,
+          channels: currentProfile.channels,
+        ),
+      );
+      return _AdaptiveStreamMatrixResult(
+        profile: profile,
+        codec: profile.codec,
+        sampleRate: profile.sampleRate,
+        bitrateKbps: profile.effectiveBitrateKbps,
+        pressureScore: pressureScore,
+      );
+    }
+
+    final sampleRate = _effectiveSampleRateFor(
+      normalizedSource,
+      pressureScore: pressureScore,
+    );
+    final sampleRateProfile = _normalizeProfile(
+      normalizedSource.copyWith(sampleRate: sampleRate),
+    );
+    final bitrateKbps = _effectiveBitrateKbpsFor(
+      sampleRateProfile,
+      pressureScore: pressureScore,
+    );
+    final profile = _normalizeProfile(
+      sampleRateProfile.copyWith(
+        bitrateKbps: bitrateKbps,
+        adaptiveSampleRate: false,
+        adaptiveBitrate: false,
+      ),
+    );
+    return _AdaptiveStreamMatrixResult(
+      profile: profile,
+      codec: profile.codec,
+      sampleRate: profile.sampleRate,
+      bitrateKbps: profile.effectiveBitrateKbps,
+      pressureScore: pressureScore,
+    );
+  }
+
+  int _effectiveSampleRateFor(
+    AudioProfile sourceProfile, {
+    required int pressureScore,
+  }) {
+    if (sourceProfile.codec == AudioCodec.opus) {
+      return 48000;
+    }
+    if (!sourceProfile.adaptiveSampleRate) {
+      return sourceProfile.sampleRate;
+    }
+
+    final currentProfile = _appliedSenderProfile;
+    if (isStreaming && currentProfile != null) {
+      return currentProfile.sampleRate;
+    }
+
+    if (pressureScore >= 4) {
+      return 44100;
+    }
+    if (sourceProfile.mode == AudioPreset.music &&
+        pressureScore <= 1 &&
+        !isUsbTransport) {
+      return 96000;
+    }
+    return 48000;
+  }
+
+  int _effectiveBitrateKbpsFor(
+    AudioProfile sourceProfile, {
+    required int pressureScore,
+  }) {
+    if (!sourceProfile.adaptiveBitrate) {
+      return sourceProfile.bitrateKbps;
+    }
+
+    final range = _bitrateRangeFor(sourceProfile.codec);
+    if (range == null) {
+      return sourceProfile.bitrateKbps;
+    }
+    return _adaptiveBitrateKbps(
+      sourceProfile,
+      range,
+      pressureScore: pressureScore,
+    );
+  }
+
+  int _adaptiveBitrateKbps(
+    AudioProfile sourceProfile,
+    CodecBitrateRange range, {
+    required int pressureScore,
+  }) {
+    final preferredKbps = _preferredAdaptiveBitrateKbps(sourceProfile, range);
+    if (pressureScore >= 7) {
+      return range.minKbps;
+    }
+    if (pressureScore >= 5) {
+      return _snapBitrateKbps((range.minKbps + preferredKbps) / 2, range);
+    }
+    if (pressureScore >= 3) {
+      return _snapBitrateKbps(
+        range.minKbps * 0.25 + preferredKbps * 0.75,
+        range,
+      );
+    }
+    if (pressureScore >= 1) {
+      return _snapBitrateKbps(
+        range.minKbps * 0.125 + preferredKbps * 0.875,
+        range,
+      );
+    }
+    return _clampBitrateKbps(preferredKbps, range);
+  }
+
+  int _preferredAdaptiveBitrateKbps(
+    AudioProfile sourceProfile,
+    CodecBitrateRange range,
+  ) {
+    final preferredKbps = switch (sourceProfile.mode) {
+      AudioPreset.gaming => 128,
+      AudioPreset.balanced => 160,
+      AudioPreset.music => range.maxKbps,
+      AudioPreset.custom => sourceProfile.bitrateKbps,
+    };
+    return _clampBitrateKbps(preferredKbps, range);
+  }
+
+  void _rememberAutoResolvedCodec(AudioProfile senderProfile) {
+    if (profile.codec == AudioCodec.auto) {
+      _autoResolvedCodec = senderProfile.codec;
+    }
   }
 
   AudioCodec _effectiveSenderCodecFor(AudioProfile sourceProfile) {
@@ -1219,10 +1824,17 @@ class AudioRelayController extends ChangeNotifier {
     if (isStreaming && metrics.remoteSupportedCodecs.isEmpty) {
       return _autoResolvedCodec;
     }
+    final remoteKnown = metrics.remoteSupportedCodecs.isNotEmpty;
     final candidates = _autoCodecLocalCandidates(
       remoteSupportedCodecs: metrics.remoteSupportedCodecs,
-      requireRemoteSupport: isStreaming,
+      requireRemoteSupport: isStreaming || remoteKnown,
     );
+    final lowLatencyCodec = remoteKnown
+        ? _preferredLowLatencyAutoCodec(sourceProfile, candidates)
+        : null;
+    if (lowLatencyCodec != null) {
+      return lowLatencyCodec;
+    }
     return candidates.contains(_autoResolvedCodec)
         ? _autoResolvedCodec
         : AudioCodec.pcm;
@@ -1274,29 +1886,41 @@ class AudioRelayController extends ChangeNotifier {
 
     final now = DateTime.now();
     _autoCodecStartedAt ??= now;
-    _autoCodecBaseline ??= _AutoCodecMetricsSnapshot.fromMetrics(nextMetrics);
+    _autoCodecBaseline ??= _AdaptiveMetricsSnapshot.fromMetrics(nextMetrics);
 
     final nextCodec = _chooseAutoCodec(nextMetrics, candidates);
+    final isLowLatencyUpgrade = _isPreferredLowLatencyAutoCodec(
+      profile,
+      nextCodec,
+    );
     final warmingUp = now.difference(_autoCodecStartedAt!) < _autoCodecWarmup;
-    if (warmingUp || nextCodec == _autoResolvedCodec) {
+    if (!isLowLatencyUpgrade &&
+        (warmingUp || nextCodec == _autoResolvedCodec)) {
+      _autoCodecQuietSince = null;
+      return;
+    }
+    if (nextCodec == _autoResolvedCodec) {
       _autoCodecQuietSince = null;
       return;
     }
 
     final lastSwitchAt = _autoCodecLastSwitchAt;
-    if (lastSwitchAt != null &&
+    if (!isLowLatencyUpgrade &&
+        lastSwitchAt != null &&
         now.difference(lastSwitchAt) < _autoCodecSwitchCooldown) {
       return;
     }
 
-    if (!_isQuietForAutoCodecSwitch(nextMetrics)) {
+    if (!isLowLatencyUpgrade && !_isQuietForAutoCodecSwitch(nextMetrics)) {
       _autoCodecQuietSince = null;
       return;
     }
 
-    _autoCodecQuietSince ??= now;
-    if (now.difference(_autoCodecQuietSince!) < _autoCodecQuietHold) {
-      return;
+    if (!isLowLatencyUpgrade) {
+      _autoCodecQuietSince ??= now;
+      if (now.difference(_autoCodecQuietSince!) < _autoCodecQuietHold) {
+        return;
+      }
     }
 
     unawaited(_applyAutoCodecSwitch(nextCodec, nextMetrics));
@@ -1306,6 +1930,11 @@ class AudioRelayController extends ChangeNotifier {
     AudioRelayMetrics nextMetrics,
     List<AudioCodec> candidates,
   ) {
+    final lowLatencyCodec = _preferredLowLatencyAutoCodec(profile, candidates);
+    if (lowLatencyCodec != null) {
+      return lowLatencyCodec;
+    }
+
     final pressureScore = _autoCodecPressureScore(nextMetrics);
     if (pressureScore <= 1) {
       return AudioCodec.pcm;
@@ -1332,6 +1961,52 @@ class AudioRelayController extends ChangeNotifier {
       }
     }
     return AudioCodec.pcm;
+  }
+
+  AudioCodec? _preferredLowLatencyAutoCodec(
+    AudioProfile sourceProfile,
+    List<AudioCodec> candidates,
+  ) {
+    if (!_prefersLowLatencyCompression(sourceProfile)) {
+      return null;
+    }
+    for (final codec in _lowLatencyAutoCodecPreference) {
+      if (candidates.contains(codec)) {
+        return codec;
+      }
+    }
+    return null;
+  }
+
+  bool _isPreferredLowLatencyAutoCodec(
+    AudioProfile sourceProfile,
+    AudioCodec codec,
+  ) {
+    return _prefersLowLatencyCompression(sourceProfile) &&
+        _lowLatencyAutoCodecPreference.contains(codec);
+  }
+
+  bool _prefersLowLatencyCompression(AudioProfile sourceProfile) {
+    return sourceProfile.mode == AudioPreset.gaming ||
+        sourceProfile.packetTimeMs <= 2 ||
+        sourceProfile.playbackBufferMs <= 28;
+  }
+
+  int _adaptiveFormatPressureScore() {
+    return _adaptiveFormatPressureScoreValue;
+  }
+
+  int _adaptiveFormatPressureScoreFromEvents(int eventDelta) {
+    if (eventDelta >= 24) {
+      return 7;
+    }
+    if (eventDelta >= 12) {
+      return 5;
+    }
+    if (eventDelta >= 6) {
+      return 3;
+    }
+    return eventDelta > 0 ? 1 : 0;
   }
 
   int _autoCodecPressureScore(AudioRelayMetrics nextMetrics) {
@@ -1396,7 +2071,10 @@ class AudioRelayController extends ChangeNotifier {
 
     _autoCodecApplyInFlight = true;
     try {
-      final nextProfile = _normalizeProfile(profile.copyWith(codec: codec));
+      final nextProfile = _resolveSenderProfile(
+        _normalizeProfile(profile.copyWith(codec: codec)),
+        reason: _AdaptiveProfileApplyReason.autoCodecSwitch,
+      );
       if (!_canUpdateActiveSenderProfileWithoutRestart(
         nextProfile,
         allowCodecChange: true,
@@ -1421,7 +2099,7 @@ class AudioRelayController extends ChangeNotifier {
       _autoResolvedCodec = codec;
       _autoCodecQuietSince = null;
       _autoCodecLastSwitchAt = DateTime.now();
-      _autoCodecBaseline = _AutoCodecMetricsSnapshot.fromMetrics(nextMetrics);
+      _autoCodecBaseline = _AdaptiveMetricsSnapshot.fromMetrics(nextMetrics);
       notifyListeners();
     } on PlatformException catch (error) {
       _fail(error.message ?? 'Unable to apply automatic codec.');
@@ -1557,6 +2235,7 @@ class AudioRelayController extends ChangeNotifier {
     _profileApplyTimer?.cancel();
     _profileApplyTimer = null;
     _profileApplyPending = false;
+    _pendingProfileApplyReason = _AdaptiveProfileApplyReason.settings;
   }
 
   static RelayRole _defaultRole() {
@@ -1581,8 +2260,70 @@ class AudioRelayController extends ChangeNotifier {
     return DevicePlatform.unknown;
   }
 
+  AudioCodec get _bitrateTargetCodec {
+    if (profile.codec != AudioCodec.auto) {
+      return profile.codec;
+    }
+    if (_hasConfigurableBitrate(_autoResolvedCodec)) {
+      return _autoResolvedCodec;
+    }
+    if (capabilities.supportsCodec(AudioCodec.opus)) {
+      return AudioCodec.opus;
+    }
+    if (capabilities.supportsCodec(AudioCodec.aac)) {
+      return AudioCodec.aac;
+    }
+    return _autoResolvedCodec;
+  }
+
+  bool _hasConfigurableBitrate(AudioCodec codec) {
+    return codec == AudioCodec.opus || codec == AudioCodec.aac;
+  }
+
+  CodecBitrateRange? _bitrateRangeFor(AudioCodec codec) {
+    final nativeRange = capabilities.codecBitrateRanges[codec];
+    if (nativeRange != null &&
+        nativeRange.minKbps > 0 &&
+        nativeRange.maxKbps >= nativeRange.minKbps) {
+      return nativeRange;
+    }
+    return switch (codec) {
+      AudioCodec.opus => const CodecBitrateRange(minKbps: 64, maxKbps: 256),
+      AudioCodec.aac => const CodecBitrateRange(minKbps: 96, maxKbps: 192),
+      _ => null,
+    };
+  }
+
+  int _snapBitrateKbps(double value, CodecBitrateRange range) {
+    const stepKbps = 8;
+    final clamped = value.clamp(range.minKbps, range.maxKbps).toDouble();
+    final snapped = (clamped / stepKbps).round() * stepKbps;
+    return _clampBitrateKbps(snapped, range);
+  }
+
+  int _clampBitrateKbps(int value, CodecBitrateRange range) {
+    return value.clamp(range.minKbps, range.maxKbps).toInt();
+  }
+
   int _framesForMs(int milliseconds) {
-    return (profile.sampleRate * milliseconds / 1000).round();
+    return (_displayProfile.sampleRate * milliseconds / 1000).round();
+  }
+
+  static String _formatSampleRate(int sampleRate) {
+    if (sampleRate % 1000 == 0) {
+      return '${sampleRate ~/ 1000} kHz';
+    }
+    return '${(sampleRate / 1000).toStringAsFixed(1)} kHz';
+  }
+
+  int _opusFrameSamplesForPacketTime(int milliseconds) {
+    if (milliseconds <= 2) {
+      return 120;
+    }
+    if (milliseconds <= 5) {
+      return 240;
+    }
+    return 480;
   }
 
   int _clampBufferMs(double value) {
@@ -1671,8 +2412,24 @@ class AudioRelayController extends ChangeNotifier {
   }
 }
 
-class _AutoCodecMetricsSnapshot {
-  const _AutoCodecMetricsSnapshot({
+class _AdaptiveStreamMatrixResult {
+  const _AdaptiveStreamMatrixResult({
+    required this.profile,
+    required this.codec,
+    required this.sampleRate,
+    required this.bitrateKbps,
+    required this.pressureScore,
+  });
+
+  final AudioProfile profile;
+  final AudioCodec codec;
+  final int sampleRate;
+  final int bitrateKbps;
+  final int pressureScore;
+}
+
+class _AdaptiveMetricsSnapshot {
+  const _AdaptiveMetricsSnapshot({
     required this.underruns,
     required this.droppedPackets,
     required this.lostPackets,
@@ -1684,8 +2441,8 @@ class _AutoCodecMetricsSnapshot {
   final int lostPackets;
   final int trims;
 
-  factory _AutoCodecMetricsSnapshot.fromMetrics(AudioRelayMetrics metrics) {
-    return _AutoCodecMetricsSnapshot(
+  factory _AdaptiveMetricsSnapshot.fromMetrics(AudioRelayMetrics metrics) {
+    return _AdaptiveMetricsSnapshot(
       underruns: metrics.underrunCount ?? 0,
       droppedPackets: metrics.droppedPacketCount ?? 0,
       lostPackets: metrics.lostPacketCount ?? 0,
@@ -1696,6 +2453,12 @@ class _AutoCodecMetricsSnapshot {
   int eventDelta(AudioRelayMetrics metrics) {
     return _positiveDelta(metrics.underrunCount, underruns) +
         _positiveDelta(metrics.droppedPacketCount, droppedPackets) +
+        _positiveDelta(metrics.lostPacketCount, lostPackets) +
+        _positiveDelta(metrics.trimCount, trims);
+  }
+
+  int transportEventDelta(AudioRelayMetrics metrics) {
+    return _positiveDelta(metrics.droppedPacketCount, droppedPackets) +
         _positiveDelta(metrics.lostPacketCount, lostPackets) +
         _positiveDelta(metrics.trimCount, trims);
   }

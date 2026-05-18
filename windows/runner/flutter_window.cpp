@@ -177,6 +177,13 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   switch (message) {
+    case WM_QUERYENDSESSION:
+      return TRUE;
+    case WM_ENDSESSION:
+      if (wparam == TRUE) {
+        ExitFromTray();
+      }
+      return 0;
     case WM_CLOSE:
       ::ShowWindow(hwnd, SW_HIDE);
       return 0;

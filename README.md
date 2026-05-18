@@ -63,6 +63,25 @@ flutter devices
 flutter run -d <android-device-id>
 ```
 
+## Dev Workflow
+
+Run the local developer check before opening a pull request:
+
+```powershell
+.\scripts\dev_check.ps1
+```
+
+For faster local iteration, skip a platform compile check when it is not
+needed:
+
+```powershell
+.\scripts\dev_check.ps1 -SkipWindowsBuild
+.\scripts\dev_check.ps1 -SkipAndroidBuild
+```
+
+Close any running `AudioBridge.exe` before the Windows build. The linker cannot
+overwrite the debug executable while the app is still running.
+
 ## Windows MSI
 
 The Windows app can be packaged as an MSI with WiX Toolset SDK 5. The packaging

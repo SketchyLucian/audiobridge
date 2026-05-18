@@ -110,6 +110,7 @@ constexpr int kMaxBufferMs = 500;
 constexpr int kLowLatencyPerformanceMaxMs = 80;
 constexpr int64_t kSourceIdleTimeoutMs = 1200;
 constexpr char kSubscribePrefix[] = "ABR_SUBSCRIBE";
+constexpr size_t kSubscribeMaxBytes = 2048;
 constexpr char kReceiverSupportedCodecs[] = "pcm";
 constexpr uint16_t kAoaGetProtocol = 51;
 constexpr uint16_t kAoaSendString = 52;
@@ -149,6 +150,9 @@ constexpr uint32_t kReceiverOptionModeMask = 3u << kReceiverOptionModeShift;
 constexpr int kReceiverOptionCustomCapShift = 8;
 constexpr uint32_t kReceiverOptionCustomCapMask =
     0x1FFu << kReceiverOptionCustomCapShift;
+constexpr int kReceiverOptionBitrateShift = 20;
+constexpr uint32_t kReceiverOptionBitrateMask =
+    0xFFFu << kReceiverOptionBitrateShift;
 constexpr int kAacSamplesPerFrame = 1024;
 constexpr int kOpusSampleRate = 48000;
 constexpr int kOpusLowFrameSamples = kOpusSampleRate * 25 / 10000;
@@ -163,11 +167,11 @@ constexpr int64_t kSequenceModulus = 0x100000000LL;
 constexpr int kAdaptiveBufferCooldownMs = 1500;
 constexpr int kAdaptiveBufferRelaxMs = 6000;
 constexpr int kAdaptiveBufferFastRelaxMs = 2500;
+constexpr int64_t kAdaptivePlaybackStartGraceMs = 1000;
 constexpr int kAdaptiveUnderrunSlowWindowMs = 15000;
 constexpr int kAdaptiveAcceptableUnderrunsPerSlowWindow = 4;
 constexpr int kAdaptiveUnderrunBurstWindowMs = 2000;
 constexpr int kAdaptiveAcceptableUnderrunsPerBurst = 3;
-constexpr int kAdaptiveLowQueueSamplesToIncrease = 5;
 constexpr int64_t kAdaptiveLowQueueDivisor = 4;
 constexpr int kAdaptiveLowLatencyStepMs = 4;
 constexpr int kAdaptiveBalancedStepMs = 8;
@@ -185,6 +189,7 @@ constexpr double kAdaptiveDelayMaxMs = 2000.0;
 constexpr int64_t kAdaptiveSequenceResetGap = 50;
 constexpr int kAdaptiveNetworkTargetHysteresisMs = 3;
 constexpr int kAdaptiveFastRelaxMarginMs = 8;
+constexpr double kAdaptiveAudibleSignalFloor = 0.001;
 
 DEFINE_GUID(kAndroidWinUsbInterfaceGuid, 0xf72fe0d4, 0xcbcb, 0x407d, 0x88,
             0x14, 0x9e, 0xd6, 0x73, 0xd0, 0xdd, 0x6b);
@@ -610,12 +615,16 @@ std::string ModeName(AudioMode mode) {
 uint32_t ReceiverOptionsFor(const AudioProfile& profile) {
   const uint32_t adaptive =
       profile.receiver_adaptive_buffer ? kReceiverOptionAdaptiveBuffer : 0;
+  const uint32_t bitrate =
+      static_cast<uint32_t>(std::clamp(profile.bitrate_kbps, 0, 0xFFF));
   return adaptive |
          ((ModePacketId(profile.mode) << kReceiverOptionModeShift) &
           kReceiverOptionModeMask) |
          ((std::clamp(profile.adaptive_buffer_cap_ms, 0, kMaxBufferMs)
            << kReceiverOptionCustomCapShift) &
-          kReceiverOptionCustomCapMask);
+          kReceiverOptionCustomCapMask) |
+         ((bitrate << kReceiverOptionBitrateShift) &
+          kReceiverOptionBitrateMask);
 }
 
 int64_t NowMillis() {
@@ -1521,11 +1530,11 @@ class OpusCodecAdapter {
     Shutdown();
   }
 
-  bool Configure(int channels, int bitrate_bps) {
+  bool Configure(int channels, int bitrate_bps, bool low_delay) {
     const int clamped_channels = std::clamp(channels, 1, 2);
     const int clamped_bitrate = std::clamp(bitrate_bps, 64000, 256000);
     if (encoder_ != nullptr && channels_ == clamped_channels &&
-        bitrate_bps_ == clamped_bitrate) {
+        bitrate_bps_ == clamped_bitrate && low_delay_ == low_delay) {
       return true;
     }
 
@@ -1533,7 +1542,10 @@ class OpusCodecAdapter {
 
     int error = OPUS_OK;
     encoder_ = opus_encoder_create(kOpusSampleRate, clamped_channels,
-                                   OPUS_APPLICATION_AUDIO, &error);
+                                   low_delay
+                                       ? OPUS_APPLICATION_RESTRICTED_LOWDELAY
+                                       : OPUS_APPLICATION_AUDIO,
+                                   &error);
     if (error != OPUS_OK || encoder_ == nullptr) {
       encoder_ = nullptr;
       return false;
@@ -1541,10 +1553,13 @@ class OpusCodecAdapter {
 
     opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(clamped_bitrate));
     opus_encoder_ctl(encoder_, OPUS_SET_VBR(0));
-    opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(5));
+    opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(low_delay ? 4 : 5));
     opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
+    opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(0));
+    opus_encoder_ctl(encoder_, OPUS_SET_DTX(0));
     channels_ = clamped_channels;
     bitrate_bps_ = clamped_bitrate;
+    low_delay_ = low_delay;
     return true;
   }
 
@@ -1589,12 +1604,14 @@ class OpusCodecAdapter {
     }
     channels_ = 0;
     bitrate_bps_ = 0;
+    low_delay_ = false;
   }
 
  private:
   OpusEncoder* encoder_ = nullptr;
   int channels_ = 0;
   int bitrate_bps_ = 0;
+  bool low_delay_ = false;
 };
 
 class G711CodecAdapter {
@@ -1922,8 +1939,7 @@ class WindowsAudioEngine::Impl {
     const int64_t received_at = remote_metrics_received_at_ms_.load();
     const double output_latency_ms = remote_output_latency_ms_.load();
     const double audio_latency_ms = remote_audio_latency_ms_.load();
-    if (received_at <= 0 || (output_latency_ms < 0 && audio_latency_ms < 0) ||
-        NowMillis() - received_at > 3000) {
+    if (received_at <= 0 || NowMillis() - received_at > 3000) {
       return metrics;
     }
 
@@ -1970,7 +1986,7 @@ class WindowsAudioEngine::Impl {
         flutter::EncodableValue(remote_trim_count_.load());
     if (!capture_running) {
       metrics[flutter::EncodableValue("signalLevel")] =
-          flutter::EncodableValue(TakeSignalLevel());
+          flutter::EncodableValue(remote_signal_level_.load());
     }
     {
       std::scoped_lock lock(remote_capabilities_mutex_);
@@ -2307,7 +2323,9 @@ class WindowsAudioEngine::Impl {
     local_adaptive_underruns_in_burst_ = 0;
     local_adaptive_low_queue_samples_ = 0;
     local_render_started_ = false;
+    local_render_started_at_ms_ = 0;
     local_signal_peak_ = 0.0;
+    local_last_playback_signal_level_ = 0.0;
     ResetLocalAdaptiveDelayTracker();
     opus_codec_.Shutdown();
     aac_codec_.Shutdown();
@@ -2363,6 +2381,7 @@ class WindowsAudioEngine::Impl {
     remote_output_latency_ms_ = -1.0;
     remote_audio_latency_ms_ = -1.0;
     remote_network_latency_ms_ = -1.0;
+    remote_signal_level_ = 0.0;
     remote_queued_frames_ = 0;
     remote_buffer_size_frames_ = 0;
     remote_target_buffer_frames_ = 0;
@@ -2426,7 +2445,7 @@ class WindowsAudioEngine::Impl {
   }
 
   void ControlLoop() {
-    std::vector<char> buffer(512);
+    std::vector<char> buffer(kSubscribeMaxBytes);
 
     while (control_running_) {
       sockaddr_in remote = {};
@@ -3087,7 +3106,7 @@ class WindowsAudioEngine::Impl {
       has_metric = true;
     }
     if (const auto signal = ParseDoubleMetric(message, "signalLevel")) {
-      PublishSignalLevel(signal.value());
+      remote_signal_level_ = std::clamp(signal.value(), 0.0, 1.0);
       has_metric = true;
     }
     if (has_metric) {
@@ -3469,12 +3488,18 @@ class WindowsAudioEngine::Impl {
       const int adaptive_buffer_cap_ms =
           static_cast<int>((receiver_options & kReceiverOptionCustomCapMask) >>
                            kReceiverOptionCustomCapShift);
+      const int active_bitrate_kbps =
+          static_cast<int>((receiver_options & kReceiverOptionBitrateMask) >>
+                           kReceiverOptionBitrateShift);
       const bool adaptive_policy_changed =
           profile_.receiver_adaptive_buffer != receiver_adaptive_buffer ||
           profile_.mode != mode ||
           profile_.adaptive_buffer_cap_ms != adaptive_buffer_cap_ms;
       const bool playback_target_changed =
           profile_.playback_buffer_ms != playback_buffer_ms;
+      if (active_bitrate_kbps > 0) {
+        profile_.bitrate_kbps = active_bitrate_kbps;
+      }
       const int previous_adaptive_buffer_ms =
           static_cast<int>(local_adaptive_playback_buffer_ms_.load());
       profile_.playback_buffer_ms = playback_buffer_ms;
@@ -3490,6 +3515,10 @@ class WindowsAudioEngine::Impl {
         const int next_buffer_ms =
             !receiver_adaptive_buffer
                 ? playback_buffer_ms
+                : adaptive_policy_changed &&
+                          ShouldStartAdaptiveBufferAtRequested(
+                              playback_buffer_ms)
+                      ? playback_buffer_ms
                 : playback_buffer_ms > previous_adaptive_buffer_ms
                       ? playback_buffer_ms
                       : previous_adaptive_buffer_ms > next_max_buffer_ms
@@ -3532,7 +3561,9 @@ class WindowsAudioEngine::Impl {
     if ((flags & kPacketFlagMuted) != 0 || muted_.load()) {
       std::fill(packet.pcm.begin(), packet.pcm.end(), int16_t{0});
     }
-    PublishSignalLevel(PcmPeakLevel(packet.pcm));
+    const double peak_level = PcmPeakLevel(packet.pcm);
+    PublishSignalLevel(peak_level);
+    local_last_playback_signal_level_ = peak_level;
 
     ObserveLocalAdaptivePacketArrival(NowMillis(), sequence, sample_rate,
                                       frames);
@@ -3566,6 +3597,7 @@ class WindowsAudioEngine::Impl {
     local_adaptive_underruns_in_burst_ = 0;
     local_adaptive_low_queue_samples_ = 0;
     local_render_started_ = false;
+    local_render_started_at_ms_ = 0;
     local_target_buffer_frames_ = LatencyFrames(sample_rate, requested_ms);
     local_last_adaptive_buffer_increase_at_ms_ = 0;
     local_last_playback_pressure_at_ms_ = 0;
@@ -3618,6 +3650,11 @@ class WindowsAudioEngine::Impl {
         break;
     }
     return std::clamp(cap_ms, requested_ms, kMaxBufferMs);
+  }
+
+  bool ShouldStartAdaptiveBufferAtRequested(int requested_ms) const {
+    return profile_.mode == AudioMode::kGaming ||
+           requested_ms <= kLowLatencyPerformanceMaxMs;
   }
 
   int AdaptiveBufferStepMs(int requested_ms) const {
@@ -3849,12 +3886,32 @@ class WindowsAudioEngine::Impl {
     }
 
     const int64_t now = NowMillis();
+    const int64_t underruns = local_underrun_count_.load();
+    if (!HasLocalAdaptivePlaybackSignal()) {
+      ResetLocalAdaptiveGrowthPressure(underruns);
+      const int current_ms =
+          static_cast<int>(local_adaptive_playback_buffer_ms_.load());
+      if (current_ms > requested_ms) {
+        SetLocalAdaptivePlaybackBufferMs(sample_rate, requested_ms);
+      }
+      return;
+    }
+
     const int64_t target_frames = LocalAdaptiveTargetFrames(sample_rate);
     const int network_floor_ms =
         LocalAdaptiveNetworkFloorBufferMs(requested_ms);
-    const int64_t underruns = local_underrun_count_.load();
+    const int64_t render_started_at = local_render_started_at_ms_.load();
+    const bool render_stable =
+        local_render_started_.load() && render_started_at > 0 &&
+        now - render_started_at >= kAdaptivePlaybackStartGraceMs;
     const int64_t underrun_delta =
-        std::max<int64_t>(0, underruns - local_last_known_underrun_count_);
+        render_stable
+            ? std::max<int64_t>(0,
+                                underruns - local_last_known_underrun_count_)
+            : 0;
+    if (!render_stable) {
+      local_last_known_underrun_count_ = underruns;
+    }
     bool should_increase = false;
     bool pressure_increase = false;
     if (underrun_delta > 0) {
@@ -3864,18 +3921,11 @@ class WindowsAudioEngine::Impl {
       pressure_increase = should_increase;
     }
 
-    if (local_render_started_.load() &&
+    if (render_stable &&
         IsLocalPlaybackQueueTooLow(sample_rate, queued_frames, target_frames)) {
-      local_last_playback_pressure_at_ms_ = now;
       ++local_adaptive_low_queue_sample_count_;
       local_adaptive_low_queue_samples_ =
           local_adaptive_low_queue_sample_count_;
-      const bool sustained_low_queue =
-          local_adaptive_low_queue_sample_count_ >=
-          kAdaptiveLowQueueSamplesToIncrease;
-      should_increase =
-          should_increase || sustained_low_queue;
-      pressure_increase = pressure_increase || sustained_low_queue;
     } else {
       local_adaptive_low_queue_sample_count_ = 0;
       local_adaptive_low_queue_samples_ = 0;
@@ -3909,6 +3959,25 @@ class WindowsAudioEngine::Impl {
     }
 
     local_last_known_underrun_count_ = underruns;
+  }
+
+  void ResetLocalAdaptiveGrowthPressure(int64_t underruns) {
+    local_last_known_underrun_count_ = underruns;
+    local_adaptive_underrun_window_start_at_ms_ = 0;
+    local_adaptive_underruns_in_window_counter_ = 0;
+    local_adaptive_underruns_in_window_ = 0;
+    local_adaptive_underrun_burst_start_at_ms_ = 0;
+    local_adaptive_underruns_in_burst_counter_ = 0;
+    local_adaptive_underruns_in_burst_ = 0;
+    local_adaptive_low_queue_sample_count_ = 0;
+    local_adaptive_low_queue_samples_ = 0;
+    ResetLocalAdaptiveDelayTracker();
+  }
+
+  bool HasLocalAdaptivePlaybackSignal() const {
+    return !muted_.load() &&
+           local_last_playback_signal_level_.load() >=
+               kAdaptiveAudibleSignalFloor;
   }
 
   bool ShouldRelaxLocalAdaptiveBuffer(int64_t now, int current_ms,
@@ -4075,6 +4144,8 @@ class WindowsAudioEngine::Impl {
         audio_client->Start();
         render_started = true;
         local_render_started_ = true;
+        local_render_started_at_ms_ = NowMillis();
+        local_last_known_underrun_count_ = local_underrun_count_.load();
       }
       WriteRenderPcm(render_client.Get(), audio_client.Get(), buffer_frames,
                      *mix_format, output);
@@ -4086,6 +4157,7 @@ class WindowsAudioEngine::Impl {
       audio_client->Stop();
     }
     local_render_started_ = false;
+    local_render_started_at_ms_ = 0;
     if (task_handle != nullptr) {
       AvRevertMmThreadCharacteristics(task_handle);
     }
@@ -4196,7 +4268,8 @@ class WindowsAudioEngine::Impl {
                                : std::max(1, max_payload_bytes /
                                                   std::max(1, bytes_per_frame));
     if (profile_.codec == AudioCodec::kOpus &&
-        !opus_codec_.Configure(channels, profile_.bitrate_kbps * 1000)) {
+        !opus_codec_.Configure(channels, profile_.bitrate_kbps * 1000,
+                               ShouldUseLowDelayOpus())) {
       return;
     }
     if (profile_.codec == AudioCodec::kAac &&
@@ -4403,6 +4476,12 @@ class WindowsAudioEngine::Impl {
     return std::clamp(profile_.sample_rate, 8000, 192000);
   }
 
+  bool ShouldUseLowDelayOpus() const {
+    return profile_.mode == AudioMode::kGaming ||
+           profile_.packet_time_ms <= 2 ||
+           profile_.playback_buffer_ms <= 28;
+  }
+
   void FinishCom(bool owns_com) {
     if (owns_com) {
       CoUninitialize();
@@ -4442,6 +4521,7 @@ class WindowsAudioEngine::Impl {
   std::atomic<double> remote_output_latency_ms_ = -1.0;
   std::atomic<double> remote_audio_latency_ms_ = -1.0;
   std::atomic<double> remote_network_latency_ms_ = -1.0;
+  std::atomic<double> remote_signal_level_ = 0.0;
   std::atomic<int64_t> remote_queued_frames_ = 0;
   std::atomic<int64_t> remote_buffer_size_frames_ = 0;
   std::atomic<int64_t> remote_target_buffer_frames_ = 0;
@@ -4462,6 +4542,7 @@ class WindowsAudioEngine::Impl {
   std::string remote_platform_;
   std::vector<std::string> remote_supported_codecs_;
   mutable std::atomic<double> local_signal_peak_ = 0.0;
+  std::atomic<double> local_last_playback_signal_level_ = 0.0;
   std::atomic<int64_t> local_buffer_size_frames_ = 0;
   std::atomic<int64_t> local_target_buffer_frames_ = 0;
   std::atomic<int64_t> local_adaptive_playback_buffer_ms_ = 0;
@@ -4471,6 +4552,7 @@ class WindowsAudioEngine::Impl {
   std::atomic<int64_t> local_adaptive_underruns_in_burst_ = 0;
   std::atomic<int64_t> local_adaptive_low_queue_samples_ = 0;
   std::atomic_bool local_render_started_ = false;
+  std::atomic<int64_t> local_render_started_at_ms_ = 0;
   std::atomic<int64_t> local_underrun_count_ = 0;
   std::atomic<int64_t> local_dropped_packet_count_ = 0;
   std::atomic<int64_t> local_lost_packet_count_ = 0;

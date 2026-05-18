@@ -319,7 +319,7 @@ class _ControlPanel extends StatelessWidget {
               _MetricTile(
                 icon: Icons.network_check_rounded,
                 label: 'Bitrate',
-                value: profile.sourceBitrateText,
+                value: controller.streamBitrateLabel,
               ),
               _MetricTile(
                 icon: Icons.av_timer_rounded,
@@ -641,19 +641,9 @@ class _UnifiedAudioSettings extends StatelessWidget {
         title: 'Sample rate',
         description:
             'Higher can preserve more detail, but uses more bandwidth and CPU. 48 kHz is the safest default.',
-        child: SegmentedButton<int>(
-          showSelectedIcon: false,
-          segments: const [
-            ButtonSegment(value: 44100, label: Text('44.1 kHz')),
-            ButtonSegment(value: 48000, label: Text('48 kHz')),
-            ButtonSegment(value: 96000, label: Text('96 kHz')),
-          ],
-          selected: {profile.sampleRate},
-          onSelectionChanged: restartRequiredLocked
-              ? null
-              : (selection) {
-                  controller.updateSampleRate(selection.first);
-                },
+        child: _SampleRatePicker(
+          controller: controller,
+          enabled: !restartRequiredLocked,
         ),
       ),
       _SettingBlock(
@@ -668,20 +658,24 @@ class _UnifiedAudioSettings extends StatelessWidget {
       ),
       _SettingBlock(
         compact: true,
-        title: 'Stream bitrate',
-        description:
-            'This is calculated from the selected codec and format. Higher values need a cleaner, faster network.',
-        child: _ReadoutValue(
-          icon: Icons.network_check_rounded,
-          value: controller.streamBitrateLabel,
-          label: controller.streamBitrateFormatLabel,
-        ),
+        title: 'Bitrate',
+        description: controller.bitrateTargetDescription,
+        child: controller.bitrateTargetRange == null
+            ? _ReadoutValue(
+                icon: Icons.network_check_rounded,
+                value: controller.streamBitrateLabel,
+                label: controller.streamBitrateFormatLabel,
+              )
+            : _BitratePicker(
+                controller: controller,
+                enabled: !restartRequiredLocked,
+              ),
       ),
       _SettingBlock(
         compact: true,
         title: 'Codec',
         description:
-            'Auto learns the link for 60 seconds, then changes codec only during silence or very quiet audio.',
+            'Auto uses Opus for low-latency modes when supported, then adapts conservative modes after link pressure is clear.',
         child: _CodecPicker(
           codec: profile.codec,
           enabled: !restartRequiredLocked,
@@ -1068,6 +1062,159 @@ class _SupportedSettingsNote extends StatelessWidget {
   }
 }
 
+class _SampleRatePicker extends StatelessWidget {
+  const _SampleRatePicker({required this.controller, required this.enabled});
+
+  static const _adaptiveValue = 0;
+
+  final AudioRelayController controller;
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final options = controller.sampleRateOptions;
+    final adaptiveEnabled = controller.canUseAdaptiveSampleRate;
+    final selection = controller.profile.adaptiveSampleRate
+        ? _adaptiveValue
+        : controller.profile.sampleRate;
+
+    return _DropdownWithDetail(
+      detail: controller.sampleRateSettingDetailLabel,
+      child: DropdownMenu<int>(
+        width: double.infinity,
+        enabled: enabled,
+        initialSelection: selection,
+        leadingIcon: const Icon(Icons.graphic_eq_rounded),
+        requestFocusOnTap: false,
+        onSelected: (value) {
+          if (value == null) {
+            return;
+          }
+          if (value == _adaptiveValue) {
+            controller.updateAdaptiveSampleRate(true);
+            return;
+          }
+          controller.updateSampleRate(value);
+        },
+        dropdownMenuEntries: [
+          DropdownMenuEntry(
+            value: _adaptiveValue,
+            enabled: adaptiveEnabled,
+            label: 'Adaptive',
+            leadingIcon: const Icon(Icons.auto_mode_rounded),
+            trailingIcon: Text(
+              adaptiveEnabled
+                  ? controller.appliedSampleRateLabel
+                  : '48 kHz only',
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: adaptiveEnabled
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          for (final option in options)
+            DropdownMenuEntry(
+              value: option,
+              label: _formatSampleRate(option),
+              leadingIcon: const Icon(Icons.speed_rounded),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BitratePicker extends StatelessWidget {
+  const _BitratePicker({required this.controller, required this.enabled});
+
+  static const _adaptiveValue = 0;
+
+  final AudioRelayController controller;
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final options = controller.bitrateTargetOptions;
+    final selection = controller.profile.adaptiveBitrate
+        ? _adaptiveValue
+        : controller.bitrateTargetKbps;
+
+    return _DropdownWithDetail(
+      detail: controller.bitrateSettingDetailLabel,
+      child: DropdownMenu<int>(
+        width: double.infinity,
+        enabled: enabled,
+        initialSelection: selection,
+        leadingIcon: const Icon(Icons.network_check_rounded),
+        requestFocusOnTap: false,
+        onSelected: (value) {
+          if (value == null) {
+            return;
+          }
+          if (value == _adaptiveValue) {
+            controller.updateAdaptiveBitrate(true);
+            return;
+          }
+          controller.updateBitrate(value.toDouble());
+        },
+        dropdownMenuEntries: [
+          DropdownMenuEntry(
+            value: _adaptiveValue,
+            label: 'Adaptive',
+            leadingIcon: const Icon(Icons.auto_mode_rounded),
+            trailingIcon: Text(
+              controller.appliedBitrateLabel,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: theme.colorScheme.primary,
+              ),
+            ),
+          ),
+          for (final option in options)
+            DropdownMenuEntry(
+              value: option,
+              label: '$option kbps',
+              leadingIcon: const Icon(Icons.speed_rounded),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DropdownWithDetail extends StatelessWidget {
+  const _DropdownWithDetail({required this.child, this.detail});
+
+  final Widget child;
+  final String? detail;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final detail = this.detail;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        child,
+        if (detail != null) ...[
+          const SizedBox(height: 6),
+          Text(
+            detail,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
 class _CodecPicker extends StatelessWidget {
   const _CodecPicker({
     required this.codec,
@@ -1129,6 +1276,13 @@ class _CodecPicker extends StatelessWidget {
       _ => Icons.music_note_rounded,
     };
   }
+}
+
+String _formatSampleRate(int sampleRate) {
+  if (sampleRate % 1000 == 0) {
+    return '${sampleRate ~/ 1000} kHz';
+  }
+  return '${(sampleRate / 1000).toStringAsFixed(1)} kHz';
 }
 
 class _OutputBackendPicker extends StatelessWidget {
