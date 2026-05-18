@@ -1,6 +1,7 @@
 # Miscellaneous
 *.class
 *.log
+*.obj
 *.pyc
 *.swp
 .DS_Store
@@ -49,3 +50,6 @@ app.*.map.json
 # WiX/MSBuild installer intermediates
 /installer/windows/bin/
 /installer/windows/obj/
+
+# External Microsoft driver sample checkout used by virtual mic scripts
+/third_party/windows-driver-samples/

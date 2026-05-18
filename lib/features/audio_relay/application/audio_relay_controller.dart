@@ -60,6 +60,13 @@ class AudioRelayController extends ChangeNotifier {
   double volume = 0.86;
   double signalLevel = 0;
   bool muted = false;
+  List<SoundPlaybackItem> soundboardItems = const [];
+  SoundPlaybackItem? selectedSoundboardItem;
+  SoundboardPlaybackTarget soundboardTarget = SoundboardPlaybackTarget.micRoute;
+  String? selectedSoundboardOutputDeviceId;
+  double soundboardVolume = 0.82;
+  bool soundboardBusy = false;
+  String? soundboardMessage;
 
   Timer? _meterTimer;
   Timer? _profileApplyTimer;
@@ -76,6 +83,8 @@ class AudioRelayController extends ChangeNotifier {
   bool _metricsPollInFlight = false;
   bool _profileApplyPending = false;
   bool _profileApplyInFlight = false;
+  bool _virtualMicPassthroughEnabled = false;
+  String? _virtualMicPassthroughOutputDeviceId;
   _AdaptiveProfileApplyReason _pendingProfileApplyReason =
       _AdaptiveProfileApplyReason.settings;
   AudioProfile _savedCustomProfile = AudioPreset.custom.profile;
@@ -85,7 +94,7 @@ class AudioRelayController extends ChangeNotifier {
   static const _adaptiveUltraLowLatencyCapMs = 24;
   static const _adaptiveGamingCapMs = 30;
   static const _adaptiveBalancedCapMs = 160;
-  static const _adaptiveFormatRecoveryPolls = 6;
+  static const _adaptiveFormatRecoveryPolls = 4;
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -107,6 +116,95 @@ class AudioRelayController extends ChangeNotifier {
 
   bool get canEditReceiverOutputBackend =>
       role == RelayRole.receiver && !isBusy && !isStreaming;
+
+  bool get canUseSoundboard {
+    return role == RelayRole.sender && capabilities.canPlaySoundEffects;
+  }
+
+  bool get canPlaySelectedSound {
+    return canPlaySoundboardItem(selectedSoundboardItem);
+  }
+
+  String get soundboardStatusLabel {
+    if (!canUseSoundboard) {
+      return 'Unavailable';
+    }
+    if (soundboardBusy) {
+      return 'Queueing';
+    }
+    if (soundboardTarget == SoundboardPlaybackTarget.micRoute &&
+        soundboardOutputDevices.isEmpty) {
+      return 'Needs call mic';
+    }
+    if (!isStreaming) {
+      return soundboardTarget == SoundboardPlaybackTarget.stream
+          ? 'Start stream'
+          : 'Mic + speaker';
+    }
+    return soundboardTarget == SoundboardPlaybackTarget.stream
+        ? 'Stream mix'
+        : 'Mic + speaker';
+  }
+
+  List<SoundboardOutputDevice> get soundboardOutputDevices {
+    final virtualDevices = capabilities.soundboardOutputDevices
+        .where((device) => device.isVirtualCable)
+        .toList(growable: false);
+    final directCableDevices = virtualDevices
+        .where(_isDedicatedSoundboardCableRoute)
+        .toList(growable: false);
+    if (directCableDevices.isNotEmpty) {
+      final sortedDirectDevices = List<SoundboardOutputDevice>.of(
+        directCableDevices,
+      )..sort(_compareSoundboardCableRoutes);
+      return [sortedDirectDevices.first];
+    }
+
+    return List<SoundboardOutputDevice>.of(virtualDevices)
+      ..sort(_compareSoundboardCableRoutes);
+  }
+
+  SoundboardOutputDevice? get selectedSoundboardOutputDevice {
+    final selectedId = selectedSoundboardOutputDeviceId;
+    if (selectedId == null) {
+      return null;
+    }
+    return soundboardOutputDevices
+        .where((device) => device.id == selectedId)
+        .firstOrNull;
+  }
+
+  String? get selectedSoundboardCallMicrophoneName {
+    final device = selectedSoundboardOutputDevice;
+    if (device == null) {
+      return null;
+    }
+    return callMicrophoneNameForSoundboardRoute(device);
+  }
+
+  String callMicrophoneNameForSoundboardRoute(SoundboardOutputDevice device) {
+    return _callMicrophoneNameForRoute(device);
+  }
+
+  bool canPlaySoundboardItem(SoundPlaybackItem? item) {
+    if (!canUseSoundboard || soundboardBusy || item == null) {
+      return false;
+    }
+    return switch (soundboardTarget) {
+      SoundboardPlaybackTarget.stream => isStreaming,
+      SoundboardPlaybackTarget.micRoute =>
+        selectedSoundboardOutputDevice != null,
+    };
+  }
+
+  String? get soundboardRouteMessage {
+    if (!canUseSoundboard ||
+        soundboardTarget != SoundboardPlaybackTarget.micRoute ||
+        soundboardOutputDevices.isNotEmpty) {
+      return null;
+    }
+    return 'No virtual microphone driver found. Install or enable VB-CABLE, then select its microphone in the call app.';
+  }
 
   bool get isNativeUsbTransport => transport == RelayTransport.usb;
 
@@ -257,8 +355,8 @@ class AudioRelayController extends ChangeNotifier {
       return profile.codec.label;
     }
     return isStreaming
-        ? 'Auto (${_autoResolvedCodec.label})'
-        : 'Auto (${AudioCodec.pcm.label} first)';
+        ? 'Adaptive (${_autoResolvedCodec.label})'
+        : 'Adaptive (${AudioCodec.pcm.label} first)';
   }
 
   String get outputBackendLabel {
@@ -420,7 +518,7 @@ class AudioRelayController extends ChangeNotifier {
 
   String get streamBitrateFormatLabel {
     if (profile.codec == AudioCodec.auto) {
-      return 'Auto target';
+      return 'Adaptive target';
     }
     return switch (profile.codec) {
       AudioCodec.pcm => 'PCM 16-bit',
@@ -484,7 +582,7 @@ class AudioRelayController extends ChangeNotifier {
 
   String get bitrateTargetDescription {
     if (profile.codec == AudioCodec.auto) {
-      return 'Sets the compressed target when Auto selects Opus or AAC. PCM stays calculated from sample rate and channels.';
+      return 'Sets the compressed target when Adaptive selects Opus or AAC. PCM stays calculated from sample rate and channels.';
     }
     if (hasBitrateTarget) {
       return 'Sets the encoder target for the selected compressed codec. Lower reduces network load; higher preserves more detail.';
@@ -668,6 +766,7 @@ class AudioRelayController extends ChangeNotifier {
     capabilities = await _engine.getCapabilities();
     await _loadSavedCustomProfile();
     await _refreshLocalAddress();
+    _selectDefaultSoundboardOutputDevice();
     if (!isOutputBackendSupported(receiverOutputBackend)) {
       receiverOutputBackend = OutputAudioBackend.auto;
     }
@@ -680,6 +779,7 @@ class AudioRelayController extends ChangeNotifier {
       selectedPreset = profile.mode;
     }
 
+    _syncVirtualMicPassthrough();
     notifyListeners();
   }
 
@@ -695,6 +795,7 @@ class AudioRelayController extends ChangeNotifier {
     devices = const [];
     selectedDevice = null;
     errorMessage = null;
+    _syncVirtualMicPassthrough();
     notifyListeners();
   }
 
@@ -712,6 +813,7 @@ class AudioRelayController extends ChangeNotifier {
     devices = const [];
     selectedDevice = null;
     errorMessage = null;
+    _syncVirtualMicPassthrough();
     notifyListeners();
   }
 
@@ -850,6 +952,8 @@ class AudioRelayController extends ChangeNotifier {
   Future<void> stopAll() async {
     _cancelPendingProfileApply();
     await _engine.disconnect();
+    _virtualMicPassthroughEnabled = false;
+    _virtualMicPassthroughOutputDeviceId = null;
     await _discoveryService.dispose();
     _stopMeters();
     _appliedSenderProfile = null;
@@ -1070,6 +1174,128 @@ class AudioRelayController extends ChangeNotifier {
     await _engine.setMuted(value);
   }
 
+  void addSoundboardFiles(Iterable<String> paths) {
+    final nextItems = List<SoundPlaybackItem>.of(soundboardItems);
+    for (final path in paths) {
+      final normalizedPath = path.trim();
+      if (normalizedPath.isEmpty ||
+          nextItems.any((item) => item.path == normalizedPath)) {
+        continue;
+      }
+      nextItems.add(_soundboardItemForPath(normalizedPath));
+    }
+
+    if (nextItems.length == soundboardItems.length) {
+      return;
+    }
+    soundboardItems = List.unmodifiable(nextItems);
+    selectedSoundboardItem ??= soundboardItems.firstOrNull;
+    soundboardMessage = null;
+    notifyListeners();
+  }
+
+  void selectSoundboardItem(SoundPlaybackItem item) {
+    selectedSoundboardItem = item;
+    soundboardMessage = null;
+    notifyListeners();
+  }
+
+  void removeSoundboardItem(SoundPlaybackItem item) {
+    final nextItems = soundboardItems
+        .where((candidate) => candidate.id != item.id)
+        .toList();
+    soundboardItems = List.unmodifiable(nextItems);
+    if (selectedSoundboardItem?.id == item.id) {
+      selectedSoundboardItem = soundboardItems.firstOrNull;
+    }
+    notifyListeners();
+  }
+
+  void updateSoundboardVolume(double value) {
+    soundboardVolume = value.clamp(0, 1).toDouble();
+    notifyListeners();
+  }
+
+  void updateSoundboardTarget(SoundboardPlaybackTarget value) {
+    if (soundboardTarget == value) {
+      return;
+    }
+    soundboardTarget = value;
+    soundboardMessage = null;
+    _syncVirtualMicPassthrough();
+    notifyListeners();
+  }
+
+  void selectSoundboardOutputDevice(String? id) {
+    if (selectedSoundboardOutputDeviceId == id) {
+      return;
+    }
+    selectedSoundboardOutputDeviceId = id;
+    soundboardMessage = null;
+    _syncVirtualMicPassthrough();
+    notifyListeners();
+  }
+
+  Future<void> playSoundboardItem(SoundPlaybackItem item) async {
+    selectedSoundboardItem = item;
+    await playSelectedSoundboardItem();
+  }
+
+  Future<void> playSelectedSoundboardItem() async {
+    final item = selectedSoundboardItem;
+    if (item == null || soundboardBusy) {
+      return;
+    }
+    if (!canUseSoundboard) {
+      soundboardMessage = 'Soundboard injection is not available here.';
+      notifyListeners();
+      return;
+    }
+    if (soundboardTarget == SoundboardPlaybackTarget.stream && !isStreaming) {
+      soundboardMessage = 'Start sender streaming first.';
+      notifyListeners();
+      return;
+    }
+    if (soundboardTarget == SoundboardPlaybackTarget.micRoute &&
+        selectedSoundboardOutputDevice == null) {
+      soundboardMessage = soundboardOutputDevices.isEmpty
+          ? 'Install or enable VB-CABLE first.'
+          : 'Select the call app microphone.';
+      notifyListeners();
+      return;
+    }
+
+    soundboardBusy = true;
+    soundboardMessage = 'Queueing ${item.name}';
+    notifyListeners();
+    try {
+      await _engine.playSoundEffect(
+        path: item.path,
+        volume: soundboardVolume,
+        target: soundboardTarget,
+        outputDeviceId: selectedSoundboardOutputDeviceId,
+      );
+      soundboardMessage = 'Queued ${item.name}';
+    } on PlatformException catch (error) {
+      soundboardMessage = error.message ?? 'Unable to play ${item.name}.';
+    } finally {
+      soundboardBusy = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> stopSoundboard() async {
+    soundboardMessage = 'Stopping soundboard';
+    notifyListeners();
+    try {
+      await _engine.stopSoundEffects();
+      soundboardMessage = 'Soundboard stopped';
+    } on PlatformException catch (error) {
+      soundboardMessage = error.message ?? 'Unable to stop soundboard.';
+    }
+    notifyListeners();
+  }
+
   @visibleForTesting
   Future<void> pollMetricsForTesting() {
     return _pollMetrics();
@@ -1080,6 +1306,7 @@ class AudioRelayController extends ChangeNotifier {
     _meterTimer?.cancel();
     _profileApplyTimer?.cancel();
     _resetAutoCodecSession();
+    _stopVirtualMicPassthrough();
     _engine.disconnect();
     _discoveryService.dispose();
     super.dispose();
@@ -1452,7 +1679,7 @@ class AudioRelayController extends ChangeNotifier {
       AudioPreset.gaming =>
         requestedMs <= 10
             ? max(_adaptiveUltraLowLatencyCapMs, requestedMs * 4)
-            : max(requestedMs, requestedMs + 12),
+            : max(requestedMs, requestedMs + 6),
       AudioPreset.balanced => min(
         max(96, requestedMs * 2),
         _adaptiveBalancedCapMs,
@@ -1802,13 +2029,7 @@ class AudioRelayController extends ChangeNotifier {
     AudioProfile sourceProfile,
     CodecBitrateRange range,
   ) {
-    final preferredKbps = switch (sourceProfile.mode) {
-      AudioPreset.gaming => 128,
-      AudioPreset.balanced => 160,
-      AudioPreset.music => range.maxKbps,
-      AudioPreset.custom => sourceProfile.bitrateKbps,
-    };
-    return _clampBitrateKbps(preferredKbps, range);
+    return _clampBitrateKbps(sourceProfile.bitrateKbps, range);
   }
 
   void _rememberAutoResolvedCodec(AudioProfile senderProfile) {
@@ -1997,16 +2218,16 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   int _adaptiveFormatPressureScoreFromEvents(int eventDelta) {
-    if (eventDelta >= 24) {
+    if (eventDelta >= 40) {
       return 7;
     }
-    if (eventDelta >= 12) {
+    if (eventDelta >= 20) {
       return 5;
     }
-    if (eventDelta >= 6) {
+    if (eventDelta >= 8) {
       return 3;
     }
-    return eventDelta > 0 ? 1 : 0;
+    return eventDelta >= 3 ? 1 : 0;
   }
 
   int _autoCodecPressureScore(AudioRelayMetrics nextMetrics) {
@@ -2102,11 +2323,11 @@ class AudioRelayController extends ChangeNotifier {
       _autoCodecBaseline = _AdaptiveMetricsSnapshot.fromMetrics(nextMetrics);
       notifyListeners();
     } on PlatformException catch (error) {
-      _fail(error.message ?? 'Unable to apply automatic codec.');
+      _fail(error.message ?? 'Unable to apply adaptive codec.');
     } on SocketException catch (error) {
-      _fail('Unable to advertise automatic codec: ${error.message}');
+      _fail('Unable to advertise adaptive codec: ${error.message}');
     } on OSError catch (error) {
-      _fail('Unable to advertise automatic codec: ${error.message}');
+      _fail('Unable to advertise adaptive codec: ${error.message}');
     } finally {
       _autoCodecApplyInFlight = false;
     }
@@ -2248,6 +2469,143 @@ class AudioRelayController extends ChangeNotifier {
       return Platform.isWindows ? 'Windows device' : 'Android device';
     }
     return hostname;
+  }
+
+  SoundPlaybackItem _soundboardItemForPath(String path) {
+    final segments = path.split(RegExp(r'[\\/]'));
+    final name = segments.last.trim();
+    return SoundPlaybackItem(
+      id: path,
+      name: name.isEmpty ? 'Sound' : name,
+      path: path,
+    );
+  }
+
+  void _selectDefaultSoundboardOutputDevice() {
+    final devices = soundboardOutputDevices;
+    if (devices.isEmpty) {
+      selectedSoundboardOutputDeviceId = null;
+      return;
+    }
+    final selectedId = selectedSoundboardOutputDeviceId;
+    if (selectedId != null &&
+        devices.any((device) => device.id == selectedId)) {
+      return;
+    }
+    selectedSoundboardOutputDeviceId = devices.first.id;
+  }
+
+  void _syncVirtualMicPassthrough() {
+    final device = selectedSoundboardOutputDevice;
+    final shouldEnable =
+        canUseSoundboard &&
+        soundboardTarget == SoundboardPlaybackTarget.micRoute &&
+        device != null;
+    final nextDeviceId = shouldEnable ? device.id : null;
+
+    if (_virtualMicPassthroughEnabled == shouldEnable &&
+        _virtualMicPassthroughOutputDeviceId == nextDeviceId) {
+      return;
+    }
+
+    _virtualMicPassthroughEnabled = shouldEnable;
+    _virtualMicPassthroughOutputDeviceId = nextDeviceId;
+    unawaited(
+      _engine
+          .configureVirtualMicPassthrough(
+            enabled: shouldEnable,
+            outputDeviceId: nextDeviceId,
+          )
+          .catchError((Object error) {
+            if (shouldEnable) {
+              soundboardMessage = 'Unable to bridge your microphone.';
+              notifyListeners();
+            }
+          }),
+    );
+  }
+
+  void _stopVirtualMicPassthrough() {
+    if (!_virtualMicPassthroughEnabled &&
+        _virtualMicPassthroughOutputDeviceId == null) {
+      return;
+    }
+    _virtualMicPassthroughEnabled = false;
+    _virtualMicPassthroughOutputDeviceId = null;
+    unawaited(_engine.configureVirtualMicPassthrough(enabled: false));
+  }
+
+  static int _compareSoundboardCableRoutes(
+    SoundboardOutputDevice left,
+    SoundboardOutputDevice right,
+  ) {
+    final rankComparison = _soundboardCableRouteRank(
+      left,
+    ).compareTo(_soundboardCableRouteRank(right));
+    if (rankComparison != 0) {
+      return rankComparison;
+    }
+    if (left.isDefault != right.isDefault) {
+      return left.isDefault ? -1 : 1;
+    }
+    return left.name.toLowerCase().compareTo(right.name.toLowerCase());
+  }
+
+  static bool _isDedicatedSoundboardCableRoute(SoundboardOutputDevice device) {
+    final label = _soundboardCableRouteLabel(device);
+    if (label.contains('16ch') || label.contains('16 ch')) {
+      return false;
+    }
+    return label.contains('vb-audio virtual cable') ||
+        label.contains('cable input') ||
+        label.contains('cable in') ||
+        (label.contains('virtual cable') && !label.contains('voicemeeter'));
+  }
+
+  static int _soundboardCableRouteRank(SoundboardOutputDevice device) {
+    final label = _soundboardCableRouteLabel(device);
+    if (label.contains('16ch') || label.contains('16 ch')) {
+      return 99;
+    }
+    if (label.contains('cable input')) {
+      return 0;
+    }
+    if (label.contains('speakers (vb-audio virtual cable)')) {
+      return 1;
+    }
+    if (label.contains('cable in')) {
+      return 2;
+    }
+    if (label.contains('vb-audio virtual cable') ||
+        label.contains('virtual cable') && !label.contains('voicemeeter')) {
+      return 3;
+    }
+    if (label.contains('voicemeeter')) {
+      return 4;
+    }
+    return 5;
+  }
+
+  static String _soundboardCableRouteLabel(SoundboardOutputDevice device) {
+    return '${device.name} ${device.id}'.toLowerCase();
+  }
+
+  static String _callMicrophoneNameForRoute(SoundboardOutputDevice device) {
+    final name = device.name.trim();
+    final label = _soundboardCableRouteLabel(device);
+    if (label.contains('vb-audio virtual cable') ||
+        label.contains('cable input') ||
+        label.contains('cable in')) {
+      return 'CABLE Output (VB-Audio Virtual Cable)';
+    }
+    if (name.isEmpty) {
+      return 'Call microphone';
+    }
+    final inputName = name.replaceAll(
+      RegExp('input', caseSensitive: false),
+      'Output',
+    );
+    return inputName == name ? name : inputName;
   }
 
   static DevicePlatform _currentPlatform() {
@@ -2459,8 +2817,7 @@ class _AdaptiveMetricsSnapshot {
 
   int transportEventDelta(AudioRelayMetrics metrics) {
     return _positiveDelta(metrics.droppedPacketCount, droppedPackets) +
-        _positiveDelta(metrics.lostPacketCount, lostPackets) +
-        _positiveDelta(metrics.trimCount, trims);
+        _positiveDelta(metrics.lostPacketCount, lostPackets);
   }
 
   int _positiveDelta(int? current, int previous) {

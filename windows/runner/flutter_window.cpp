@@ -127,6 +127,24 @@ bool FlutterWindow::OnCreate() {
           return;
         }
 
+        if (method == "playSoundEffect") {
+          ReturnError(result,
+                      native_audio_engine_->PlaySoundEffect(call.arguments()));
+          return;
+        }
+
+        if (method == "configureVirtualMicPassthrough") {
+          ReturnError(result, native_audio_engine_->ConfigureVirtualMicPassthrough(
+                                  call.arguments()));
+          return;
+        }
+
+        if (method == "stopSoundEffects") {
+          native_audio_engine_->StopSoundEffects();
+          result->Success();
+          return;
+        }
+
         if (method == "disconnect") {
           native_audio_engine_->Disconnect();
           result->Success();

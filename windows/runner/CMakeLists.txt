@@ -36,7 +36,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE Opus::opus)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
-target_link_libraries(${BINARY_NAME} PRIVATE "avrt.lib" "ole32.lib" "ws2_32.lib" "iphlpapi.lib" "setupapi.lib" "winusb.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "avrt.lib" "ole32.lib" "propsys.lib" "ws2_32.lib" "iphlpapi.lib" "setupapi.lib" "winusb.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "mf.lib" "mfplat.lib" "mfreadwrite.lib" "mfuuid.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 

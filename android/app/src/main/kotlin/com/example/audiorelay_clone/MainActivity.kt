@@ -106,6 +106,18 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
+                    "playSoundEffect" -> {
+                        result.error(
+                            "sound_effects_unsupported",
+                            "Soundboard injection is only available on Windows sender streams.",
+                            null
+                        )
+                    }
+
+                    "stopSoundEffects" -> {
+                        result.success(null)
+                    }
+
                     "disconnect" -> {
                         audioEngine.disconnect()
                         stopAudioRelayService()

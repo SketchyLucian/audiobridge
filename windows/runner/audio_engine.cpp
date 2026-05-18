@@ -20,7 +20,9 @@
 #include <mmdeviceapi.h>
 #include <mmreg.h>
 #include <objbase.h>
+#include <propsys.h>
 #include <propvarutil.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <cwctype>
 #include <initguid.h>
 #include <setupapi.h>
@@ -83,6 +85,22 @@ std::string Narrow(const std::wstring& value) {
   WideCharToMultiByte(CP_UTF8, 0, value.c_str(),
                       static_cast<int>(value.size()), output.data(), size,
                       nullptr, nullptr);
+  return output;
+}
+
+std::wstring Widen(const std::string& value) {
+  if (value.empty()) {
+    return {};
+  }
+  const int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(),
+                                       static_cast<int>(value.size()),
+                                       nullptr, 0);
+  if (size <= 0) {
+    return {};
+  }
+  std::wstring output(size, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, value.c_str(),
+                      static_cast<int>(value.size()), output.data(), size);
   return output;
 }
 
@@ -256,6 +274,23 @@ struct EncodedAudioPacket {
   uint32_t decoded_frame_count = 0;
 };
 
+struct RemoteReceiverClockEcho {
+  int64_t receiver_time_ms = 0;
+  int64_t received_at_sender_time_ms = 0;
+};
+
+struct SoundEffectClip {
+  std::vector<int16_t> pcm;
+  size_t sample_offset = 0;
+  int sample_rate = 48000;
+  int channels = 2;
+};
+
+struct SoundboardOutputFormat {
+  int sample_rate = 48000;
+  int channels = 2;
+};
+
 int HexDigitValue(wchar_t digit) {
   if (digit >= L'0' && digit <= L'9') {
     return static_cast<int>(digit - L'0');
@@ -276,6 +311,31 @@ std::wstring Uppercase(std::wstring value) {
 
 bool DevicePathContains(const std::wstring& path, const wchar_t* token) {
   return Uppercase(path).find(token) != std::wstring::npos;
+}
+
+bool IsLikelyVirtualCableEndpoint(const std::wstring& value) {
+  const std::wstring label = Uppercase(value);
+  return label.find(L"VB-AUDIO") != std::wstring::npos ||
+         label.find(L"VIRTUAL AUDIO") != std::wstring::npos ||
+         label.find(L"VIRTUAL CABLE") != std::wstring::npos ||
+         label.find(L"VOICEMEETER") != std::wstring::npos ||
+         label.find(L"CABLE INPUT") != std::wstring::npos ||
+         label.find(L"CABLE-A INPUT") != std::wstring::npos ||
+         label.find(L"CABLE-B INPUT") != std::wstring::npos ||
+         (label.find(L"LINE 1") != std::wstring::npos &&
+          label.find(L"VIRTUAL") != std::wstring::npos);
+}
+
+bool IsUnsupportedVirtualCableRenderEndpoint(const std::wstring& name,
+                                             const std::wstring& id) {
+  const std::wstring label = Uppercase(name + L" " + id);
+  const bool is_vb_cable = label.find(L"VB-AUDIO") != std::wstring::npos ||
+                           label.find(L"VIRTUAL CABLE") != std::wstring::npos;
+  const bool is_16_channel = label.find(L"16CH") != std::wstring::npos ||
+                             label.find(L"16 CH") != std::wstring::npos;
+  const bool is_cable_input = label.find(L"CABLE IN") != std::wstring::npos ||
+                              label.find(L"CABLE INPUT") != std::wstring::npos;
+  return is_vb_cable && is_16_channel && is_cable_input;
 }
 
 bool IsAoaAccessoryDevice(const USB_DEVICE_DESCRIPTOR& descriptor) {
@@ -1730,6 +1790,10 @@ class WindowsAudioEngine::Impl {
         flutter::EncodableValue(true);
     capabilities[flutter::EncodableValue("canReceive")] =
         flutter::EncodableValue(true);
+    capabilities[flutter::EncodableValue("canPlaySoundEffects")] =
+        flutter::EncodableValue(true);
+    capabilities[flutter::EncodableValue("soundboardOutputDevices")] =
+        flutter::EncodableValue(GetSoundboardOutputDevices());
     capabilities[flutter::EncodableValue("backend")] =
         flutter::EncodableValue("windows-wasapi-codecs-udp-native-usb");
     capabilities[flutter::EncodableValue("detail")] =
@@ -1795,6 +1859,70 @@ class WindowsAudioEngine::Impl {
              })},
         });
     return capabilities;
+  }
+
+  flutter::EncodableList GetSoundboardOutputDevices() const {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool owns_com = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+      return {};
+    }
+
+    flutter::EncodableList devices;
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      return devices;
+    }
+
+    std::wstring default_id;
+    Microsoft::WRL::ComPtr<IMMDevice> default_device;
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(
+            eRender, eCommunications, &default_device))) {
+      default_id = DeviceId(default_device.Get());
+    }
+
+    Microsoft::WRL::ComPtr<IMMDeviceCollection> collection;
+    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE,
+                                        &collection);
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      return devices;
+    }
+
+    UINT count = 0;
+    collection->GetCount(&count);
+    for (UINT index = 0; index < count; ++index) {
+      Microsoft::WRL::ComPtr<IMMDevice> device;
+      if (FAILED(collection->Item(index, &device))) {
+        continue;
+      }
+
+      const std::wstring id = DeviceId(device.Get());
+      if (id.empty()) {
+        continue;
+      }
+      const std::wstring name = DeviceFriendlyName(device.Get());
+      if (IsUnsupportedVirtualCableRenderEndpoint(name, id)) {
+        continue;
+      }
+      const bool is_virtual_cable =
+          IsLikelyVirtualCableEndpoint(name) || IsLikelyVirtualCableEndpoint(id);
+      flutter::EncodableMap item;
+      item[flutter::EncodableValue("id")] = flutter::EncodableValue(Narrow(id));
+      item[flutter::EncodableValue("name")] =
+          flutter::EncodableValue(Narrow(name.empty() ? id : name));
+      item[flutter::EncodableValue("isDefault")] =
+          flutter::EncodableValue(id == default_id);
+      item[flutter::EncodableValue("isVirtualCable")] =
+          flutter::EncodableValue(is_virtual_cable);
+      devices.emplace_back(flutter::EncodableValue(item));
+    }
+
+    FinishCom(owns_com);
+    return devices;
   }
 
   flutter::EncodableList GetNetworkInterfaces() const {
@@ -2306,6 +2434,7 @@ class WindowsAudioEngine::Impl {
       playback_queue_.clear();
       playback_queue_frames_ = 0;
     }
+    StopSoundEffects();
     {
       std::scoped_lock lock(receiver_source_mutex_);
       receiver_source_ = {};
@@ -2350,7 +2479,56 @@ class WindowsAudioEngine::Impl {
                       muted_.load());
   }
 
+  std::optional<std::string> PlaySoundEffect(
+      const flutter::EncodableValue* arguments) {
+    if (!arguments ||
+        !std::holds_alternative<flutter::EncodableMap>(*arguments)) {
+      return "Missing soundboard payload.";
+    }
+
+    const auto& map = std::get<flutter::EncodableMap>(*arguments);
+    const std::string path = ReadString(map, "path", "");
+    if (path.empty()) {
+      return "Choose a sound file first.";
+    }
+
+    const std::string target = ReadString(map, "target", "stream");
+    if (target == "micRoute") {
+      return PlaySoundEffectToOutput(arguments);
+    }
+
+    if (!capture_running_.load()) {
+      return "Start the sender stream before playing soundboard audio.";
+    }
+
+    const double gain = std::clamp(ReadDouble(map, "volume", 1.0), 0.0, 1.0);
+    const int sample_rate = OutputSampleRateForProfile();
+    const int channels = std::clamp(profile_.channels, 1, 2);
+    auto decoded = DecodeSoundEffectFile(path, sample_rate, channels, gain);
+    if (!decoded.has_value()) {
+      return "Unable to decode that sound file.";
+    }
+    if (decoded->pcm.empty()) {
+      return "The selected sound file has no playable audio.";
+    }
+
+    std::scoped_lock lock(sound_effect_mutex_);
+    sound_effect_queue_.push_back(std::move(*decoded));
+    return std::nullopt;
+  }
+
+  void StopSoundEffects() {
+    {
+      std::scoped_lock lock(sound_effect_mutex_);
+      sound_effect_queue_.clear();
+    }
+    StopSoundEffectOutput();
+    StopSoundEffectMonitor();
+  }
+
   void Disconnect() {
+    StopVirtualMicPassthrough();
+    StopSoundEffects();
     StopStream();
     usb_receiver_mode_ = false;
 
@@ -2397,8 +2575,10 @@ class WindowsAudioEngine::Impl {
     remote_lost_packet_count_ = 0;
     remote_trim_count_ = 0;
     remote_metrics_received_at_ms_ = 0;
-    remote_receiver_time_ms_ = 0;
-    remote_receiver_time_received_at_ms_ = 0;
+    {
+      std::scoped_lock lock(remote_receiver_clock_mutex_);
+      remote_receiver_clock_echo_ = {};
+    }
     {
       std::scoped_lock lock(remote_capabilities_mutex_);
       remote_platform_.clear();
@@ -2416,7 +2596,186 @@ class WindowsAudioEngine::Impl {
     }
   }
 
+  std::optional<std::string> ConfigureVirtualMicPassthrough(
+      const flutter::EncodableValue* arguments) {
+    if (!arguments ||
+        !std::holds_alternative<flutter::EncodableMap>(*arguments)) {
+      return "Missing virtual mic payload.";
+    }
+
+    const auto& map = std::get<flutter::EncodableMap>(*arguments);
+    const bool enabled = ReadBool(map, "enabled", false);
+    const std::string device_id = ReadString(map, "outputDeviceId", "");
+    if (!enabled || device_id.empty()) {
+      StopVirtualMicPassthrough();
+      return std::nullopt;
+    }
+
+    if (virtual_mic_passthrough_running_.load() &&
+        virtual_mic_passthrough_output_device_id_ == device_id) {
+      return std::nullopt;
+    }
+
+    StopVirtualMicPassthrough();
+    virtual_mic_passthrough_output_device_id_ = device_id;
+    virtual_mic_passthrough_running_ = true;
+    virtual_mic_passthrough_thread_ =
+        std::thread(&Impl::VirtualMicPassthroughLoop, this, device_id);
+    return std::nullopt;
+  }
+
  private:
+  std::wstring DeviceId(IMMDevice* device) const {
+    if (device == nullptr) {
+      return {};
+    }
+
+    LPWSTR raw_id = nullptr;
+    if (FAILED(device->GetId(&raw_id)) || raw_id == nullptr) {
+      return {};
+    }
+    std::wstring id(raw_id);
+    CoTaskMemFree(raw_id);
+    return id;
+  }
+
+  std::wstring DeviceFriendlyName(IMMDevice* device) const {
+    if (device == nullptr) {
+      return {};
+    }
+
+    Microsoft::WRL::ComPtr<IPropertyStore> properties;
+    if (FAILED(device->OpenPropertyStore(STGM_READ, &properties))) {
+      return {};
+    }
+
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    std::wstring name;
+    if (SUCCEEDED(properties->GetValue(PKEY_Device_FriendlyName, &value)) &&
+        value.vt == VT_LPWSTR && value.pwszVal != nullptr) {
+      name = value.pwszVal;
+    }
+    PropVariantClear(&value);
+    return name;
+  }
+
+  Microsoft::WRL::ComPtr<IMMDevice> SoundboardOutputDeviceForId(
+      IMMDeviceEnumerator* enumerator,
+      const std::string& device_id) const {
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    if (enumerator == nullptr) {
+      return device;
+    }
+
+    if (device_id.empty()) {
+      enumerator->GetDefaultAudioEndpoint(eRender, eCommunications, &device);
+      return device;
+    }
+
+    const std::wstring wide_id = Widen(device_id);
+    if (!wide_id.empty()) {
+      enumerator->GetDevice(wide_id.c_str(), &device);
+    }
+    return device;
+  }
+
+  Microsoft::WRL::ComPtr<IMMDevice> SoundboardMonitorDevice(
+      IMMDeviceEnumerator* enumerator) const {
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    if (enumerator == nullptr) {
+      return device;
+    }
+
+    const auto is_usable_monitor = [this](IMMDevice* candidate) {
+      if (candidate == nullptr) {
+        return false;
+      }
+      const std::wstring name = DeviceFriendlyName(candidate);
+      const std::wstring id = DeviceId(candidate);
+      return !IsLikelyVirtualCableEndpoint(name) &&
+             !IsLikelyVirtualCableEndpoint(id) &&
+             !IsUnsupportedVirtualCableRenderEndpoint(name, id);
+    };
+
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole,
+                                                      &device)) &&
+        is_usable_monitor(device.Get())) {
+      return device;
+    }
+    device.Reset();
+
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia,
+                                                      &device)) &&
+        is_usable_monitor(device.Get())) {
+      return device;
+    }
+    device.Reset();
+
+    Microsoft::WRL::ComPtr<IMMDeviceCollection> collection;
+    if (FAILED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE,
+                                               &collection))) {
+      return device;
+    }
+
+    UINT count = 0;
+    collection->GetCount(&count);
+    for (UINT index = 0; index < count; ++index) {
+      Microsoft::WRL::ComPtr<IMMDevice> candidate;
+      if (FAILED(collection->Item(index, &candidate))) {
+        continue;
+      }
+      if (is_usable_monitor(candidate.Get())) {
+        return candidate;
+      }
+    }
+
+    return device;
+  }
+
+  Microsoft::WRL::ComPtr<IMMDevice> PhysicalMicrophoneDevice(
+      IMMDeviceEnumerator* enumerator) const {
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    if (enumerator == nullptr) {
+      return device;
+    }
+
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(
+            eCapture, eCommunications, &device))) {
+      const std::wstring name = DeviceFriendlyName(device.Get());
+      const std::wstring id = DeviceId(device.Get());
+      if (!IsLikelyVirtualCableEndpoint(name) &&
+          !IsLikelyVirtualCableEndpoint(id)) {
+        return device;
+      }
+      device.Reset();
+    }
+
+    Microsoft::WRL::ComPtr<IMMDeviceCollection> collection;
+    if (FAILED(enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE,
+                                               &collection))) {
+      return device;
+    }
+
+    UINT count = 0;
+    collection->GetCount(&count);
+    for (UINT index = 0; index < count; ++index) {
+      Microsoft::WRL::ComPtr<IMMDevice> candidate;
+      if (FAILED(collection->Item(index, &candidate))) {
+        continue;
+      }
+
+      const std::wstring name = DeviceFriendlyName(candidate.Get());
+      const std::wstring id = DeviceId(candidate.Get());
+      if (!IsLikelyVirtualCableEndpoint(name) &&
+          !IsLikelyVirtualCableEndpoint(id)) {
+        return candidate;
+      }
+    }
+
+    return device;
+  }
+
   std::optional<std::string> EnsureMediaFoundationStarted() {
     if (media_foundation_started_) {
       return std::nullopt;
@@ -2442,6 +2801,685 @@ class WindowsAudioEngine::Impl {
     }
     winsock_started_ = true;
     return std::nullopt;
+  }
+
+  std::optional<SoundEffectClip> DecodeSoundEffectFile(
+      const std::string& path,
+      int sample_rate,
+      int channels,
+      double gain) {
+    if (sample_rate <= 0 || channels <= 0) {
+      return std::nullopt;
+    }
+
+    const auto media_foundation_error = EnsureMediaFoundationStarted();
+    if (media_foundation_error.has_value()) {
+      return std::nullopt;
+    }
+
+    const std::wstring wide_path = Widen(path);
+    if (wide_path.empty()) {
+      return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IMFSourceReader> reader;
+    HRESULT hr =
+        MFCreateSourceReaderFromURL(wide_path.c_str(), nullptr, &reader);
+    if (FAILED(hr)) {
+      return std::nullopt;
+    }
+
+    const DWORD all_streams =
+        static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS);
+    const DWORD first_audio_stream =
+        static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM);
+    reader->SetStreamSelection(all_streams, FALSE);
+    hr = reader->SetStreamSelection(first_audio_stream, TRUE);
+    if (FAILED(hr)) {
+      return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IMFMediaType> media_type;
+    hr = MFCreateMediaType(&media_type);
+    if (FAILED(hr)) {
+      return std::nullopt;
+    }
+
+    const UINT32 bits_per_sample = 16;
+    const UINT32 block_alignment =
+        static_cast<UINT32>(channels * sizeof(int16_t));
+    media_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    media_type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    media_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS,
+                          static_cast<UINT32>(channels));
+    media_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND,
+                          static_cast<UINT32>(sample_rate));
+    media_type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, bits_per_sample);
+    media_type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, block_alignment);
+    media_type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+                          static_cast<UINT32>(sample_rate) * block_alignment);
+
+    hr = reader->SetCurrentMediaType(first_audio_stream, nullptr,
+                                     media_type.Get());
+    if (FAILED(hr)) {
+      return std::nullopt;
+    }
+
+    SoundEffectClip clip;
+    clip.sample_rate = sample_rate;
+    clip.channels = channels;
+
+    while (true) {
+      DWORD flags = 0;
+      Microsoft::WRL::ComPtr<IMFSample> sample;
+      hr = reader->ReadSample(first_audio_stream, 0, nullptr, &flags, nullptr,
+                              &sample);
+      if (FAILED(hr)) {
+        return std::nullopt;
+      }
+      if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0) {
+        break;
+      }
+      if (!sample) {
+        continue;
+      }
+
+      Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+      hr = sample->ConvertToContiguousBuffer(&buffer);
+      if (FAILED(hr)) {
+        return std::nullopt;
+      }
+
+      BYTE* data = nullptr;
+      DWORD max_length = 0;
+      DWORD current_length = 0;
+      hr = buffer->Lock(&data, &max_length, &current_length);
+      if (FAILED(hr)) {
+        return std::nullopt;
+      }
+      (void)max_length;
+
+      const size_t sample_count = current_length / sizeof(int16_t);
+      const auto* pcm = reinterpret_cast<const int16_t*>(data);
+      clip.pcm.reserve(clip.pcm.size() + sample_count);
+      for (size_t index = 0; index < sample_count; ++index) {
+        clip.pcm.push_back(FloatToPcm16(Pcm16ToFloat(pcm[index]) *
+                                        static_cast<float>(gain)));
+      }
+      buffer->Unlock();
+    }
+
+    return clip;
+  }
+
+  std::optional<SoundboardOutputFormat> SoundboardOutputFormatForDevice(
+      const std::string& device_id) const {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool owns_com = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+      return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      return std::nullopt;
+    }
+
+    auto device = SoundboardOutputDeviceForId(enumerator.Get(), device_id);
+    if (!device) {
+      FinishCom(owns_com);
+      return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IAudioClient> audio_client;
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                          reinterpret_cast<void**>(audio_client.GetAddressOf()));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      return std::nullopt;
+    }
+
+    WAVEFORMATEX* raw_mix_format = nullptr;
+    hr = audio_client->GetMixFormat(&raw_mix_format);
+    if (FAILED(hr) || raw_mix_format == nullptr) {
+      FinishCom(owns_com);
+      return std::nullopt;
+    }
+
+    SoundboardOutputFormat format;
+    format.sample_rate = static_cast<int>(raw_mix_format->nSamplesPerSec);
+    format.channels = std::max<int>(1, raw_mix_format->nChannels);
+
+    const REFERENCE_TIME buffer_duration = 10000000LL * 80 / 1000;
+    hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+                                  buffer_duration, 0, raw_mix_format, nullptr);
+    if (FAILED(hr)) {
+      CoTaskMemFree(raw_mix_format);
+      FinishCom(owns_com);
+      return std::nullopt;
+    }
+
+    CoTaskMemFree(raw_mix_format);
+    FinishCom(owns_com);
+    return format;
+  }
+
+  std::optional<std::string> PlaySoundEffectToOutput(
+      const flutter::EncodableValue* arguments) {
+    if (!arguments ||
+        !std::holds_alternative<flutter::EncodableMap>(*arguments)) {
+      return "Missing soundboard payload.";
+    }
+
+    const auto& map = std::get<flutter::EncodableMap>(*arguments);
+    const std::string path = ReadString(map, "path", "");
+    const std::string device_id = ReadString(map, "outputDeviceId", "");
+    const double gain = std::clamp(ReadDouble(map, "volume", 1.0), 0.0, 1.0);
+    if (path.empty()) {
+      return "Choose a sound file first.";
+    }
+
+    const auto format = SoundboardOutputFormatForDevice(device_id);
+    if (!format.has_value()) {
+      return "Unable to open the selected mic route device.";
+    }
+
+    auto decoded = DecodeSoundEffectFile(path, format->sample_rate,
+                                         format->channels, gain);
+    if (!decoded.has_value()) {
+      return "Unable to decode that sound file.";
+    }
+    if (decoded->pcm.empty()) {
+      return "The selected sound file has no playable audio.";
+    }
+
+    const SoundEffectClip monitor_clip = *decoded;
+    {
+      std::unique_lock lock(sound_effect_output_mutex_);
+      const bool device_changed =
+          sound_effect_output_running_.load() &&
+          (sound_effect_output_device_id_ != device_id ||
+           sound_effect_output_sample_rate_ != format->sample_rate ||
+           sound_effect_output_channels_ != format->channels);
+      if (device_changed) {
+        lock.unlock();
+        StopSoundEffectOutput();
+        lock.lock();
+      }
+
+      if (!sound_effect_output_running_.load()) {
+        if (sound_effect_output_thread_.joinable()) {
+          lock.unlock();
+          sound_effect_output_thread_.join();
+          lock.lock();
+        }
+        sound_effect_output_device_id_ = device_id;
+        sound_effect_output_sample_rate_ = format->sample_rate;
+        sound_effect_output_channels_ = format->channels;
+        sound_effect_output_running_ = true;
+        sound_effect_output_thread_ =
+            std::thread(&Impl::SoundEffectOutputLoop, this, device_id);
+      }
+      sound_effect_output_queue_.push_back(std::move(*decoded));
+    }
+    sound_effect_output_cv_.notify_one();
+    QueueSoundEffectMonitor(monitor_clip);
+    return std::nullopt;
+  }
+
+  void StopSoundEffectOutput() {
+    sound_effect_output_running_ = false;
+    sound_effect_output_cv_.notify_all();
+    if (sound_effect_output_thread_.joinable()) {
+      sound_effect_output_thread_.join();
+    }
+    {
+      std::scoped_lock lock(sound_effect_output_mutex_);
+      sound_effect_output_queue_.clear();
+      sound_effect_output_device_id_.clear();
+      sound_effect_output_sample_rate_ = 0;
+      sound_effect_output_channels_ = 0;
+    }
+  }
+
+  void QueueSoundEffectMonitor(const SoundEffectClip& clip) {
+    std::unique_lock lock(sound_effect_monitor_mutex_);
+    if (!sound_effect_monitor_running_.load()) {
+      if (sound_effect_monitor_thread_.joinable()) {
+        lock.unlock();
+        sound_effect_monitor_thread_.join();
+        lock.lock();
+      }
+      sound_effect_monitor_running_ = true;
+      sound_effect_monitor_thread_ =
+          std::thread(&Impl::SoundEffectMonitorLoop, this);
+    }
+    sound_effect_monitor_queue_.push_back(clip);
+    lock.unlock();
+    sound_effect_monitor_cv_.notify_one();
+  }
+
+  void StopSoundEffectMonitor() {
+    sound_effect_monitor_running_ = false;
+    sound_effect_monitor_cv_.notify_all();
+    if (sound_effect_monitor_thread_.joinable()) {
+      sound_effect_monitor_thread_.join();
+    }
+    {
+      std::scoped_lock lock(sound_effect_monitor_mutex_);
+      sound_effect_monitor_queue_.clear();
+    }
+  }
+
+  void StopVirtualMicPassthrough() {
+    virtual_mic_passthrough_running_ = false;
+    if (virtual_mic_passthrough_thread_.joinable()) {
+      virtual_mic_passthrough_thread_.join();
+    }
+    virtual_mic_passthrough_output_device_id_.clear();
+  }
+
+  void VirtualMicPassthroughLoop(std::string output_device_id) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool owns_com = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    auto input_device = PhysicalMicrophoneDevice(enumerator.Get());
+    auto output_device =
+        SoundboardOutputDeviceForId(enumerator.Get(), output_device_id);
+    if (!input_device || !output_device) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IAudioClient> capture_client;
+    hr = input_device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                reinterpret_cast<void**>(
+                                    capture_client.GetAddressOf()));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IAudioClient> render_client_audio;
+    hr = output_device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                 reinterpret_cast<void**>(
+                                     render_client_audio.GetAddressOf()));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    WAVEFORMATEX* raw_capture_format = nullptr;
+    hr = capture_client->GetMixFormat(&raw_capture_format);
+    if (FAILED(hr) || raw_capture_format == nullptr) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    WAVEFORMATEX* raw_render_format = nullptr;
+    hr = render_client_audio->GetMixFormat(&raw_render_format);
+    if (FAILED(hr) || raw_render_format == nullptr) {
+      CoTaskMemFree(raw_capture_format);
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    const size_t capture_format_size =
+        sizeof(WAVEFORMATEX) + raw_capture_format->cbSize;
+    std::vector<BYTE> capture_format_storage(capture_format_size);
+    std::memcpy(capture_format_storage.data(), raw_capture_format,
+                capture_format_size);
+    const auto* capture_format =
+        reinterpret_cast<const WAVEFORMATEX*>(capture_format_storage.data());
+    CoTaskMemFree(raw_capture_format);
+
+    const size_t render_format_size =
+        sizeof(WAVEFORMATEX) + raw_render_format->cbSize;
+    std::vector<BYTE> render_format_storage(render_format_size);
+    std::memcpy(render_format_storage.data(), raw_render_format,
+                render_format_size);
+    const auto* render_format =
+        reinterpret_cast<const WAVEFORMATEX*>(render_format_storage.data());
+    CoTaskMemFree(raw_render_format);
+
+    const REFERENCE_TIME buffer_duration = 10000000LL * 80 / 1000;
+    hr = capture_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+                                    buffer_duration, 0, capture_format,
+                                    nullptr);
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    hr = render_client_audio->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+                                         buffer_duration, 0, render_format,
+                                         nullptr);
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IAudioCaptureClient> capture_client_audio;
+    hr = capture_client->GetService(IID_PPV_ARGS(&capture_client_audio));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IAudioRenderClient> render_client;
+    hr = render_client_audio->GetService(IID_PPV_ARGS(&render_client));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      virtual_mic_passthrough_running_ = false;
+      return;
+    }
+
+    UINT32 render_buffer_frames = 0;
+    render_client_audio->GetBufferSize(&render_buffer_frames);
+
+    DWORD task_index = 0;
+    HANDLE task_handle =
+        AvSetMmThreadCharacteristics(L"Pro Audio", &task_index);
+    if (task_handle != nullptr) {
+      AvSetMmThreadPriority(task_handle, AVRT_PRIORITY_HIGH);
+    }
+
+    capture_client->Start();
+    render_client_audio->Start();
+
+    while (virtual_mic_passthrough_running_) {
+      UINT32 packet_frames = 0;
+      if (FAILED(capture_client_audio->GetNextPacketSize(&packet_frames))) {
+        break;
+      }
+      if (packet_frames == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+
+      while (virtual_mic_passthrough_running_ && packet_frames > 0) {
+        BYTE* data = nullptr;
+        UINT32 frames = 0;
+        DWORD flags = 0;
+        hr = capture_client_audio->GetBuffer(&data, &frames, &flags, nullptr,
+                                             nullptr);
+        if (FAILED(hr)) {
+          virtual_mic_passthrough_running_ = false;
+          break;
+        }
+
+        const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+        auto pcm = ConvertToPcm16(data, frames, *capture_format, silent, 1.0f,
+                                  false);
+        capture_client_audio->ReleaseBuffer(frames);
+
+        if (!pcm.empty()) {
+          const auto output =
+              ReformatPcm(pcm, capture_format->nSamplesPerSec,
+                          capture_format->nChannels,
+                          render_format->nSamplesPerSec,
+                          render_format->nChannels);
+          WriteRenderPcm(render_client.Get(), render_client_audio.Get(),
+                         render_buffer_frames, *render_format, output,
+                         virtual_mic_passthrough_running_, false);
+        }
+
+        if (FAILED(capture_client_audio->GetNextPacketSize(&packet_frames))) {
+          virtual_mic_passthrough_running_ = false;
+          break;
+        }
+      }
+    }
+
+    capture_client->Stop();
+    render_client_audio->Stop();
+    if (task_handle != nullptr) {
+      AvRevertMmThreadCharacteristics(task_handle);
+    }
+    FinishCom(owns_com);
+    virtual_mic_passthrough_running_ = false;
+  }
+
+  void SoundEffectOutputLoop(std::string device_id) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool owns_com = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+      sound_effect_output_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      sound_effect_output_running_ = false;
+      return;
+    }
+
+    auto device = SoundboardOutputDeviceForId(enumerator.Get(), device_id);
+    if (!device) {
+      FinishCom(owns_com);
+      sound_effect_output_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IAudioClient> audio_client;
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                          reinterpret_cast<void**>(audio_client.GetAddressOf()));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      sound_effect_output_running_ = false;
+      return;
+    }
+
+    WAVEFORMATEX* raw_mix_format = nullptr;
+    hr = audio_client->GetMixFormat(&raw_mix_format);
+    if (FAILED(hr) || raw_mix_format == nullptr) {
+      FinishCom(owns_com);
+      sound_effect_output_running_ = false;
+      return;
+    }
+
+    const size_t mix_format_size = sizeof(WAVEFORMATEX) + raw_mix_format->cbSize;
+    std::vector<BYTE> mix_format_storage(mix_format_size);
+    std::memcpy(mix_format_storage.data(), raw_mix_format, mix_format_size);
+    const auto* mix_format =
+        reinterpret_cast<const WAVEFORMATEX*>(mix_format_storage.data());
+    CoTaskMemFree(raw_mix_format);
+
+    const REFERENCE_TIME buffer_duration = 10000000LL * 80 / 1000;
+    hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+                                  buffer_duration, 0, mix_format, nullptr);
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      sound_effect_output_running_ = false;
+      return;
+    }
+
+    UINT32 buffer_frames = 0;
+    audio_client->GetBufferSize(&buffer_frames);
+    Microsoft::WRL::ComPtr<IAudioRenderClient> render_client;
+    hr = audio_client->GetService(IID_PPV_ARGS(&render_client));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      sound_effect_output_running_ = false;
+      return;
+    }
+
+    DWORD task_index = 0;
+    HANDLE task_handle = AvSetMmThreadCharacteristics(L"Pro Audio", &task_index);
+    if (task_handle != nullptr) {
+      AvSetMmThreadPriority(task_handle, AVRT_PRIORITY_HIGH);
+    }
+    audio_client->Start();
+
+    while (sound_effect_output_running_) {
+      SoundEffectClip clip;
+      {
+        std::unique_lock lock(sound_effect_output_mutex_);
+        sound_effect_output_cv_.wait_for(
+            lock, std::chrono::milliseconds(40), [this] {
+              return !sound_effect_output_running_.load() ||
+                     !sound_effect_output_queue_.empty();
+            });
+        if (!sound_effect_output_running_) {
+          break;
+        }
+        if (sound_effect_output_queue_.empty()) {
+          continue;
+        }
+        clip = std::move(sound_effect_output_queue_.front());
+        sound_effect_output_queue_.pop_front();
+      }
+
+      const auto output = ReformatPcm(clip.pcm, clip.sample_rate,
+                                      clip.channels,
+                                      mix_format->nSamplesPerSec,
+                                      mix_format->nChannels);
+      WriteRenderPcm(render_client.Get(), audio_client.Get(), buffer_frames,
+                     *mix_format, output, sound_effect_output_running_, false);
+    }
+
+    audio_client->Stop();
+    if (task_handle != nullptr) {
+      AvRevertMmThreadCharacteristics(task_handle);
+    }
+    FinishCom(owns_com);
+    sound_effect_output_running_ = false;
+  }
+
+  void SoundEffectMonitorLoop() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool owns_com = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+      sound_effect_monitor_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      sound_effect_monitor_running_ = false;
+      return;
+    }
+
+    auto device = SoundboardMonitorDevice(enumerator.Get());
+    if (!device) {
+      FinishCom(owns_com);
+      sound_effect_monitor_running_ = false;
+      return;
+    }
+
+    Microsoft::WRL::ComPtr<IAudioClient> audio_client;
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                          reinterpret_cast<void**>(audio_client.GetAddressOf()));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      sound_effect_monitor_running_ = false;
+      return;
+    }
+
+    WAVEFORMATEX* raw_mix_format = nullptr;
+    hr = audio_client->GetMixFormat(&raw_mix_format);
+    if (FAILED(hr) || raw_mix_format == nullptr) {
+      FinishCom(owns_com);
+      sound_effect_monitor_running_ = false;
+      return;
+    }
+
+    const size_t mix_format_size = sizeof(WAVEFORMATEX) + raw_mix_format->cbSize;
+    std::vector<BYTE> mix_format_storage(mix_format_size);
+    std::memcpy(mix_format_storage.data(), raw_mix_format, mix_format_size);
+    const auto* mix_format =
+        reinterpret_cast<const WAVEFORMATEX*>(mix_format_storage.data());
+    CoTaskMemFree(raw_mix_format);
+
+    const REFERENCE_TIME buffer_duration = 10000000LL * 80 / 1000;
+    hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+                                  buffer_duration, 0, mix_format, nullptr);
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      sound_effect_monitor_running_ = false;
+      return;
+    }
+
+    UINT32 buffer_frames = 0;
+    audio_client->GetBufferSize(&buffer_frames);
+    Microsoft::WRL::ComPtr<IAudioRenderClient> render_client;
+    hr = audio_client->GetService(IID_PPV_ARGS(&render_client));
+    if (FAILED(hr)) {
+      FinishCom(owns_com);
+      sound_effect_monitor_running_ = false;
+      return;
+    }
+
+    DWORD task_index = 0;
+    HANDLE task_handle = AvSetMmThreadCharacteristics(L"Pro Audio", &task_index);
+    if (task_handle != nullptr) {
+      AvSetMmThreadPriority(task_handle, AVRT_PRIORITY_HIGH);
+    }
+    audio_client->Start();
+
+    while (sound_effect_monitor_running_) {
+      SoundEffectClip clip;
+      {
+        std::unique_lock lock(sound_effect_monitor_mutex_);
+        sound_effect_monitor_cv_.wait_for(
+            lock, std::chrono::milliseconds(40), [this] {
+              return !sound_effect_monitor_running_.load() ||
+                     !sound_effect_monitor_queue_.empty();
+            });
+        if (!sound_effect_monitor_running_) {
+          break;
+        }
+        if (sound_effect_monitor_queue_.empty()) {
+          continue;
+        }
+        clip = std::move(sound_effect_monitor_queue_.front());
+        sound_effect_monitor_queue_.pop_front();
+      }
+
+      const auto output = ReformatPcm(clip.pcm, clip.sample_rate,
+                                      clip.channels,
+                                      mix_format->nSamplesPerSec,
+                                      mix_format->nChannels);
+      WriteRenderPcm(render_client.Get(), audio_client.Get(), buffer_frames,
+                     *mix_format, output, sound_effect_monitor_running_, false);
+    }
+
+    audio_client->Stop();
+    if (task_handle != nullptr) {
+      AvRevertMmThreadCharacteristics(task_handle);
+    }
+    FinishCom(owns_com);
+    sound_effect_monitor_running_ = false;
   }
 
   void ControlLoop() {
@@ -3008,8 +4046,11 @@ class WindowsAudioEngine::Impl {
   void UpdateRemoteMetrics(const std::string& message) {
     const int64_t received_at = NowMillis();
     if (const auto receiver_time = ParseIntMetric(message, "receiverTimeMs")) {
-      remote_receiver_time_ms_ = receiver_time.value();
-      remote_receiver_time_received_at_ms_ = received_at;
+      std::scoped_lock lock(remote_receiver_clock_mutex_);
+      remote_receiver_clock_echo_ = {
+          receiver_time.value(),
+          received_at,
+      };
     }
 
     bool has_metric = false;
@@ -3180,6 +4221,49 @@ class WindowsAudioEngine::Impl {
     return output;
   }
 
+  bool MixSoundEffects(std::vector<int16_t>* pcm,
+                       int sample_rate,
+                       int channels) {
+    if (pcm == nullptr || pcm->empty() || sample_rate <= 0 || channels <= 0) {
+      return false;
+    }
+
+    std::scoped_lock lock(sound_effect_mutex_);
+    if (sound_effect_queue_.empty()) {
+      return false;
+    }
+
+    size_t mixed_samples = 0;
+    const size_t output_samples = pcm->size();
+    while (mixed_samples < output_samples && !sound_effect_queue_.empty()) {
+      auto& clip = sound_effect_queue_.front();
+      if (clip.sample_rate != sample_rate || clip.channels != channels ||
+          clip.sample_offset >= clip.pcm.size()) {
+        sound_effect_queue_.pop_front();
+        continue;
+      }
+
+      const size_t available_samples = clip.pcm.size() - clip.sample_offset;
+      const size_t samples_to_mix =
+          std::min(output_samples - mixed_samples, available_samples);
+      for (size_t index = 0; index < samples_to_mix; ++index) {
+        const int mixed =
+            static_cast<int>((*pcm)[mixed_samples + index]) +
+            static_cast<int>(clip.pcm[clip.sample_offset + index]);
+        (*pcm)[mixed_samples + index] = static_cast<int16_t>(
+            std::clamp(mixed, -32768, 32767));
+      }
+
+      clip.sample_offset += samples_to_mix;
+      mixed_samples += samples_to_mix;
+      if (clip.sample_offset >= clip.pcm.size()) {
+        sound_effect_queue_.pop_front();
+      }
+    }
+
+    return mixed_samples > 0;
+  }
+
   void CaptureLoop() {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool owns_com = SUCCEEDED(hr);
@@ -3283,10 +4367,12 @@ class WindowsAudioEngine::Impl {
       const auto captured_pcm =
           ConvertToPcm16(data, frames_available, *mix_format, silent,
                          volume_.load(), muted_.load());
-      const auto output_pcm = ReformatPcmForProfile(
+      const int output_sample_rate = OutputSampleRateForProfile();
+      const int output_channels = std::clamp(profile_.channels, 1, 2);
+      auto output_pcm = ReformatPcmForProfile(
           captured_pcm, mix_format->nSamplesPerSec, mix_format->nChannels);
-      SendPcm(output_pcm, OutputSampleRateForProfile(),
-              std::clamp(profile_.channels, 1, 2));
+      MixSoundEffects(&output_pcm, output_sample_rate, output_channels);
+      SendPcm(output_pcm, output_sample_rate, output_channels);
       capture_client->ReleaseBuffer(frames_available);
     }
 
@@ -4148,7 +5234,7 @@ class WindowsAudioEngine::Impl {
         local_last_known_underrun_count_ = local_underrun_count_.load();
       }
       WriteRenderPcm(render_client.Get(), audio_client.Get(), buffer_frames,
-                     *mix_format, output);
+                     *mix_format, output, playback_running_);
       playback_queue_frames_ -=
           static_cast<int64_t>(packet.pcm.size()) / std::max(1, packet.channels);
     }
@@ -4169,11 +5255,13 @@ class WindowsAudioEngine::Impl {
                       IAudioClient* audio_client,
                       UINT32 buffer_frames,
                       const WAVEFORMATEX& format,
-                      const std::vector<int16_t>& pcm) {
+                      const std::vector<int16_t>& pcm,
+                      const std::atomic_bool& running,
+                      bool apply_output_volume = true) {
     const int channels = std::max<int>(1, format.nChannels);
     size_t offset_frames = 0;
     const size_t total_frames = pcm.size() / channels;
-    while (playback_running_ && offset_frames < total_frames) {
+    while (running && offset_frames < total_frames) {
       UINT32 padding = 0;
       if (FAILED(audio_client->GetCurrentPadding(&padding))) {
         return;
@@ -4191,18 +5279,20 @@ class WindowsAudioEngine::Impl {
         return;
       }
       WritePcmToMixBuffer(pcm.data() + offset_frames * channels,
-                          frames_to_write, format, output);
+                          frames_to_write, format, output,
+                          apply_output_volume);
       render_client->ReleaseBuffer(frames_to_write, 0);
       offset_frames += frames_to_write;
     }
   }
 
   void WritePcmToMixBuffer(const int16_t* pcm, UINT32 frames,
-                           const WAVEFORMATEX& format, BYTE* output) {
+                           const WAVEFORMATEX& format, BYTE* output,
+                           bool apply_output_volume) {
     const int channels = std::max<int>(1, format.nChannels);
     const size_t sample_count = static_cast<size_t>(frames) * channels;
-    const float volume = volume_.load();
-    const bool muted = muted_.load();
+    const float volume = apply_output_volume ? volume_.load() : 1.0f;
+    const bool muted = apply_output_volume && muted_.load();
 
     if (IsFloatFormat(format) && format.wBitsPerSample == 32) {
       auto* samples = reinterpret_cast<float*>(output);
@@ -4299,12 +5389,21 @@ class WindowsAudioEngine::Impl {
       }
       std::vector<uint8_t> packet(kPacketV4HeaderBytes + encoded.payload.size());
       const int64_t send_time_ms = NowMillis();
-      const int64_t receiver_time_ms = remote_receiver_time_ms_.load();
-      const int64_t receiver_time_received_at_ms =
-          remote_receiver_time_received_at_ms_.load();
+      RemoteReceiverClockEcho receiver_clock_echo;
+      {
+        std::scoped_lock lock(remote_receiver_clock_mutex_);
+        receiver_clock_echo = remote_receiver_clock_echo_;
+      }
       const bool has_fresh_receiver_time =
-          receiver_time_ms > 0 && receiver_time_received_at_ms > 0 &&
-          send_time_ms - receiver_time_received_at_ms < 3000;
+          receiver_clock_echo.receiver_time_ms > 0 &&
+          receiver_clock_echo.received_at_sender_time_ms > 0 &&
+          send_time_ms - receiver_clock_echo.received_at_sender_time_ms < 3000;
+      const int64_t echoed_receiver_time_ms =
+          has_fresh_receiver_time ? receiver_clock_echo.receiver_time_ms : 0;
+      const int64_t echo_received_at_sender_time_ms =
+          has_fresh_receiver_time
+              ? receiver_clock_echo.received_at_sender_time_ms
+              : 0;
 
       WriteU32(packet, 0, kPacketV4Magic);
       WriteU32(packet, 4, sequence_++);
@@ -4315,14 +5414,9 @@ class WindowsAudioEngine::Impl {
       WriteU16(packet, 18, encoded.packet_kind);
       WriteU32(packet, 20, encoded.decoded_frame_count);
       WriteU64(packet, 24, static_cast<uint64_t>(send_time_ms));
-      WriteU64(packet, 32,
-               static_cast<uint64_t>(has_fresh_receiver_time
-                                         ? receiver_time_ms
-                                         : 0));
+      WriteU64(packet, 32, static_cast<uint64_t>(echoed_receiver_time_ms));
       WriteU64(packet, 40,
-               static_cast<uint64_t>(has_fresh_receiver_time
-                                         ? receiver_time_received_at_ms
-                                         : 0));
+               static_cast<uint64_t>(echo_received_at_sender_time_ms));
       WriteU32(packet, 48, static_cast<uint32_t>(std::clamp(
                              profile_.playback_buffer_ms, kMinBufferMs,
                              kMaxBufferMs)));
@@ -4482,7 +5576,7 @@ class WindowsAudioEngine::Impl {
            profile_.playback_buffer_ms <= 28;
   }
 
-  void FinishCom(bool owns_com) {
+  static void FinishCom(bool owns_com) {
     if (owns_com) {
       CoUninitialize();
     }
@@ -4537,8 +5631,8 @@ class WindowsAudioEngine::Impl {
   std::atomic<int64_t> remote_lost_packet_count_ = 0;
   std::atomic<int64_t> remote_trim_count_ = 0;
   std::atomic<int64_t> remote_metrics_received_at_ms_ = 0;
-  std::atomic<int64_t> remote_receiver_time_ms_ = 0;
-  std::atomic<int64_t> remote_receiver_time_received_at_ms_ = 0;
+  std::mutex remote_receiver_clock_mutex_;
+  RemoteReceiverClockEcho remote_receiver_clock_echo_;
   std::string remote_platform_;
   std::vector<std::string> remote_supported_codecs_;
   mutable std::atomic<double> local_signal_peak_ = 0.0;
@@ -4566,9 +5660,27 @@ class WindowsAudioEngine::Impl {
   mutable std::mutex remote_capabilities_mutex_;
   std::mutex playback_queue_mutex_;
   std::condition_variable playback_queue_cv_;
+  std::mutex sound_effect_mutex_;
+  std::mutex sound_effect_output_mutex_;
+  std::mutex sound_effect_monitor_mutex_;
+  std::condition_variable sound_effect_output_cv_;
+  std::condition_variable sound_effect_monitor_cv_;
   Endpoint endpoint_;
   ReceiverSource receiver_source_;
   std::deque<PcmPlaybackPacket> playback_queue_;
+  std::deque<SoundEffectClip> sound_effect_queue_;
+  std::deque<SoundEffectClip> sound_effect_output_queue_;
+  std::deque<SoundEffectClip> sound_effect_monitor_queue_;
+  std::thread sound_effect_output_thread_;
+  std::thread sound_effect_monitor_thread_;
+  std::thread virtual_mic_passthrough_thread_;
+  std::atomic_bool sound_effect_output_running_ = false;
+  std::atomic_bool sound_effect_monitor_running_ = false;
+  std::atomic_bool virtual_mic_passthrough_running_ = false;
+  std::string sound_effect_output_device_id_;
+  std::string virtual_mic_passthrough_output_device_id_;
+  int sound_effect_output_sample_rate_ = 0;
+  int sound_effect_output_channels_ = 0;
   std::atomic<int64_t> playback_queue_frames_ = 0;
   PcmCodecAdapter pcm_codec_;
   OpusCodecAdapter opus_codec_;
@@ -4619,6 +5731,10 @@ flutter::EncodableMap WindowsAudioEngine::GetCapabilities() const {
   return impl_->GetCapabilities();
 }
 
+flutter::EncodableList WindowsAudioEngine::GetSoundboardOutputDevices() const {
+  return impl_->GetSoundboardOutputDevices();
+}
+
 flutter::EncodableList WindowsAudioEngine::GetNetworkInterfaces() const {
   return impl_->GetNetworkInterfaces();
 }
@@ -4667,6 +5783,20 @@ void WindowsAudioEngine::SetVolume(const flutter::EncodableValue* arguments) {
 
 void WindowsAudioEngine::SetMuted(const flutter::EncodableValue* arguments) {
   impl_->SetMuted(arguments);
+}
+
+std::optional<std::string> WindowsAudioEngine::PlaySoundEffect(
+    const flutter::EncodableValue* arguments) {
+  return impl_->PlaySoundEffect(arguments);
+}
+
+std::optional<std::string> WindowsAudioEngine::ConfigureVirtualMicPassthrough(
+    const flutter::EncodableValue* arguments) {
+  return impl_->ConfigureVirtualMicPassthrough(arguments);
+}
+
+void WindowsAudioEngine::StopSoundEffects() {
+  impl_->StopSoundEffects();
 }
 
 void WindowsAudioEngine::Disconnect() {

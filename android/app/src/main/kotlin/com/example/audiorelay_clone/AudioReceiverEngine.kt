@@ -91,13 +91,13 @@ private const val START_BUFFER_EXTRA_MS = 2
 private const val ADAPTIVE_BUFFER_COOLDOWN_MS = 1500L
 private const val ADAPTIVE_BUFFER_RELAX_MS = 6000L
 private const val ADAPTIVE_BUFFER_FAST_RELAX_MS = 2500L
-private const val ADAPTIVE_GAMING_BUFFER_RELAX_MS = 1800L
-private const val ADAPTIVE_GAMING_BUFFER_FAST_RELAX_MS = 1000L
+private const val ADAPTIVE_GAMING_BUFFER_RELAX_MS = 1200L
+private const val ADAPTIVE_GAMING_BUFFER_FAST_RELAX_MS = 700L
 private const val ADAPTIVE_PLAYBACK_START_GRACE_MS = 1000L
 private const val ADAPTIVE_UNDERRUN_SLOW_WINDOW_MS = 15000L
-private const val ADAPTIVE_ACCEPTABLE_UNDERRUNS_PER_SLOW_WINDOW = 4
+private const val ADAPTIVE_ACCEPTABLE_UNDERRUNS_PER_SLOW_WINDOW = 6
 private const val ADAPTIVE_UNDERRUN_BURST_WINDOW_MS = 2000L
-private const val ADAPTIVE_ACCEPTABLE_UNDERRUNS_PER_BURST = 3
+private const val ADAPTIVE_ACCEPTABLE_UNDERRUNS_PER_BURST = 4
 private const val ADAPTIVE_LOW_QUEUE_DIVISOR = 4L
 private const val ADAPTIVE_LOW_LATENCY_STEP_MS = 4
 private const val ADAPTIVE_GAMING_RELAX_STEP_MS = 1
@@ -108,13 +108,13 @@ private const val ADAPTIVE_GAMING_CAP_MS = 30
 private const val ADAPTIVE_BALANCED_CAP_MS = 160
 private const val ADAPTIVE_DELAY_SAMPLE_INTERVAL_MS = 500L
 private const val ADAPTIVE_DELAY_HISTORY_SAMPLES = 32
-private const val ADAPTIVE_DELAY_MIN_HISTORY_SAMPLES = 4
-private const val ADAPTIVE_DELAY_QUANTILE = 0.75
-private const val ADAPTIVE_DELAY_HEADROOM_NUMERATOR = 3
-private const val ADAPTIVE_DELAY_HEADROOM_DENOMINATOR = 5
+private const val ADAPTIVE_DELAY_MIN_HISTORY_SAMPLES = 8
+private const val ADAPTIVE_DELAY_QUANTILE = 0.60
+private const val ADAPTIVE_DELAY_HEADROOM_NUMERATOR = 1
+private const val ADAPTIVE_DELAY_HEADROOM_DENOMINATOR = 3
 private const val ADAPTIVE_DELAY_MAX_MS = 2000.0
 private const val ADAPTIVE_SEQUENCE_RESET_GAP = 50L
-private const val ADAPTIVE_NETWORK_TARGET_HYSTERESIS_MS = 3
+private const val ADAPTIVE_NETWORK_TARGET_HYSTERESIS_MS = 5
 private const val ADAPTIVE_FAST_RELAX_MARGIN_MS = 8
 private const val ADAPTIVE_AUDIBLE_SIGNAL_FLOOR = 0.001
 private const val ADAPTIVE_LINK_MEMORY_PREFS = "audio_bridge_adaptive_link_memory"
@@ -212,6 +212,11 @@ private data class AdaptiveNetworkIdentity(
     val prefixLength: Int,
     val localSubnet: String,
     val peerSubnet: String
+)
+
+private data class RemoteReceiverClockEcho(
+    val receiverTimeMs: Long = 0L,
+    val receivedAtSenderTimeMs: Long = 0L
 )
 
 class AudioReceiverEngine(private val context: Context) {
@@ -361,8 +366,10 @@ class AudioReceiverEngine(private val context: Context) {
     private val remoteLostPacketCount = AtomicLong(0)
     private val remoteTrimCount = AtomicLong(0)
     private val remoteMetricsReceivedAtMs = AtomicLong(0)
-    private val remoteReceiverTimeMs = AtomicLong(0)
-    private val remoteReceiverTimeReceivedAtMs = AtomicLong(0)
+
+    @Volatile
+    private var remoteReceiverClockEcho = RemoteReceiverClockEcho()
+
     private var usbFramesReceived = 0L
     private var usbSubscribeFramesSent = 0L
     private var usbAudioPacketsHandled = 0L
@@ -374,6 +381,7 @@ class AudioReceiverEngine(private val context: Context) {
         "platform" to "android",
         "canSend" to true,
         "canReceive" to true,
+        "canPlaySoundEffects" to false,
         "backend" to "android-audiorecord-audiotrack-codecs-udp-native-usb",
         "detail" to "Low-latency UDP microphone capture plus UDP, USB tethering, and Android Open Accessory USB playback",
         "supportedCodecs" to listOf("pcm", "opus", "aac", "g711MuLaw", "g711ALaw", "imaAdpcm"),
@@ -1394,12 +1402,21 @@ class AudioReceiverEngine(private val context: Context) {
         }
 
         val sendTimeMs = SystemClock.elapsedRealtime()
-        val receiverTimeMs = remoteReceiverTimeMs.get()
-        val receiverTimeReceivedAtMs = remoteReceiverTimeReceivedAtMs.get()
+        val receiverClockEcho = remoteReceiverClockEcho
         val hasFreshReceiverTime =
-            receiverTimeMs > 0L &&
-                receiverTimeReceivedAtMs > 0L &&
-                sendTimeMs - receiverTimeReceivedAtMs < 3000L
+            receiverClockEcho.receiverTimeMs > 0L &&
+                receiverClockEcho.receivedAtSenderTimeMs > 0L &&
+                sendTimeMs - receiverClockEcho.receivedAtSenderTimeMs < 3000L
+        val echoedReceiverTimeMs = if (hasFreshReceiverTime) {
+            receiverClockEcho.receiverTimeMs
+        } else {
+            0L
+        }
+        val echoReceivedAtSenderTimeMs = if (hasFreshReceiverTime) {
+            receiverClockEcho.receivedAtSenderTimeMs
+        } else {
+            0L
+        }
 
         val packet = ByteBuffer.allocate(PACKET_V4_HEADER_BYTES + encoded.payload.size)
             .order(ByteOrder.LITTLE_ENDIAN)
@@ -1412,8 +1429,8 @@ class AudioReceiverEngine(private val context: Context) {
             .putShort(PACKET_KIND_AUDIO.toShort())
             .putInt(encoded.decodedFrameCount)
             .putLong(sendTimeMs)
-            .putLong(if (hasFreshReceiverTime) receiverTimeMs else 0L)
-            .putLong(if (hasFreshReceiverTime) receiverTimeReceivedAtMs else 0L)
+            .putLong(echoedReceiverTimeMs)
+            .putLong(echoReceivedAtSenderTimeMs)
             .putInt(profile.playbackBufferMs.coerceIn(minLatencyMs(), MAX_LATENCY_MS))
             .putInt(receiverOptionsFor(profile))
             .put(encoded.payload)
@@ -1869,8 +1886,10 @@ class AudioReceiverEngine(private val context: Context) {
     private fun updateRemoteMetrics(message: String) {
         val receivedAt = SystemClock.elapsedRealtime()
         parseLongMetric(message, "receiverTimeMs")?.let {
-            remoteReceiverTimeMs.set(it)
-            remoteReceiverTimeReceivedAtMs.set(receivedAt)
+            remoteReceiverClockEcho = RemoteReceiverClockEcho(
+                receiverTimeMs = it,
+                receivedAtSenderTimeMs = receivedAt
+            )
         }
 
         var hasMetric = false
@@ -1984,8 +2003,7 @@ class AudioReceiverEngine(private val context: Context) {
         remoteLostPacketCount.set(0)
         remoteTrimCount.set(0)
         remoteMetricsReceivedAtMs.set(0)
-        remoteReceiverTimeMs.set(0)
-        remoteReceiverTimeReceivedAtMs.set(0)
+        remoteReceiverClockEcho = RemoteReceiverClockEcho()
     }
 
     private fun ensurePacketizerCapacity(requiredSamples: Int) {
@@ -2892,6 +2910,12 @@ class AudioReceiverEngine(private val context: Context) {
         currentInputSampleRate = sampleRate
         val playbackPayloadFrames = playbackPayloadSize / bytesPerFrame
         val packetReceivedAtReceiverMs = SystemClock.elapsedRealtime()
+        val networkSampleMs = estimateNetworkLatencyMs(
+            packetReceivedAtReceiverMs = packetReceivedAtReceiverMs,
+            senderSendTimeMs = senderSendTimeMs,
+            echoedReceiverTimeMs = echoedReceiverTimeMs,
+            echoReceivedAtSenderTimeMs = echoReceivedAtSenderTimeMs
+        )
         lastAudioPacketReceivedAtMs = packetReceivedAtReceiverMs
         observeAdaptivePacketArrival(
             now = packetReceivedAtReceiverMs,
@@ -2899,7 +2923,13 @@ class AudioReceiverEngine(private val context: Context) {
             sampleRate = sampleRate,
             packetFrames = payloadFrames
         )
-        if (shouldDropForLatency(track, playbackSampleRate, playbackPayloadFrames)) {
+        if (shouldDropForLatency(
+                track,
+                playbackSampleRate,
+                playbackPayloadFrames,
+                networkSampleMs
+            )
+        ) {
             return
         }
 
@@ -2924,10 +2954,7 @@ class AudioReceiverEngine(private val context: Context) {
             updateAudioLatencyEstimate(
                 track = track,
                 sampleRate = playbackSampleRate,
-                packetReceivedAtReceiverMs = packetReceivedAtReceiverMs,
-                senderSendTimeMs = senderSendTimeMs,
-                echoedReceiverTimeMs = echoedReceiverTimeMs,
-                echoReceivedAtSenderTimeMs = echoReceivedAtSenderTimeMs
+                networkSampleMs = networkSampleMs
             )
             startPlaybackIfReady(track, queuedAfterWrite)
             if (writtenBytes < playbackPayloadSize) {
@@ -3187,7 +3214,8 @@ class AudioReceiverEngine(private val context: Context) {
     private fun shouldDropForLatency(
         track: AudioTrack,
         sampleRate: Int,
-        payloadFrames: Int
+        payloadFrames: Int,
+        networkSampleMs: Double?
     ): Boolean {
         val queuedFrames = max(0L, writtenFrames.get() - playbackFrames(track))
         val targetFrames = adaptiveTargetFrames(sampleRate).toLong()
@@ -3195,6 +3223,14 @@ class AudioReceiverEngine(private val context: Context) {
         val softLimit = max(targetFrames + packetFrames * 2L, targetFrames * 3L / 2L)
         val hardLimit = max(targetFrames * 3L, targetFrames + sampleRate * 50L / 1000L)
 
+        if (networkSampleMs != null) {
+            val queuedMs = queuedFrames * 1000.0 / sampleRate
+            val hardLimitMs = hardLimit * 1000.0 / sampleRate
+            if (networkSampleMs + queuedMs > hardLimitMs) {
+                droppedPackets.incrementAndGet()
+                return true
+            }
+        }
         if (queuedFrames > hardLimit) {
             trimQueuedAudio(track)
             return false
@@ -3697,7 +3733,7 @@ class AudioReceiverEngine(private val context: Context) {
             sampleRate,
             profile.playbackBufferMs.coerceIn(minLatencyMs(), MAX_LATENCY_MS)
         ).toLong()
-        return max(requestedFrames, targetFrames * 3L / 4L)
+        return max(requestedFrames, targetFrames * 2L / 3L)
     }
 
     private fun adaptiveBufferStepMs(requestedLatencyMs: Int): Int {
@@ -3748,7 +3784,7 @@ class AudioReceiverEngine(private val context: Context) {
                     ADAPTIVE_ULTRA_LOW_LATENCY_CAP_MS,
                     requestedLatencyMs * 4
                 )
-                else -> max(requestedLatencyMs, requestedLatencyMs + 12)
+                else -> max(requestedLatencyMs, requestedLatencyMs + 6)
             }.coerceAtMost(ADAPTIVE_GAMING_CAP_MS)
             AudioMode.BALANCED -> max(96, requestedLatencyMs * 2)
                 .coerceAtMost(ADAPTIVE_BALANCED_CAP_MS)
@@ -3916,17 +3952,9 @@ class AudioReceiverEngine(private val context: Context) {
     private fun updateAudioLatencyEstimate(
         track: AudioTrack,
         sampleRate: Int,
-        packetReceivedAtReceiverMs: Long,
-        senderSendTimeMs: Long,
-        echoedReceiverTimeMs: Long,
-        echoReceivedAtSenderTimeMs: Long
+        networkSampleMs: Double?
     ) {
-        val networkSampleMs = estimateNetworkLatencyMs(
-            packetReceivedAtReceiverMs = packetReceivedAtReceiverMs,
-            senderSendTimeMs = senderSendTimeMs,
-            echoedReceiverTimeMs = echoedReceiverTimeMs,
-            echoReceivedAtSenderTimeMs = echoReceivedAtSenderTimeMs
-        ) ?: return
+        networkSampleMs ?: return
         val queuedFrames = max(0L, writtenFrames.get() - playbackFrames(track))
         val outputQueueMs = queuedFrames * 1000.0 / sampleRate
         networkLatencyMs = smoothLatency(networkLatencyMs, networkSampleMs)

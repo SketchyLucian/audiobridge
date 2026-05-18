@@ -13,6 +13,7 @@ void main() {
     expect(find.text('Wi-Fi'), findsWidgets);
     expect(find.text('USB tether'), findsOneWidget);
     expect(find.text('Native USB'), findsOneWidget);
+    expect(find.text('Soundboard'), findsOneWidget);
     expect(find.text('Audio settings'), findsOneWidget);
     expect(find.text('Simple'), findsNothing);
     expect(find.text('Advanced'), findsNothing);
@@ -24,8 +25,8 @@ void main() {
     expect(find.text('Latency and stability'), findsOneWidget);
     expect(find.text('Bitrate'), findsWidgets);
     expect(find.text('Sender buffer'), findsOneWidget);
-    expect(find.text('Receiver buffer'), findsOneWidget);
-    expect(find.text('Receiver adaptive buffer'), findsOneWidget);
+    expect(find.text('Receiver buffer'), findsWidgets);
+    expect(find.text('Receiver adaptive buffer'), findsNothing);
     expect(find.byIcon(Icons.tune_rounded), findsWidgets);
   });
 }

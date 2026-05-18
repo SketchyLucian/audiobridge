@@ -13,6 +13,8 @@ class PlatformAudioCapabilities {
     required this.supportedCodecs,
     required this.supportedOutputBackends,
     required this.codecBitrateRanges,
+    this.soundboardOutputDevices = const [],
+    this.canPlaySoundEffects = false,
     this.detail,
   });
 
@@ -23,12 +25,15 @@ class PlatformAudioCapabilities {
   final Set<AudioCodec> supportedCodecs;
   final Set<OutputAudioBackend> supportedOutputBackends;
   final Map<AudioCodec, CodecBitrateRange> codecBitrateRanges;
+  final List<SoundboardOutputDevice> soundboardOutputDevices;
+  final bool canPlaySoundEffects;
   final String? detail;
 
   factory PlatformAudioCapabilities.fromMap(Map<String, Object?> payload) {
     final codecNames = payload['supportedCodecs'];
     final outputBackendNames = payload['supportedOutputBackends'];
     final bitrateRanges = payload['codecBitrateRanges'];
+    final soundboardOutputDevices = payload['soundboardOutputDevices'];
 
     return PlatformAudioCapabilities(
       platform: payload['platform']?.toString() ?? _platformName(),
@@ -38,6 +43,10 @@ class PlatformAudioCapabilities {
       supportedCodecs: _readSupportedCodecs(codecNames),
       supportedOutputBackends: _readSupportedOutputBackends(outputBackendNames),
       codecBitrateRanges: _readBitrateRanges(bitrateRanges),
+      soundboardOutputDevices: _readSoundboardOutputDevices(
+        soundboardOutputDevices,
+      ),
+      canPlaySoundEffects: payload['canPlaySoundEffects'] == true,
       detail: payload['detail']?.toString(),
     );
   }
@@ -58,6 +67,8 @@ class PlatformAudioCapabilities {
         if (isAndroid) OutputAudioBackend.audioTrack,
       },
       codecBitrateRanges: const {},
+      soundboardOutputDevices: const [],
+      canPlaySoundEffects: false,
       detail: detail ?? 'Native audio backend is not installed yet.',
     );
   }
@@ -101,6 +112,20 @@ class PlatformAudioCapabilities {
           entry.value,
         ),
     };
+  }
+
+  static List<SoundboardOutputDevice> _readSoundboardOutputDevices(
+    Object? value,
+  ) {
+    if (value is! List) {
+      return const [];
+    }
+
+    return [
+      for (final item in value)
+        if (item is Map)
+          SoundboardOutputDevice.fromMap(item.cast<Object?, Object?>()),
+    ];
   }
 
   static String _platformName() {
@@ -285,6 +310,20 @@ abstract interface class AudioRelayEngine {
 
   Future<void> setMuted(bool value);
 
+  Future<void> playSoundEffect({
+    required String path,
+    required double volume,
+    required SoundboardPlaybackTarget target,
+    String? outputDeviceId,
+  });
+
+  Future<void> configureVirtualMicPassthrough({
+    required bool enabled,
+    String? outputDeviceId,
+  });
+
+  Future<void> stopSoundEffects();
+
   Future<void> disconnect();
 }
 
@@ -383,6 +422,37 @@ class MethodChannelAudioRelayEngine implements AudioRelayEngine {
   @override
   Future<void> setMuted(bool value) {
     return _invoke('setMuted', {'value': value});
+  }
+
+  @override
+  Future<void> playSoundEffect({
+    required String path,
+    required double volume,
+    required SoundboardPlaybackTarget target,
+    String? outputDeviceId,
+  }) {
+    return _invoke('playSoundEffect', {
+      'path': path,
+      'volume': volume,
+      'target': target.methodValue,
+      'outputDeviceId': ?outputDeviceId,
+    });
+  }
+
+  @override
+  Future<void> configureVirtualMicPassthrough({
+    required bool enabled,
+    String? outputDeviceId,
+  }) {
+    return _invoke('configureVirtualMicPassthrough', {
+      'enabled': enabled,
+      'outputDeviceId': ?outputDeviceId,
+    });
+  }
+
+  @override
+  Future<void> stopSoundEffects() {
+    return _invoke('stopSoundEffects');
   }
 
   @override

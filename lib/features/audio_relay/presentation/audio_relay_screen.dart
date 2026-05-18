@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:file_selector/file_selector.dart';
 
 import '../application/audio_relay_controller.dart';
 import '../data/discovery_service.dart';
@@ -28,6 +29,11 @@ extension _AudioProfileDisplay on AudioProfile {
     return '${codec.label} · $sourceSampleRateText · $sourceChannelText · $sourceBitrateText';
   }
 }
+
+const _soundboardAudioTypeGroup = XTypeGroup(
+  label: 'Audio',
+  extensions: ['wav', 'mp3', 'm4a', 'aac', 'wma', 'flac'],
+);
 
 class AudioRelayScreen extends StatefulWidget {
   const AudioRelayScreen({super.key});
@@ -111,6 +117,10 @@ class _AudioRelayScreenState extends State<AudioRelayScreen> {
                             ),
                           ],
                         ),
+                      if (controller.role == RelayRole.sender) ...[
+                        const SizedBox(height: 16),
+                        _SoundboardPanel(controller: controller),
+                      ],
                       const SizedBox(height: 16),
                       _SettingsPanel(controller: controller),
                     ],
@@ -472,6 +482,365 @@ class _DevicesPanel extends StatelessWidget {
   }
 }
 
+class _SoundboardPanel extends StatelessWidget {
+  const _SoundboardPanel({required this.controller});
+
+  final AudioRelayController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final selectedItem = controller.selectedSoundboardItem;
+    final notice =
+        controller.soundboardMessage ?? controller.soundboardRouteMessage;
+
+    return _Panel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _PanelTitle(
+            icon: Icons.library_music_rounded,
+            title: 'Soundboard',
+            trailing: Text(controller.soundboardStatusLabel),
+          ),
+          const SizedBox(height: 14),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              SegmentedButton<SoundboardPlaybackTarget>(
+                showSelectedIcon: false,
+                segments: const [
+                  ButtonSegment(
+                    value: SoundboardPlaybackTarget.micRoute,
+                    icon: Icon(Icons.mic_external_on_rounded),
+                    label: Text('Mic + speaker'),
+                  ),
+                  ButtonSegment(
+                    value: SoundboardPlaybackTarget.stream,
+                    icon: Icon(Icons.hub_rounded),
+                    label: Text('Stream'),
+                  ),
+                ],
+                selected: {controller.soundboardTarget},
+                onSelectionChanged: controller.canUseSoundboard
+                    ? (selection) {
+                        controller.updateSoundboardTarget(selection.first);
+                      }
+                    : null,
+              ),
+              if (controller.soundboardTarget ==
+                  SoundboardPlaybackTarget.micRoute)
+                ConstrainedBox(
+                  constraints: const BoxConstraints(
+                    minWidth: 260,
+                    maxWidth: 460,
+                  ),
+                  child: _CallMicrophonePicker(controller: controller),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.icon(
+                onPressed: controller.canUseSoundboard
+                    ? () {
+                        _pickSoundFiles(context);
+                      }
+                    : null,
+                icon: const Icon(Icons.add_rounded),
+                label: const Text('Add sound'),
+              ),
+              Tooltip(
+                message: 'Play selected sound',
+                child: IconButton.filledTonal(
+                  onPressed: controller.canPlaySelectedSound
+                      ? controller.playSelectedSoundboardItem
+                      : null,
+                  icon: const Icon(Icons.play_arrow_rounded),
+                ),
+              ),
+              Tooltip(
+                message: 'Stop soundboard',
+                child: IconButton.filledTonal(
+                  onPressed: controller.canUseSoundboard
+                      ? controller.stopSoundboard
+                      : null,
+                  icon: const Icon(Icons.stop_rounded),
+                ),
+              ),
+              ConstrainedBox(
+                constraints: const BoxConstraints(minWidth: 220, maxWidth: 320),
+                child: _SoundboardVolumeControl(controller: controller),
+              ),
+            ],
+          ),
+          if (notice != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              notice,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+          const SizedBox(height: 12),
+          if (controller.soundboardItems.isEmpty)
+            _EmptySoundboard(enabled: controller.canUseSoundboard)
+          else
+            Column(
+              children: [
+                for (final item in controller.soundboardItems)
+                  _SoundboardRow(
+                    item: item,
+                    selected: selectedItem?.id == item.id,
+                    canPlay: controller.canPlaySoundboardItem(item),
+                    onTap: () {
+                      controller.selectSoundboardItem(item);
+                    },
+                    onPlay: () {
+                      controller.playSoundboardItem(item);
+                    },
+                    onRemove: () {
+                      controller.removeSoundboardItem(item);
+                    },
+                  ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickSoundFiles(BuildContext context) async {
+    final files = await openFiles(
+      acceptedTypeGroups: const [_soundboardAudioTypeGroup],
+    );
+    if (!context.mounted || files.isEmpty) {
+      return;
+    }
+    controller.addSoundboardFiles(files.map((file) => file.path));
+  }
+}
+
+class _CallMicrophonePicker extends StatelessWidget {
+  const _CallMicrophonePicker({required this.controller});
+
+  final AudioRelayController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final devices = controller.soundboardOutputDevices;
+    final selectedId =
+        devices.any(
+          (device) => device.id == controller.selectedSoundboardOutputDeviceId,
+        )
+        ? controller.selectedSoundboardOutputDeviceId
+        : null;
+
+    return DropdownButtonFormField<String>(
+      initialValue: selectedId,
+      isExpanded: true,
+      decoration: const InputDecoration(
+        isDense: true,
+        border: OutlineInputBorder(),
+        labelText: 'Call app microphone',
+      ),
+      hint: Text(devices.isEmpty ? 'No call microphone found' : 'Choose mic'),
+      items: [
+        for (final device in devices)
+          DropdownMenuItem(
+            value: device.id,
+            child: Text(
+              controller.callMicrophoneNameForSoundboardRoute(device),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+      ],
+      onChanged: devices.isEmpty || !controller.canUseSoundboard
+          ? null
+          : controller.selectSoundboardOutputDevice,
+    );
+  }
+}
+
+class _SoundboardVolumeControl extends StatelessWidget {
+  const _SoundboardVolumeControl({required this.controller});
+
+  final AudioRelayController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Row(
+      children: [
+        Icon(Icons.graphic_eq_rounded, color: theme.colorScheme.secondary),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Slider(
+            value: controller.soundboardVolume,
+            onChanged: controller.canUseSoundboard
+                ? controller.updateSoundboardVolume
+                : null,
+          ),
+        ),
+        SizedBox(
+          width: 44,
+          child: Text(
+            '${(controller.soundboardVolume * 100).round()}%',
+            textAlign: TextAlign.end,
+            style: theme.textTheme.labelLarge,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _SoundboardRow extends StatelessWidget {
+  const _SoundboardRow({
+    required this.item,
+    required this.selected,
+    required this.canPlay,
+    required this.onTap,
+    required this.onPlay,
+    required this.onRemove,
+  });
+
+  final SoundPlaybackItem item;
+  final bool selected;
+  final bool canPlay;
+  final VoidCallback onTap;
+  final VoidCallback onPlay;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 58),
+          child: Ink(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: selected
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.outlineVariant,
+              ),
+              color: selected
+                  ? theme.colorScheme.primary.withValues(alpha: 0.07)
+                  : Colors.transparent,
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.audio_file_rounded,
+                  color: selected
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.secondary,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        item.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      Text(
+                        item.path,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Tooltip(
+                  message: 'Play sound',
+                  child: IconButton(
+                    onPressed: canPlay ? onPlay : null,
+                    icon: const Icon(Icons.play_arrow_rounded),
+                  ),
+                ),
+                Tooltip(
+                  message: 'Remove sound',
+                  child: IconButton(
+                    onPressed: onRemove,
+                    icon: const Icon(Icons.close_rounded),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptySoundboard extends StatelessWidget {
+  const _EmptySoundboard({required this.enabled});
+
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(minHeight: 112),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            enabled ? Icons.library_music_rounded : Icons.music_off_rounded,
+            color: theme.colorScheme.secondary,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            enabled ? 'No sounds added' : 'Soundboard unavailable',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _EndpointDetails extends StatelessWidget {
   const _EndpointDetails({required this.controller});
 
@@ -675,7 +1044,7 @@ class _UnifiedAudioSettings extends StatelessWidget {
         compact: true,
         title: 'Codec',
         description:
-            'Auto uses Opus for low-latency modes when supported, then adapts conservative modes after link pressure is clear.',
+            'Adaptive uses Opus for low-latency modes when supported, then adapts conservative modes after link pressure is clear.',
         child: _CodecPicker(
           codec: profile.codec,
           enabled: !restartRequiredLocked,
@@ -708,29 +1077,9 @@ class _UnifiedAudioSettings extends StatelessWidget {
         title: 'Receiver buffer',
         description:
             'Lower feels more immediate. Higher adds latency but prevents pops and dropouts on unstable links.',
-        child: _SettingSlider(
-          value: profile.playbackBufferMs.toDouble(),
-          min: AudioProfile.minBufferMs.toDouble(),
-          max: AudioProfile.maxBufferMs.toDouble(),
-          divisions: AudioProfile.maxBufferMs - AudioProfile.minBufferMs,
-          valueLabel: '${profile.playbackBufferMs} ms',
-          detail: controller.receiverBufferDetailLabel,
-          onChanged: liveControlsLocked
-              ? null
-              : controller.updatePlaybackBuffer,
-        ),
-      ),
-      _SettingBlock(
-        compact: true,
-        title: 'Receiver adaptive buffer',
-        description: 'Raises the live buffer on bursts or sustained low queue.',
-        child: _SettingSwitch(
-          value: profile.receiverAdaptiveBuffer,
-          valueLabel: controller.receiverAdaptiveBufferLabel,
-          detail: controller.receiverAdaptiveBufferDetailLabel,
-          onChanged: liveControlsLocked
-              ? null
-              : controller.updateReceiverAdaptiveBuffer,
+        child: _ReceiverBufferControl(
+          controller: controller,
+          locked: liveControlsLocked,
         ),
       ),
       if (profile.mode == AudioPreset.custom)
@@ -940,8 +1289,9 @@ class _LiveBufferPreview extends StatelessWidget {
           ),
           _SettingValueChip(
             icon: Icons.av_timer_rounded,
-            label: 'Receiver active',
-            value: controller.activePlaybackBufferLabel,
+            label: 'Receiver buffer',
+            value:
+                '${controller.activePlaybackBufferLabel} · ${controller.receiverAdaptiveBufferLabel}',
           ),
           _SettingValueChip(
             icon: Icons.warning_amber_rounded,
@@ -957,11 +1307,6 @@ class _LiveBufferPreview extends StatelessWidget {
             icon: Icons.block_rounded,
             label: 'Cap',
             value: controller.adaptiveBufferCapLabel,
-          ),
-          _SettingValueChip(
-            icon: Icons.tune_rounded,
-            label: 'Receiver adaptive',
-            value: controller.receiverAdaptiveBufferLabel,
           ),
         ],
       ),
@@ -1007,17 +1352,29 @@ class _AdvancedSection extends StatelessWidget {
             ],
           )
         else
-          GridView.builder(
-            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: columns,
-              crossAxisSpacing: 10,
-              mainAxisSpacing: 10,
-              mainAxisExtent: 128,
-            ),
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemCount: controls.length,
-            itemBuilder: (context, index) => controls[index],
+          LayoutBuilder(
+            builder: (context, constraints) {
+              if (controls.isEmpty) {
+                return const SizedBox.shrink();
+              }
+
+              final columnCount = controls.length < columns
+                  ? controls.length
+                  : columns;
+              const spacing = 10.0;
+              final itemWidth =
+                  (constraints.maxWidth - spacing * (columnCount - 1)) /
+                  columnCount;
+
+              return Wrap(
+                spacing: spacing,
+                runSpacing: spacing,
+                children: [
+                  for (final control in controls)
+                    SizedBox(width: itemWidth, child: control),
+                ],
+              );
+            },
           ),
       ],
     );
@@ -1341,6 +1698,43 @@ class _OutputBackendPicker extends StatelessWidget {
       OutputAudioBackend.wasapiShared ||
       OutputAudioBackend.wasapiExclusive => Icons.desktop_windows_rounded,
     };
+  }
+}
+
+class _ReceiverBufferControl extends StatelessWidget {
+  const _ReceiverBufferControl({
+    required this.controller,
+    required this.locked,
+  });
+
+  final AudioRelayController controller;
+  final bool locked;
+
+  @override
+  Widget build(BuildContext context) {
+    final profile = controller.profile;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _SettingSlider(
+          value: profile.playbackBufferMs.toDouble(),
+          min: AudioProfile.minBufferMs.toDouble(),
+          max: AudioProfile.maxBufferMs.toDouble(),
+          divisions: AudioProfile.maxBufferMs - AudioProfile.minBufferMs,
+          valueLabel: '${profile.playbackBufferMs} ms',
+          detail: controller.receiverBufferDetailLabel,
+          onChanged: locked ? null : controller.updatePlaybackBuffer,
+        ),
+        const SizedBox(height: 8),
+        _SettingSwitch(
+          value: profile.receiverAdaptiveBuffer,
+          valueLabel: controller.receiverAdaptiveBufferLabel,
+          detail: controller.receiverAdaptiveBufferDetailLabel,
+          onChanged: locked ? null : controller.updateReceiverAdaptiveBuffer,
+        ),
+      ],
+    );
   }
 }
 

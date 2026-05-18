@@ -13,6 +13,7 @@ class WindowsAudioEngine {
   ~WindowsAudioEngine();
 
   flutter::EncodableMap GetCapabilities() const;
+  flutter::EncodableList GetSoundboardOutputDevices() const;
   flutter::EncodableList GetNetworkInterfaces() const;
   flutter::EncodableMap GetMetrics() const;
   std::optional<std::string> PrepareSender(
@@ -29,6 +30,11 @@ class WindowsAudioEngine {
   void StopStream();
   void SetVolume(const flutter::EncodableValue* arguments);
   void SetMuted(const flutter::EncodableValue* arguments);
+  std::optional<std::string> PlaySoundEffect(
+      const flutter::EncodableValue* arguments);
+  std::optional<std::string> ConfigureVirtualMicPassthrough(
+      const flutter::EncodableValue* arguments);
+  void StopSoundEffects();
   void Disconnect();
 
  private:

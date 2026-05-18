@@ -69,7 +69,7 @@ enum AudioCodec {
 
   String get label {
     return switch (this) {
-      AudioCodec.auto => 'Auto',
+      AudioCodec.auto => 'Adaptive',
       AudioCodec.pcm => 'PCM',
       AudioCodec.opus => 'Opus',
       AudioCodec.aac => 'AAC',
@@ -99,7 +99,7 @@ enum AudioCodec {
 
   String get availabilityLabel {
     return this == AudioCodec.auto
-        ? 'Automatic'
+        ? 'Adaptive'
         : isImplemented
         ? 'Native required'
         : 'Encoder pending';
@@ -124,6 +124,9 @@ enum AudioCodec {
 
   static AudioCodec fromName(String? value) {
     final normalized = value?.toLowerCase().replaceAll(RegExp(r'[-_\s]'), '');
+    if (normalized == 'adaptive' || normalized == 'automatic') {
+      return AudioCodec.auto;
+    }
     if (normalized == 'aaclc' || normalized == 'acc') {
       return AudioCodec.aac;
     }
@@ -179,6 +182,25 @@ enum OutputAudioBackend {
       (candidate) => candidate.name.toLowerCase() == normalized,
       orElse: () => OutputAudioBackend.auto,
     );
+  }
+}
+
+enum SoundboardPlaybackTarget {
+  stream,
+  micRoute;
+
+  String get label {
+    return switch (this) {
+      SoundboardPlaybackTarget.stream => 'Stream',
+      SoundboardPlaybackTarget.micRoute => 'Mic + speaker',
+    };
+  }
+
+  String get methodValue {
+    return switch (this) {
+      SoundboardPlaybackTarget.stream => 'stream',
+      SoundboardPlaybackTarget.micRoute => 'micRoute',
+    };
   }
 }
 
@@ -623,5 +645,57 @@ class RelayDevice {
       return value;
     }
     return int.tryParse(value?.toString() ?? '') ?? fallback;
+  }
+}
+
+class SoundPlaybackItem {
+  const SoundPlaybackItem({
+    required this.id,
+    required this.name,
+    required this.path,
+  });
+
+  final String id;
+  final String name;
+  final String path;
+}
+
+class SoundboardOutputDevice {
+  const SoundboardOutputDevice({
+    required this.id,
+    required this.name,
+    required this.isDefault,
+    this.isVirtualCable = false,
+  });
+
+  final String id;
+  final String name;
+  final bool isDefault;
+  final bool isVirtualCable;
+
+  factory SoundboardOutputDevice.fromMap(Map<Object?, Object?> payload) {
+    final id = payload['id']?.toString() ?? '';
+    final name = payload['name']?.toString() ?? id;
+    final displayName = name.isEmpty ? 'Audio device' : name;
+    return SoundboardOutputDevice(
+      id: id,
+      name: displayName,
+      isDefault: payload['isDefault'] == true,
+      isVirtualCable:
+          payload['isVirtualCable'] == true ||
+          _looksLikeVirtualCable('$displayName $id'),
+    );
+  }
+
+  static bool _looksLikeVirtualCable(String value) {
+    final label = value.toLowerCase();
+    return label.contains('vb-audio') ||
+        label.contains('virtual audio') ||
+        label.contains('virtual cable') ||
+        label.contains('voicemeeter') ||
+        label.contains('cable input') ||
+        label.contains('cable-a input') ||
+        label.contains('cable-b input') ||
+        label.contains('line 1') && label.contains('virtual');
   }
 }

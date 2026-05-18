@@ -331,7 +331,7 @@ void main() {
       expect(controller.liveLatencyLabel, '18 ms');
       expect(controller.activePlaybackBufferLabel, 'Requested 18 ms');
       expect(controller.playbackQueueFillLabel, '0%');
-      expect(controller.adaptiveBufferCapLabel, '30 ms');
+      expect(controller.adaptiveBufferCapLabel, '24 ms');
 
       controller.dispose();
     },
@@ -544,7 +544,7 @@ void main() {
 
       Future<void> expectBitrateForDroppedPackets(
         int droppedPackets,
-        int expectedKbps,
+        int? expectedKbps,
       ) async {
         engine.calls.clear();
         engine.profiles.clear();
@@ -552,15 +552,22 @@ void main() {
         await controller.pollMetricsForTesting();
         await Future<void>.delayed(Duration.zero);
 
+        if (expectedKbps == null) {
+          expect(engine.calls, isEmpty);
+          expect(controller.streamBitrateLabel, '256 kbps');
+          return;
+        }
+
         expect(engine.calls, ['prepareSender']);
         expect(engine.profiles.single.bitrateKbps, expectedKbps);
         expect(controller.streamBitrateLabel, '$expectedKbps kbps');
       }
 
-      await expectBitrateForDroppedPackets(1, 152);
-      await expectBitrateForDroppedPackets(7, 136);
-      await expectBitrateForDroppedPackets(19, 112);
-      await expectBitrateForDroppedPackets(43, 64);
+      await expectBitrateForDroppedPackets(1, null);
+      await expectBitrateForDroppedPackets(7, 232);
+      await expectBitrateForDroppedPackets(19, 208);
+      await expectBitrateForDroppedPackets(43, 160);
+      await expectBitrateForDroppedPackets(83, 64);
 
       controller.dispose();
     },
@@ -593,7 +600,7 @@ void main() {
 
     expect(controller.profile.adaptiveBitrate, true);
     expect(engine.startedProfiles.single.adaptiveBitrate, false);
-    expect(engine.startedProfiles.single.bitrateKbps, 160);
+    expect(engine.startedProfiles.single.bitrateKbps, 256);
     expect(controller.bitrateSettingDetailLabel, contains('64-256 kbps'));
 
     engine.metrics = AudioRelayMetrics.empty;
@@ -607,8 +614,8 @@ void main() {
     await Future<void>.delayed(Duration.zero);
 
     expect(engine.calls, ['prepareSender']);
-    expect(engine.profiles.single.bitrateKbps, 112);
-    expect(controller.streamBitrateLabel, '112 kbps');
+    expect(engine.profiles.single.bitrateKbps, 208);
+    expect(controller.streamBitrateLabel, '208 kbps');
 
     engine.calls.clear();
     engine.profiles.clear();
@@ -618,8 +625,8 @@ void main() {
     }
 
     expect(engine.calls, ['prepareSender']);
-    expect(engine.profiles.single.bitrateKbps, 136);
-    expect(controller.streamBitrateLabel, '136 kbps');
+    expect(engine.profiles.single.bitrateKbps, 232);
+    expect(controller.streamBitrateLabel, '232 kbps');
 
     controller.dispose();
   });
@@ -649,18 +656,23 @@ void main() {
     controller.updateAdaptiveBitrate(true);
     await controller.startSenderStream();
 
+    engine.metrics = AudioRelayMetrics.empty;
+    await controller.pollMetricsForTesting();
+    await Future<void>.delayed(Duration.zero);
+
     engine.calls.clear();
     engine.profiles.clear();
     engine.metrics = const AudioRelayMetrics(
       adaptiveLimitReached: true,
       adaptiveUnderrunsInWindow: 4,
       adaptiveLowQueueSamples: 3,
+      trimCount: 12,
     );
     await controller.pollMetricsForTesting();
     await Future<void>.delayed(Duration.zero);
 
     expect(engine.calls, isEmpty);
-    expect(controller.streamBitrateLabel, '160 kbps');
+    expect(controller.streamBitrateLabel, '256 kbps');
 
     controller.dispose();
   });
@@ -814,8 +826,10 @@ void main() {
 
   test('auto codec is a controller policy, not a packet codec', () {
     expect(AudioCodec.auto.isImplemented, true);
+    expect(AudioCodec.auto.label, 'Adaptive');
     expect(AudioCodec.auto.packetId, -1);
     expect(AudioCodec.fromName('auto'), AudioCodec.auto);
+    expect(AudioCodec.fromName('adaptive'), AudioCodec.auto);
     expect(AudioCodec.fromPacketId(-1), AudioCodec.pcm);
   });
 
@@ -1084,7 +1098,7 @@ void main() {
       expect(controller.profile.codec, AudioCodec.auto);
       expect(engine.profiles.first.codec, AudioCodec.opus);
       expect(engine.startedProfiles.single.codec, AudioCodec.opus);
-      expect(controller.codecStatusLabel, 'Auto (Opus)');
+      expect(controller.codecStatusLabel, 'Adaptive (Opus)');
       expect(controller.streamBitrateLabel, '256 kbps');
 
       controller.dispose();
@@ -1125,7 +1139,7 @@ void main() {
       expect(controller.profile.codec, AudioCodec.auto);
       expect(engine.profiles.first.codec, AudioCodec.imaAdpcm);
       expect(engine.startedProfiles.single.codec, AudioCodec.imaAdpcm);
-      expect(controller.codecStatusLabel, 'Auto (IMA ADPCM)');
+      expect(controller.codecStatusLabel, 'Adaptive (IMA ADPCM)');
 
       controller.dispose();
     },
@@ -1171,7 +1185,7 @@ void main() {
       expect(engine.calls, ['prepareSender']);
       expect(engine.profiles.single.codec, AudioCodec.opus);
       expect(discoveryService.advertisedProfiles.single.codec, AudioCodec.opus);
-      expect(controller.codecStatusLabel, 'Auto (Opus)');
+      expect(controller.codecStatusLabel, 'Adaptive (Opus)');
 
       controller.dispose();
     },
@@ -1231,7 +1245,7 @@ void main() {
       expect(engine.profiles.single.codec, AudioCodec.opus);
       expect(discoveryService.advertisedProfiles.single.codec, AudioCodec.opus);
       expect(controller.profile.codec, AudioCodec.auto);
-      expect(controller.codecStatusLabel, 'Auto (Opus)');
+      expect(controller.codecStatusLabel, 'Adaptive (Opus)');
 
       controller.dispose();
     },
@@ -1270,7 +1284,123 @@ void main() {
     await Future<void>.delayed(Duration.zero);
 
     expect(engine.calls, isEmpty);
-    expect(controller.codecStatusLabel, 'Auto (PCM)');
+    expect(controller.codecStatusLabel, 'Adaptive (PCM)');
+
+    controller.dispose();
+  });
+
+  test(
+    'soundboard queues selected sound into an active sender stream',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final controller = AudioRelayController(engine: engine)
+        ..role = RelayRole.sender
+        ..capabilities = _soundboardCapabilities;
+      const soundPath = r'C:\sounds\airhorn.mp3';
+
+      controller.addSoundboardFiles([soundPath]);
+      controller.updateSoundboardTarget(SoundboardPlaybackTarget.stream);
+
+      expect(controller.selectedSoundboardItem?.name, 'airhorn.mp3');
+      expect(controller.canPlaySelectedSound, false);
+
+      await controller.playSelectedSoundboardItem();
+
+      expect(engine.soundEffectPaths, isEmpty);
+      expect(controller.soundboardMessage, 'Start sender streaming first.');
+
+      await controller.startSenderStream();
+      engine.calls.clear();
+      controller.updateSoundboardVolume(0.5);
+      await controller.playSelectedSoundboardItem();
+
+      expect(engine.calls, ['playSoundEffect']);
+      expect(engine.soundEffectPaths, [soundPath]);
+      expect(engine.soundEffectVolumes, [0.5]);
+      expect(engine.soundEffectTargets, [SoundboardPlaybackTarget.stream]);
+
+      controller.dispose();
+    },
+  );
+
+  test('soundboard mic route can play without sender streaming', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..capabilities = _soundboardCapabilities;
+    controller.selectSoundboardOutputDevice('route-1');
+    const soundPath = r'C:\sounds\airhorn.mp3';
+
+    controller.addSoundboardFiles([soundPath]);
+    await controller.playSelectedSoundboardItem();
+
+    expect(engine.virtualMicPassthroughEnabled, [true]);
+    expect(engine.virtualMicPassthroughOutputDeviceIds, ['route-1']);
+    expect(engine.calls, ['playSoundEffect']);
+    expect(engine.soundEffectTargets, [SoundboardPlaybackTarget.micRoute]);
+    expect(engine.soundEffectOutputDeviceIds, ['route-1']);
+
+    controller.dispose();
+  });
+
+  test('soundboard virtual mic bridges the real microphone into the route', () {
+    final engine = _FakeAudioRelayEngine();
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..capabilities = _soundboardCapabilities;
+
+    controller.selectSoundboardOutputDevice('route-1');
+    controller.updateSoundboardTarget(SoundboardPlaybackTarget.stream);
+    controller.updateSoundboardTarget(SoundboardPlaybackTarget.micRoute);
+
+    expect(engine.virtualMicPassthroughEnabled, [true, false, true]);
+    expect(engine.virtualMicPassthroughOutputDeviceIds, [
+      'route-1',
+      null,
+      'route-1',
+    ]);
+
+    controller.dispose();
+  });
+
+  test('soundboard virtual mic hides physical output devices', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..capabilities = _soundboardPhysicalOnlyCapabilities;
+    const soundPath = r'C:\sounds\airhorn.mp3';
+
+    controller.addSoundboardFiles([soundPath]);
+
+    expect(controller.soundboardOutputDevices, isEmpty);
+    expect(controller.canPlaySelectedSound, false);
+    expect(controller.soundboardStatusLabel, 'Needs call mic');
+
+    await controller.playSelectedSoundboardItem();
+
+    expect(engine.calls, isEmpty);
+    expect(controller.soundboardMessage, 'Install or enable VB-CABLE first.');
+
+    controller.dispose();
+  });
+
+  test('soundboard virtual mic prefers direct cable routes', () {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
+      ..role = RelayRole.sender
+      ..capabilities = _soundboardMixedVirtualCapabilities;
+
+    expect(controller.soundboardOutputDevices, hasLength(1));
+    expect(controller.soundboardOutputDevices.single.id, 'cable-2');
+    expect(
+      controller.soundboardOutputDevices.single.name,
+      'CABLE Input (VB-Audio Virtual Cable)',
+    );
+    expect(
+      controller.callMicrophoneNameForSoundboardRoute(
+        controller.soundboardOutputDevices.single,
+      ),
+      'CABLE Output (VB-Audio Virtual Cable)',
+    );
 
     controller.dispose();
   });
@@ -1715,6 +1845,74 @@ const _adaptiveCodecCapabilities = PlatformAudioCapabilities(
   },
 );
 
+const _soundboardCapabilities = PlatformAudioCapabilities(
+  platform: 'windows',
+  canSend: true,
+  canReceive: true,
+  backend: 'fake',
+  supportedCodecs: {AudioCodec.pcm},
+  supportedOutputBackends: {OutputAudioBackend.auto},
+  codecBitrateRanges: {},
+  soundboardOutputDevices: [
+    SoundboardOutputDevice(
+      id: 'route-1',
+      name: 'CABLE Input',
+      isDefault: true,
+      isVirtualCable: true,
+    ),
+  ],
+  canPlaySoundEffects: true,
+);
+
+const _soundboardPhysicalOnlyCapabilities = PlatformAudioCapabilities(
+  platform: 'windows',
+  canSend: true,
+  canReceive: true,
+  backend: 'fake',
+  supportedCodecs: {AudioCodec.pcm},
+  supportedOutputBackends: {OutputAudioBackend.auto},
+  codecBitrateRanges: {},
+  soundboardOutputDevices: [
+    SoundboardOutputDevice(
+      id: 'speakers-1',
+      name: 'Speakers (Realtek(R) Audio)',
+      isDefault: true,
+    ),
+  ],
+  canPlaySoundEffects: true,
+);
+
+const _soundboardMixedVirtualCapabilities = PlatformAudioCapabilities(
+  platform: 'windows',
+  canSend: true,
+  canReceive: true,
+  backend: 'fake',
+  supportedCodecs: {AudioCodec.pcm},
+  supportedOutputBackends: {OutputAudioBackend.auto},
+  codecBitrateRanges: {},
+  soundboardOutputDevices: [
+    SoundboardOutputDevice(
+      id: 'voicemeeter-1',
+      name: 'Speakers (VB-Audio Voicemeeter VAIO)',
+      isDefault: true,
+      isVirtualCable: true,
+    ),
+    SoundboardOutputDevice(
+      id: 'cable-2',
+      name: 'CABLE Input (VB-Audio Virtual Cable)',
+      isDefault: false,
+      isVirtualCable: true,
+    ),
+    SoundboardOutputDevice(
+      id: 'cable-1',
+      name: 'CABLE In 16 Ch (VB-Audio Virtual Cable)',
+      isDefault: false,
+      isVirtualCable: true,
+    ),
+  ],
+  canPlaySoundEffects: true,
+);
+
 class _FakeAudioRelayEngine implements AudioRelayEngine {
   _FakeAudioRelayEngine({this.prepareUsbError});
 
@@ -1724,6 +1922,12 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   final List<AudioProfile> startedProfiles = [];
   final List<AudioProfile> connectedProfiles = [];
   final List<String?> senderBindAddresses = [];
+  final List<String> soundEffectPaths = [];
+  final List<double> soundEffectVolumes = [];
+  final List<SoundboardPlaybackTarget> soundEffectTargets = [];
+  final List<String?> soundEffectOutputDeviceIds = [];
+  final List<bool> virtualMicPassthroughEnabled = [];
+  final List<String?> virtualMicPassthroughOutputDeviceIds = [];
   AudioRelayMetrics metrics = AudioRelayMetrics.empty;
 
   @override
@@ -1781,6 +1985,34 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
 
   @override
   Future<void> setVolume(double value) async {}
+
+  @override
+  Future<void> playSoundEffect({
+    required String path,
+    required double volume,
+    required SoundboardPlaybackTarget target,
+    String? outputDeviceId,
+  }) async {
+    calls.add('playSoundEffect');
+    soundEffectPaths.add(path);
+    soundEffectVolumes.add(volume);
+    soundEffectTargets.add(target);
+    soundEffectOutputDeviceIds.add(outputDeviceId);
+  }
+
+  @override
+  Future<void> configureVirtualMicPassthrough({
+    required bool enabled,
+    String? outputDeviceId,
+  }) async {
+    virtualMicPassthroughEnabled.add(enabled);
+    virtualMicPassthroughOutputDeviceIds.add(outputDeviceId);
+  }
+
+  @override
+  Future<void> stopSoundEffects() async {
+    calls.add('stopSoundEffects');
+  }
 
   @override
   Future<void> startStream(AudioProfile profile) async {

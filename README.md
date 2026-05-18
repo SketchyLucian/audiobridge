@@ -32,6 +32,9 @@ audio engines.
 - Android `AudioTrack` playback backend for UDP audio packets
 - Android `AudioRecord` microphone capture backend for UDP audio packets
 - Windows WASAPI loopback capture backend for UDP audio packets
+- Windows sender soundboard panel that can queue local audio files into the
+  active outgoing stream or feed an installed virtual microphone cable such as
+  `CABLE Input`.
 
 The native audio capture/playback engines are isolated behind
 `audio_bridge/native_engine`. The working native codec paths are PCM, Opus,
@@ -110,6 +113,17 @@ prompt. Wi-Fi mode still uses LAN discovery and UDP audio. Windows may need the
 Android accessory interface bound to the WinUSB driver before native USB can
 open.
 
+For call-app soundboard use on Windows, install or enable a virtual microphone
+driver such as VB-CABLE or Voicemeeter. Windows does not allow a normal app to
+write into a physical microphone like `Microphone (Realtek(R) Audio)`. Select
+the virtual cable playback side such as `CABLE Input` as the Soundboard
+`Virtual mic` feed, then select the matching recording side such as
+`CABLE Output` as the microphone inside Discord, Zoom, or the game voice chat.
+The in-repo path for building an AudioBridge-owned virtual microphone driver is
+documented in `windows/virtual_mic/README.md`. That driver path requires the
+Windows Driver Kit driver toolsets and driver signing; it is separate from the
+normal Flutter debug run.
+
 ## Native Engine Contract
 
 Flutter calls the `audio_bridge/native_engine` method channel:
@@ -125,14 +139,17 @@ Flutter calls the `audio_bridge/native_engine` method channel:
 - `stopStream`
 - `setVolume`
 - `setMuted`
+- `playSoundEffect`
+- `stopSoundEffects`
 - `disconnect`
 
 Implemented behind that channel:
 
-- Windows: WASAPI loopback capture, PCM16 conversion, PCM/G.711/IMA ADPCM
-  encoding, receiver playback, UDP packet streaming, USB tethering via the
-  normal UDP path, and Android Open Accessory USB bulk streaming in sender or
-  receiver role.
+- Windows: WASAPI loopback capture, soundboard file decode/mix via Media
+  Foundation, optional soundboard render to a selected virtual-mic cable feed,
+  PCM16 conversion, PCM/Opus/AAC-LC/G.711/IMA ADPCM encoding, receiver
+  playback, UDP packet streaming, USB tethering via the normal UDP path, and
+  Android Open Accessory USB bulk streaming in sender or receiver role.
 - Android: microphone capture sender over Wi-Fi/USB tethering, receiver
   subscription, UDP packet receive loop, adaptive `AudioTrack` playback,
   PCM/G.711/IMA ADPCM encoding and decoding, USB tethering via the normal UDP
