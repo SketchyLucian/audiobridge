@@ -34,7 +34,7 @@ Invoke-DevStep 'Test' { flutter test }
 Invoke-DevStep 'Android native unit tests' {
     Push-Location (Join-Path $repoRoot 'android')
     try {
-        .\gradlew.bat testDebugUnitTest
+        .\gradlew.bat :app:testDebugUnitTest
     } finally {
         Pop-Location
     }
