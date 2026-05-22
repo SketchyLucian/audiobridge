@@ -31,6 +31,14 @@ function Invoke-DevStep {
 Invoke-DevStep 'Install dependencies' { flutter pub get }
 Invoke-DevStep 'Analyze' { flutter analyze }
 Invoke-DevStep 'Test' { flutter test }
+Invoke-DevStep 'Android native unit tests' {
+    Push-Location (Join-Path $repoRoot 'android')
+    try {
+        .\gradlew.bat testDebugUnitTest
+    } finally {
+        Pop-Location
+    }
+}
 
 if ($SkipWindowsBuild) {
     Write-Host ''

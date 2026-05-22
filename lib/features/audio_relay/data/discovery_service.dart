@@ -41,17 +41,20 @@ class DiscoveryNetworkInterface {
     required this.addresses,
     this.description,
     this.index,
+    this.addressMetadata = const [],
   });
 
   final String name;
   final String? description;
   final int? index;
   final List<InternetAddress> addresses;
+  final List<DiscoveryNetworkAddress> addressMetadata;
 
   factory DiscoveryNetworkInterface.fromPlatformMap(
     Map<Object?, Object?> payload,
   ) {
     final addresses = payload['addresses'];
+    final addressMetadata = payload['addressMetadata'];
     return DiscoveryNetworkInterface(
       name: payload['name']?.toString() ?? '',
       description: payload['description']?.toString(),
@@ -61,6 +64,41 @@ class DiscoveryNetworkInterface {
           for (final address in addresses)
             if (address != null) InternetAddress(address.toString()),
       ],
+      addressMetadata: [
+        if (addressMetadata is List)
+          for (final item in addressMetadata)
+            if (item is Map && item['address'] != null)
+              DiscoveryNetworkAddress.fromPlatformMap(
+                item.cast<Object?, Object?>(),
+              ),
+      ],
+    );
+  }
+}
+
+class DiscoveryNetworkAddress {
+  const DiscoveryNetworkAddress({
+    required this.address,
+    this.prefixLength,
+    this.broadcastAddress,
+  });
+
+  final InternetAddress address;
+  final int? prefixLength;
+  final InternetAddress? broadcastAddress;
+
+  factory DiscoveryNetworkAddress.fromPlatformMap(
+    Map<Object?, Object?> payload,
+  ) {
+    final prefixLength = payload['prefixLength'];
+    final broadcastAddress = payload['broadcastAddress']?.toString();
+    return DiscoveryNetworkAddress(
+      address: InternetAddress(payload['address'].toString()),
+      prefixLength: prefixLength is int ? prefixLength : null,
+      broadcastAddress:
+          broadcastAddress == null || broadcastAddress.trim().isEmpty
+          ? null
+          : InternetAddress(broadcastAddress),
     );
   }
 }
@@ -80,11 +118,11 @@ class DiscoveryService {
   List<StreamSubscription<RawSocketEvent>> _advertiseSubscriptions = const [];
   List<RawDatagramSocket> _advertiseSendSockets = const [];
   List<InternetAddress> _advertiseTargets = const [];
-  List<InternetAddress> _advertiseScopeAddresses = const [];
+  List<DiscoveryNetworkAddress> _advertiseScopeAddresses = const [];
   List<RawDatagramSocket> _scanReceiveSockets = const [];
   List<RawDatagramSocket> _scanSendSockets = const [];
   List<StreamSubscription<RawSocketEvent>> _scanSubscriptions = const [];
-  List<InternetAddress> _scanScopeAddresses = const [];
+  List<DiscoveryNetworkAddress> _scanScopeAddresses = const [];
   Timer? _beaconTimer;
   Timer? _scanProbeTimer;
 
@@ -93,7 +131,7 @@ class DiscoveryService {
   }) async {
     final addresses = await _localIPv4Addresses(scope);
     if (addresses.isNotEmpty) {
-      return addresses.first.address;
+      return addresses.first.address.address;
     }
 
     return scope.missingAddressLabel;
@@ -211,7 +249,7 @@ class DiscoveryService {
 
   Future<List<RawDatagramSocket>> _openReceiveSockets(
     DiscoveryNetworkScope scope,
-    List<InternetAddress> scopeAddresses,
+    List<DiscoveryNetworkAddress> scopeAddresses,
   ) async {
     final sockets = <RawDatagramSocket>[];
     for (final address in _receiveBindAddresses(scope, scopeAddresses)) {
@@ -231,12 +269,31 @@ class DiscoveryService {
     DiscoveryNetworkScope scope,
     List<InternetAddress> scopeAddresses,
   ) {
-    return _receiveBindAddresses(scope, scopeAddresses);
+    return _receiveBindAddresses(scope, [
+      for (final address in scopeAddresses)
+        DiscoveryNetworkAddress(address: address),
+    ]);
+  }
+
+  @visibleForTesting
+  InternetAddress? debugDirectedBroadcastAddress(
+    DiscoveryNetworkAddress address,
+  ) {
+    final broadcastAddress = _directedBroadcastAddress(address);
+    return broadcastAddress == null ? null : InternetAddress(broadcastAddress);
+  }
+
+  @visibleForTesting
+  bool debugSourceMatchesScope(
+    InternetAddress source,
+    List<DiscoveryNetworkAddress> scopeAddresses,
+  ) {
+    return _sourceMatchesScope(source, scopeAddresses);
   }
 
   List<InternetAddress> _receiveBindAddresses(
     DiscoveryNetworkScope scope,
-    List<InternetAddress> scopeAddresses,
+    List<DiscoveryNetworkAddress> scopeAddresses,
   ) {
     if (scope == DiscoveryNetworkScope.all || scopeAddresses.isNotEmpty) {
       // Broadcast packets sent to a network's directed broadcast address are
@@ -248,13 +305,13 @@ class DiscoveryService {
   }
 
   Future<List<RawDatagramSocket>> _openInterfaceSendSockets(
-    List<InternetAddress> addresses,
+    List<DiscoveryNetworkAddress> addresses,
   ) async {
     final sockets = <RawDatagramSocket>[];
-    for (final address in addresses) {
+    for (final networkAddress in addresses) {
       try {
         final socket = await RawDatagramSocket.bind(
-          address,
+          networkAddress.address,
           0,
           reuseAddress: true,
         );
@@ -270,7 +327,7 @@ class DiscoveryService {
   }
 
   Future<List<InternetAddress>> _broadcastTargets(
-    List<InternetAddress> addresses,
+    List<DiscoveryNetworkAddress> addresses,
   ) async {
     final targets = <String>{InternetAddress('255.255.255.255').address};
     for (final address in addresses) {
@@ -282,7 +339,7 @@ class DiscoveryService {
     return [for (final target in targets) InternetAddress(target)];
   }
 
-  Future<List<InternetAddress>> _localIPv4Addresses(
+  Future<List<DiscoveryNetworkAddress>> _localIPv4Addresses(
     DiscoveryNetworkScope scope,
   ) async {
     final interfaces = await _loadNetworkInterfaces();
@@ -290,7 +347,8 @@ class DiscoveryService {
     return [
       for (final networkInterface in scopedInterfaces)
         for (final address in networkInterface.addresses)
-          if (_isUsableIPv4Address(address)) address,
+          if (_isUsableIPv4Address(address))
+            _networkAddressFor(networkInterface, address),
     ];
   }
 
@@ -318,6 +376,18 @@ class DiscoveryService {
           addresses: networkInterface.addresses,
         ),
     ];
+  }
+
+  DiscoveryNetworkAddress _networkAddressFor(
+    DiscoveryNetworkInterface networkInterface,
+    InternetAddress address,
+  ) {
+    for (final metadata in networkInterface.addressMetadata) {
+      if (metadata.address.address == address.address) {
+        return metadata;
+      }
+    }
+    return DiscoveryNetworkAddress(address: address);
   }
 
   Future<List<DiscoveryNetworkInterface>>
@@ -516,23 +586,66 @@ class DiscoveryService {
     return _scanReceiveSockets;
   }
 
-  String? _directedBroadcastAddress(InternetAddress address) {
+  String? _directedBroadcastAddress(DiscoveryNetworkAddress networkAddress) {
+    final explicitBroadcast = networkAddress.broadcastAddress;
+    if (explicitBroadcast != null &&
+        explicitBroadcast.type == InternetAddressType.IPv4) {
+      return explicitBroadcast.address;
+    }
+
+    final prefixLength = networkAddress.prefixLength;
+    final addressValue = _ipv4ToInt(networkAddress.address);
+    if (prefixLength == null || addressValue == null) {
+      return _classCBroadcastAddress(networkAddress.address);
+    }
+    if (prefixLength < 0 || prefixLength > 32) {
+      return null;
+    }
+
+    final mask = prefixLength == 0
+        ? 0
+        : (0xFFFFFFFF << (32 - prefixLength)) & 0xFFFFFFFF;
+    final broadcast = (addressValue | (~mask & 0xFFFFFFFF)) & 0xFFFFFFFF;
+    return _ipv4FromInt(broadcast).address;
+  }
+
+  bool _sourceMatchesScope(
+    InternetAddress source,
+    List<DiscoveryNetworkAddress> scopeAddresses,
+  ) {
+    if (scopeAddresses.isEmpty) {
+      return true;
+    }
+    return scopeAddresses.any((address) => _sameSubnet(address, source));
+  }
+
+  bool _sameSubnet(
+    DiscoveryNetworkAddress networkAddress,
+    InternetAddress source,
+  ) {
+    final prefixLength = networkAddress.prefixLength;
+    final left = _ipv4ToInt(networkAddress.address);
+    final right = _ipv4ToInt(source);
+    if (prefixLength == null || left == null || right == null) {
+      return _sameClassCSubnet(networkAddress.address, source);
+    }
+    if (prefixLength < 0 || prefixLength > 32) {
+      return false;
+    }
+
+    final mask = prefixLength == 0
+        ? 0
+        : (0xFFFFFFFF << (32 - prefixLength)) & 0xFFFFFFFF;
+    return (left & mask) == (right & mask);
+  }
+
+  String? _classCBroadcastAddress(InternetAddress address) {
     final octets = address.address.split('.');
     if (octets.length != 4 ||
         octets.any((octet) => int.tryParse(octet) == null)) {
       return null;
     }
     return '${octets[0]}.${octets[1]}.${octets[2]}.255';
-  }
-
-  bool _sourceMatchesScope(
-    InternetAddress source,
-    List<InternetAddress> scopeAddresses,
-  ) {
-    if (scopeAddresses.isEmpty) {
-      return true;
-    }
-    return scopeAddresses.any((address) => _sameClassCSubnet(address, source));
   }
 
   bool _sameClassCSubnet(InternetAddress left, InternetAddress right) {
@@ -544,6 +657,33 @@ class DiscoveryService {
     return leftOctets[0] == rightOctets[0] &&
         leftOctets[1] == rightOctets[1] &&
         leftOctets[2] == rightOctets[2];
+  }
+
+  int? _ipv4ToInt(InternetAddress address) {
+    if (address.type != InternetAddressType.IPv4) {
+      return null;
+    }
+    final octets = address.address.split('.');
+    if (octets.length != 4) {
+      return null;
+    }
+
+    var value = 0;
+    for (final octet in octets) {
+      final parsed = int.tryParse(octet);
+      if (parsed == null || parsed < 0 || parsed > 255) {
+        return null;
+      }
+      value = (value << 8) | parsed;
+    }
+    return value;
+  }
+
+  InternetAddress _ipv4FromInt(int value) {
+    return InternetAddress(
+      '${(value >> 24) & 0xFF}.${(value >> 16) & 0xFF}.'
+      '${(value >> 8) & 0xFF}.${value & 0xFF}',
+    );
   }
 
   bool _isDiscoveryProbe(List<int> data) {

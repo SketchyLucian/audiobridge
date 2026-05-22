@@ -5,8 +5,20 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+val releaseTaskRequested = gradle.startParameter.taskNames.any { taskName ->
+    taskName.contains("Release", ignoreCase = true)
+}
+
+fun requiredReleaseSigningValue(name: String): String {
+    val value = System.getenv(name)
+    if (value.isNullOrBlank()) {
+        throw GradleException("Android release signing requires the $name environment variable.")
+    }
+    return value
+}
+
 android {
-    namespace = "com.example.audiorelay_clone"
+    namespace = "com.audiobridge.app"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -20,10 +32,7 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.audiorelay_clone"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
+        applicationId = "com.audiobridge.app"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
@@ -49,11 +58,20 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            if (releaseTaskRequested) {
+                storeFile = file(requiredReleaseSigningValue("ANDROID_KEYSTORE_PATH"))
+                storePassword = requiredReleaseSigningValue("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = requiredReleaseSigningValue("ANDROID_KEY_ALIAS")
+                keyPassword = requiredReleaseSigningValue("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 }

@@ -1,4 +1,4 @@
-package com.example.audiorelay_clone
+package com.audiobridge.app
 
 import android.Manifest
 import android.app.PendingIntent
@@ -314,7 +314,9 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun startAudioRelayService() {
-        val intent = Intent(this, AudioRelayForegroundService::class.java)
+        val intent = Intent(this, AudioRelayForegroundService::class.java).apply {
+            action = AudioRelayForegroundService.ACTION_START_STREAM
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
         } else {
@@ -384,6 +386,27 @@ class MainActivity : FlutterActivity() {
                 emptyList()
             }
 
+            val addressMetadata = try {
+                item.interfaceAddresses.mapNotNull { interfaceAddress ->
+                    val address = interfaceAddress.address as? Inet4Address
+                        ?: return@mapNotNull null
+                    val hostAddress = address.hostAddress?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+                    buildMap<String, Any> {
+                        put("address", hostAddress)
+                        put(
+                            "prefixLength",
+                            interfaceAddress.networkPrefixLength.toInt().coerceIn(0, 32)
+                        )
+                        interfaceAddress.broadcast?.hostAddress
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { put("broadcastAddress", it) }
+                    }
+                }
+            } catch (_: Exception) {
+                emptyList()
+            }
+
             if (addresses.isEmpty()) {
                 return@mapNotNull null
             }
@@ -392,7 +415,8 @@ class MainActivity : FlutterActivity() {
                 "name" to item.name,
                 "description" to item.displayName,
                 "index" to item.index,
-                "addresses" to addresses
+                "addresses" to addresses,
+                "addressMetadata" to addressMetadata
             )
         }
     }
@@ -400,6 +424,6 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val STREAM_PERMISSION_REQUEST_CODE = 47885
         private const val USB_PERMISSION_ACTION =
-            "com.example.audiorelay_clone.USB_PERMISSION"
+            "com.audiobridge.app.USB_PERMISSION"
     }
 }

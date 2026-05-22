@@ -35,8 +35,8 @@ EncoderHandle* ToEncoderHandle(jlong value) {
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_example_audiorelay_1clone_OpusNative_createDecoder(JNIEnv*, jobject,
-                                                            jint channels) {
+Java_com_audiobridge_app_OpusNative_createDecoder(JNIEnv*, jobject,
+                                                  jint channels) {
   const int clamped_channels = std::clamp(static_cast<int>(channels), 1,
                                           kMaxChannels);
   int error = OPUS_OK;
@@ -53,11 +53,11 @@ Java_com_example_audiorelay_1clone_OpusNative_createDecoder(JNIEnv*, jobject,
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL
-Java_com_example_audiorelay_1clone_OpusNative_decode(JNIEnv* env, jobject,
-                                                     jlong handle_value,
-                                                     jbyteArray input,
-                                                     jint offset,
-                                                     jint size) {
+Java_com_audiobridge_app_OpusNative_decode(JNIEnv* env, jobject,
+                                           jlong handle_value,
+                                           jbyteArray input,
+                                           jint offset,
+                                           jint size) {
   DecoderHandle* handle = ToDecoderHandle(handle_value);
   if (handle == nullptr || handle->decoder == nullptr || input == nullptr ||
       offset < 0 || size <= 0) {
@@ -95,8 +95,8 @@ Java_com_example_audiorelay_1clone_OpusNative_decode(JNIEnv* env, jobject,
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_audiorelay_1clone_OpusNative_destroyDecoder(JNIEnv*, jobject,
-                                                             jlong handle_value) {
+Java_com_audiobridge_app_OpusNative_destroyDecoder(JNIEnv*, jobject,
+                                                   jlong handle_value) {
   DecoderHandle* handle = ToDecoderHandle(handle_value);
   if (handle == nullptr) {
     return;
@@ -108,7 +108,7 @@ Java_com_example_audiorelay_1clone_OpusNative_destroyDecoder(JNIEnv*, jobject,
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_example_audiorelay_1clone_OpusNative_createEncoder(
+Java_com_audiobridge_app_OpusNative_createEncoder(
     JNIEnv*, jobject, jint channels, jint bitrate_bps, jboolean low_delay) {
   const int clamped_channels = std::clamp(static_cast<int>(channels), 1,
                                           kMaxChannels);
@@ -137,10 +137,10 @@ Java_com_example_audiorelay_1clone_OpusNative_createEncoder(
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL
-Java_com_example_audiorelay_1clone_OpusNative_encode(JNIEnv* env, jobject,
-                                                     jlong handle_value,
-                                                     jshortArray input,
-                                                     jint frame_samples) {
+Java_com_audiobridge_app_OpusNative_encode(JNIEnv* env, jobject,
+                                           jlong handle_value,
+                                           jshortArray input,
+                                           jint frame_samples) {
   EncoderHandle* handle = ToEncoderHandle(handle_value);
   if (handle == nullptr || handle->encoder == nullptr || input == nullptr ||
       frame_samples <= 0 || frame_samples > kMaxFrameSamples) {
@@ -178,8 +178,8 @@ Java_com_example_audiorelay_1clone_OpusNative_encode(JNIEnv* env, jobject,
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_audiorelay_1clone_OpusNative_destroyEncoder(JNIEnv*, jobject,
-                                                             jlong handle_value) {
+Java_com_audiobridge_app_OpusNative_destroyEncoder(JNIEnv*, jobject,
+                                                   jlong handle_value) {
   EncoderHandle* handle = ToEncoderHandle(handle_value);
   if (handle == nullptr) {
     return;

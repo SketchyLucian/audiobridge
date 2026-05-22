@@ -1,4 +1,4 @@
-package com.example.audiorelay_clone
+package com.audiobridge.app
 
 import org.junit.Assert.assertEquals
 import org.junit.Test

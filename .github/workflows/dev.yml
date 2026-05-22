@@ -29,6 +29,10 @@ jobs:
       - name: Test
         run: flutter test
 
+      - name: Android native unit tests
+        working-directory: android
+        run: .\gradlew.bat testDebugUnitTest
+
       - name: Build Windows debug app
         run: flutter build windows --debug
 

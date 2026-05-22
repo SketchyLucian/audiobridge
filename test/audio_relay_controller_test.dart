@@ -1032,6 +1032,52 @@ void main() {
     expect(wifiBindAddresses.single.address, InternetAddress.anyIPv4.address);
   });
 
+  test('cidr discovery computes non-class-c broadcast targets', () {
+    final service = DiscoveryService();
+    final address = DiscoveryNetworkAddress(
+      address: InternetAddress('172.16.5.9'),
+      prefixLength: 16,
+    );
+
+    expect(
+      service.debugDirectedBroadcastAddress(address)?.address,
+      '172.16.255.255',
+    );
+    expect(
+      service.debugSourceMatchesScope(InternetAddress('172.16.99.2'), [
+        address,
+      ]),
+      true,
+    );
+    expect(
+      service.debugSourceMatchesScope(InternetAddress('172.17.1.2'), [address]),
+      false,
+    );
+  });
+
+  test('cidr discovery handles twenty-bit prefixes', () {
+    final service = DiscoveryService();
+    final address = DiscoveryNetworkAddress(
+      address: InternetAddress('10.20.16.8'),
+      prefixLength: 20,
+    );
+
+    expect(
+      service.debugDirectedBroadcastAddress(address)?.address,
+      '10.20.31.255',
+    );
+    expect(
+      service.debugSourceMatchesScope(InternetAddress('10.20.31.99'), [
+        address,
+      ]),
+      true,
+    );
+    expect(
+      service.debugSourceMatchesScope(InternetAddress('10.20.32.1'), [address]),
+      false,
+    );
+  });
+
   test('wifi discovery uses datagram source host', () {
     final device = RelayDevice.fromDiscoveryMap({
       'type': 'audiobridge.source',
@@ -1250,6 +1296,51 @@ void main() {
       expect(engine.profiles.single.codec, AudioCodec.opus);
       expect(discoveryService.advertisedProfiles.single.codec, AudioCodec.opus);
       expect(controller.codecStatusLabel, 'Adaptive (Opus)');
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'manual codec falls back to pcm when receiver does not support it',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final discoveryService = _FakeDiscoveryService();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: discoveryService,
+              profileApplyDelay: Duration.zero,
+            )
+            ..role = RelayRole.sender
+            ..capabilities = const PlatformAudioCapabilities(
+              platform: 'test',
+              canSend: true,
+              canReceive: true,
+              backend: 'fake',
+              supportedCodecs: {AudioCodec.pcm, AudioCodec.opus},
+              supportedOutputBackends: {OutputAudioBackend.auto},
+              codecBitrateRanges: {},
+            );
+
+      controller.updateCodec(AudioCodec.opus);
+      await controller.startSenderStream();
+
+      expect(engine.startedProfiles.single.codec, AudioCodec.opus);
+      engine.calls.clear();
+      engine.profiles.clear();
+      discoveryService.advertisedProfiles.clear();
+
+      engine.metrics = const AudioRelayMetrics(
+        remoteSupportedCodecs: {AudioCodec.pcm},
+      );
+      await controller.pollMetricsForTesting();
+
+      expect(controller.profile.codec, AudioCodec.pcm);
+      expect(controller.noticeMessage, contains('switched to PCM'));
+      expect(engine.calls, ['prepareSender']);
+      expect(engine.profiles.single.codec, AudioCodec.pcm);
+      expect(discoveryService.advertisedProfiles.single.codec, AudioCodec.pcm);
 
       controller.dispose();
     },
@@ -1832,6 +1923,14 @@ void main() {
     expect(controller.profile.hasSameSettings(AudioPreset.music.profile), true);
 
     controller.dispose();
+  });
+
+  test('developer checks include Android native unit tests', () {
+    final devCheck = File('scripts/dev_check.ps1').readAsStringSync();
+    final devWorkflow = File('.github/workflows/dev.yml').readAsStringSync();
+
+    expect(devCheck, contains('testDebugUnitTest'));
+    expect(devWorkflow, contains('testDebugUnitTest'));
   });
 
   test('usb sender reports native usb setup failures', () async {

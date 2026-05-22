@@ -1958,6 +1958,7 @@ class WindowsAudioEngine::Impl {
       }
 
       flutter::EncodableList addresses;
+      flutter::EncodableList address_metadata;
       for (IP_ADAPTER_UNICAST_ADDRESS* unicast =
                adapter->FirstUnicastAddress;
            unicast != nullptr; unicast = unicast->Next) {
@@ -1971,7 +1972,32 @@ class WindowsAudioEngine::Impl {
             reinterpret_cast<const sockaddr_in*>(socket_address);
         if (inet_ntop(AF_INET, &ipv4->sin_addr, address_text,
                       sizeof(address_text)) != nullptr) {
-          addresses.emplace_back(std::string(address_text));
+          const std::string address(address_text);
+          addresses.emplace_back(address);
+
+          const int prefix_length =
+              std::clamp(static_cast<int>(unicast->OnLinkPrefixLength), 0, 32);
+          const uint32_t host_address = ntohl(ipv4->sin_addr.S_un.S_addr);
+          const uint32_t mask =
+              prefix_length == 0
+                  ? 0
+                  : (0xFFFFFFFFu << (32 - prefix_length)) & 0xFFFFFFFFu;
+          const uint32_t broadcast = host_address | (~mask & 0xFFFFFFFFu);
+          in_addr broadcast_address = {};
+          broadcast_address.S_un.S_addr = htonl(broadcast);
+          char broadcast_text[INET_ADDRSTRLEN] = {};
+
+          flutter::EncodableMap metadata;
+          metadata[flutter::EncodableValue("address")] =
+              flutter::EncodableValue(address);
+          metadata[flutter::EncodableValue("prefixLength")] =
+              flutter::EncodableValue(prefix_length);
+          if (inet_ntop(AF_INET, &broadcast_address, broadcast_text,
+                        sizeof(broadcast_text)) != nullptr) {
+            metadata[flutter::EncodableValue("broadcastAddress")] =
+                flutter::EncodableValue(std::string(broadcast_text));
+          }
+          address_metadata.emplace_back(metadata);
         }
       }
 
@@ -1988,6 +2014,8 @@ class WindowsAudioEngine::Impl {
           flutter::EncodableValue(static_cast<int>(adapter->IfIndex));
       item[flutter::EncodableValue("addresses")] =
           flutter::EncodableValue(addresses);
+      item[flutter::EncodableValue("addressMetadata")] =
+          flutter::EncodableValue(address_metadata);
       interfaces.emplace_back(item);
     }
 

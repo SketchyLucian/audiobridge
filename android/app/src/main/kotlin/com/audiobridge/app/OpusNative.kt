@@ -1,4 +1,4 @@
-package com.example.audiorelay_clone
+package com.audiobridge.app
 
 class OpusNative {
     external fun createDecoder(channels: Int): Long

@@ -1,4 +1,4 @@
-package com.example.audiorelay_clone
+package com.audiobridge.app
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -20,12 +20,17 @@ class AudioRelayForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        acquireWakeLock()
-        startForegroundForCurrentRole()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
+        if (intent?.action != ACTION_START_STREAM) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+
+        startForegroundForCurrentRole()
+        acquireWakeLock()
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -57,6 +62,10 @@ class AudioRelayForegroundService : Service() {
     }
 
     private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) {
+            return
+        }
+
         val powerManager = getSystemService(PowerManager::class.java)
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
@@ -114,5 +123,9 @@ class AudioRelayForegroundService : Service() {
         }
 
         startForeground(NOTIFICATION_ID, notification)
+    }
+
+    companion object {
+        const val ACTION_START_STREAM = "com.audiobridge.app.action.START_STREAM"
     }
 }

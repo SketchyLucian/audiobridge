@@ -256,6 +256,10 @@ class _ControlPanel extends StatelessWidget {
             const SizedBox(height: 14),
             _ErrorBanner(message: controller.errorMessage!),
           ],
+          if (controller.noticeMessage != null) ...[
+            const SizedBox(height: 14),
+            _NoticeBanner(message: controller.noticeMessage!),
+          ],
           const SizedBox(height: 20),
           _SignalMeter(value: controller.signalLevel, muted: controller.muted),
           const SizedBox(height: 18),
@@ -2453,6 +2457,44 @@ class _ErrorBanner extends StatelessWidget {
               message,
               style: theme.textTheme.bodyMedium?.copyWith(
                 color: theme.colorScheme.onErrorContainer,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _NoticeBanner extends StatelessWidget {
+  const _NoticeBanner({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            Icons.info_outline_rounded,
+            color: theme.colorScheme.onTertiaryContainer,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              message,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onTertiaryContainer,
               ),
             ),
           ),

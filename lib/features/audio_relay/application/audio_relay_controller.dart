@@ -15,6 +15,7 @@ enum _AdaptiveProfileApplyReason {
   metrics,
   liveBufferPolicy,
   autoCodecSwitch,
+  receiverCodecFallback,
   display,
 }
 
@@ -57,6 +58,7 @@ class AudioRelayController extends ChangeNotifier {
   String localDeviceName;
   String localAddress = 'Detecting';
   String? errorMessage;
+  String? noticeMessage;
   double volume = 0.86;
   double signalLevel = 0;
   bool muted = false;
@@ -796,6 +798,7 @@ class AudioRelayController extends ChangeNotifier {
     devices = const [];
     selectedDevice = null;
     errorMessage = null;
+    noticeMessage = null;
     _syncVirtualMicPassthrough();
     notifyListeners();
   }
@@ -814,6 +817,7 @@ class AudioRelayController extends ChangeNotifier {
     devices = const [];
     selectedDevice = null;
     errorMessage = null;
+    noticeMessage = null;
     _syncVirtualMicPassthrough();
     notifyListeners();
   }
@@ -825,6 +829,7 @@ class AudioRelayController extends ChangeNotifier {
     }
 
     errorMessage = null;
+    noticeMessage = null;
     notifyListeners();
 
     try {
@@ -874,6 +879,7 @@ class AudioRelayController extends ChangeNotifier {
     }
 
     errorMessage = null;
+    noticeMessage = null;
     activity = RelayActivity.connecting;
     notifyListeners();
 
@@ -961,6 +967,7 @@ class AudioRelayController extends ChangeNotifier {
     _resetAutoCodecSession();
     activity = RelayActivity.idle;
     signalLevel = 0;
+    noticeMessage = null;
     notifyListeners();
   }
 
@@ -1012,6 +1019,7 @@ class AudioRelayController extends ChangeNotifier {
     if (!isCodecSupported(value)) {
       return;
     }
+    noticeMessage = null;
     if (profile.codec != value) {
       _resetAutoCodecSession();
     }
@@ -1375,6 +1383,7 @@ class AudioRelayController extends ChangeNotifier {
       signalLevel = muted ? 0 : nextMetrics.signalLevel ?? 0;
       _updateAdaptiveFormatPressureFromMetrics(nextMetrics);
       _syncReceiverProfileFromMetrics(nextMetrics);
+      await _fallbackUnsupportedManualCodecFromMetrics(nextMetrics);
       _updateAutoCodecFromMetrics(nextMetrics);
       _updateAdaptiveSenderProfileFromMetrics();
       if (isStreaming) {
@@ -1388,6 +1397,7 @@ class AudioRelayController extends ChangeNotifier {
   void _fail(String message) {
     activity = RelayActivity.error;
     errorMessage = message;
+    noticeMessage = null;
     _stopMeters();
     _cancelPendingProfileApply();
     notifyListeners();
@@ -1822,6 +1832,8 @@ class AudioRelayController extends ChangeNotifier {
 
     if (_canUpdateActiveSenderProfileWithoutRestart(
       senderProfile,
+      allowCodecChange:
+          reason == _AdaptiveProfileApplyReason.receiverCodecFallback,
       allowBitrateChange: profile.adaptiveBitrate,
     )) {
       if (usesNetworkDiscovery) {
@@ -2054,6 +2066,45 @@ class AudioRelayController extends ChangeNotifier {
   void _rememberAutoResolvedCodec(AudioProfile senderProfile) {
     if (profile.codec == AudioCodec.auto) {
       _autoResolvedCodec = senderProfile.codec;
+    }
+  }
+
+  Future<void> _fallbackUnsupportedManualCodecFromMetrics(
+    AudioRelayMetrics nextMetrics,
+  ) async {
+    final requestedCodec = profile.codec;
+    final remoteSupportedCodecs = nextMetrics.remoteSupportedCodecs;
+    if (role != RelayRole.sender ||
+        !isStreaming ||
+        requestedCodec == AudioCodec.auto ||
+        requestedCodec == AudioCodec.pcm ||
+        remoteSupportedCodecs.isEmpty ||
+        remoteSupportedCodecs.contains(requestedCodec)) {
+      return;
+    }
+
+    final fallbackProfile = _profileForCurrentRole(
+      _normalizeProfile(profile.copyWith(codec: AudioCodec.pcm)),
+    );
+    profile = fallbackProfile;
+    selectedPreset = profile.mode;
+    noticeMessage =
+        '${requestedCodec.label} is not supported by the receiver; switched to PCM.';
+    _resetAdaptiveFormatBaselines();
+
+    try {
+      await _refreshActiveSenderProfile(
+        fallbackProfile,
+        reason: _AdaptiveProfileApplyReason.receiverCodecFallback,
+      );
+    } on PlatformException catch (error) {
+      _fail(
+        error.message ?? 'Unable to switch to a receiver-compatible codec.',
+      );
+    } on SocketException catch (error) {
+      _fail('Unable to advertise receiver-compatible codec: ${error.message}');
+    } on OSError catch (error) {
+      _fail('Unable to advertise receiver-compatible codec: ${error.message}');
     }
   }
 
