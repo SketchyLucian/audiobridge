@@ -27,6 +27,12 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
+      - name: Use workspace Pub cache
+        shell: pwsh
+        run: |
+          $pubCache = Join-Path $env:GITHUB_WORKSPACE '.pub-cache'
+          "PUB_CACHE=$pubCache" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Install dependencies
         run: flutter pub get
 
