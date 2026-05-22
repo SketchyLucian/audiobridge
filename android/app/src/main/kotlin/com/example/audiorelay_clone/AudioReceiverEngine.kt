@@ -137,6 +137,49 @@ private const val LOG_TAG = "AudioBridgeUsb"
 private const val RECEIVER_SUPPORTED_CODECS =
     "pcm,opus,aac,g711MuLaw,g711ALaw,imaAdpcm"
 
+internal enum class LatencyRecoveryDecision {
+    ACCEPT,
+    DROP,
+    TRIM_AND_ACCEPT,
+    TRIM_AND_DROP
+}
+
+internal fun latencyRecoveryDecision(
+    queuedFrames: Long,
+    targetFrames: Long,
+    packetFrames: Long,
+    hardLimitFrames: Long,
+    sampleRate: Int,
+    networkSampleMs: Double?
+): LatencyRecoveryDecision {
+    if (sampleRate <= 0) {
+        return LatencyRecoveryDecision.DROP
+    }
+
+    val boundedPacketFrames = max(1L, packetFrames)
+    if (networkSampleMs != null) {
+        val queuedMs = queuedFrames * 1000.0 / sampleRate
+        val hardLimitMs = hardLimitFrames * 1000.0 / sampleRate
+        if (networkSampleMs + queuedMs > hardLimitMs) {
+            val queueCanRecover = queuedFrames > targetFrames + boundedPacketFrames
+            if (queueCanRecover) {
+                return if (networkSampleMs <= hardLimitMs) {
+                    LatencyRecoveryDecision.TRIM_AND_ACCEPT
+                } else {
+                    LatencyRecoveryDecision.TRIM_AND_DROP
+                }
+            }
+            return LatencyRecoveryDecision.DROP
+        }
+    }
+
+    if (queuedFrames > hardLimitFrames) {
+        return LatencyRecoveryDecision.TRIM_AND_ACCEPT
+    }
+
+    return LatencyRecoveryDecision.ACCEPT
+}
+
 private enum class TransportMode {
     WIFI,
     USB_TETHERING,
@@ -457,7 +500,7 @@ class AudioReceiverEngine(private val context: Context) {
             0
         }
         if (isSourceIdle(now)) {
-            parkIdlePlayback(track, sampleRate, underruns)
+            parkIdlePlayback(track, underruns)
             return idleReceiverMetrics(sampleRate)
         }
 
@@ -510,7 +553,10 @@ class AudioReceiverEngine(private val context: Context) {
             minLatencyMs(),
             MAX_LATENCY_MS
         )
-        val activeLatencyMs = initialAdaptivePlaybackBufferMs()
+        val activeLatencyMs = adaptivePlaybackBufferMs.coerceIn(
+            requestedLatencyMs,
+            adaptiveMaxPlaybackBufferMs(requestedLatencyMs)
+        )
         val targetFrames = latencyFrames(activeSampleRate, activeLatencyMs)
         val adaptiveMaxBufferMs = adaptiveMaxPlaybackBufferMs(requestedLatencyMs)
         adaptivePlaybackBufferMs = activeLatencyMs
@@ -542,7 +588,7 @@ class AudioReceiverEngine(private val context: Context) {
         )
     }
 
-    private fun parkIdlePlayback(track: AudioTrack, sampleRate: Int, underruns: Int) {
+    private fun parkIdlePlayback(track: AudioTrack, underruns: Int) {
         try {
             if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                 track.pause()
@@ -558,11 +604,7 @@ class AudioReceiverEngine(private val context: Context) {
         adaptiveUnderrunsInBurst = 0
         adaptiveLowQueueSamples = 0
         resetAdaptiveDelayTracker()
-        updateAdaptivePlaybackBuffer(
-            sampleRate,
-            initialAdaptivePlaybackBufferMs(),
-            remember = false
-        )
+        lastAdaptiveBufferRelaxAtMs = SystemClock.elapsedRealtime()
         signalLevel = 0.0
     }
 
@@ -3223,18 +3265,35 @@ class AudioReceiverEngine(private val context: Context) {
         val softLimit = max(targetFrames + packetFrames * 2L, targetFrames * 3L / 2L)
         val hardLimit = max(targetFrames * 3L, targetFrames + sampleRate * 50L / 1000L)
 
-        if (networkSampleMs != null) {
-            val queuedMs = queuedFrames * 1000.0 / sampleRate
-            val hardLimitMs = hardLimit * 1000.0 / sampleRate
-            if (networkSampleMs + queuedMs > hardLimitMs) {
+        when (
+            latencyRecoveryDecision(
+                queuedFrames = queuedFrames,
+                targetFrames = targetFrames,
+                packetFrames = packetFrames,
+                hardLimitFrames = hardLimit,
+                sampleRate = sampleRate,
+                networkSampleMs = networkSampleMs
+            )
+        ) {
+            LatencyRecoveryDecision.ACCEPT -> {}
+            LatencyRecoveryDecision.DROP -> {
+                droppedPackets.incrementAndGet()
+                return true
+            }
+            LatencyRecoveryDecision.TRIM_AND_ACCEPT -> {
+                if (trimQueuedAudio(track)) {
+                    return false
+                }
+                droppedPackets.incrementAndGet()
+                return true
+            }
+            LatencyRecoveryDecision.TRIM_AND_DROP -> {
+                trimQueuedAudio(track)
                 droppedPackets.incrementAndGet()
                 return true
             }
         }
-        if (queuedFrames > hardLimit) {
-            trimQueuedAudio(track)
-            return false
-        }
+
         if (queuedFrames > softLimit) {
             droppedPackets.incrementAndGet()
             return true
@@ -3439,11 +3498,7 @@ class AudioReceiverEngine(private val context: Context) {
         val hasPlaybackSignal = hasAdaptivePlaybackSignal()
         if (!hasPlaybackSignal) {
             resetAdaptiveGrowthPressure(underruns)
-            val currentBufferMs = adaptivePlaybackBufferMs
-            if (currentBufferMs > requestedLatencyMs) {
-                updateAdaptivePlaybackBuffer(sampleRate, requestedLatencyMs)
-                lastAdaptiveBufferRelaxAtMs = now
-            }
+            lastAdaptiveBufferRelaxAtMs = now
             return
         }
 
@@ -3784,7 +3839,7 @@ class AudioReceiverEngine(private val context: Context) {
                     ADAPTIVE_ULTRA_LOW_LATENCY_CAP_MS,
                     requestedLatencyMs * 4
                 )
-                else -> max(requestedLatencyMs, requestedLatencyMs + 6)
+                else -> max(requestedLatencyMs, requestedLatencyMs + 12)
             }.coerceAtMost(ADAPTIVE_GAMING_CAP_MS)
             AudioMode.BALANCED -> max(96, requestedLatencyMs * 2)
                 .coerceAtMost(ADAPTIVE_BALANCED_CAP_MS)
@@ -3986,17 +4041,24 @@ class AudioReceiverEngine(private val context: Context) {
     }
 
     private fun smoothLatency(previous: Double, sample: Double): Double {
-        return if (previous.isNaN()) sample else previous * 0.75 + sample * 0.25
+        if (previous.isNaN()) {
+            return sample
+        }
+        val previousWeight = if (sample < previous) 0.35 else 0.75
+        return previous * previousWeight + sample * (1.0 - previousWeight)
     }
 
-    private fun trimQueuedAudio(track: AudioTrack) {
+    private fun trimQueuedAudio(track: AudioTrack): Boolean {
         try {
             track.pause()
             track.flush()
             writtenFrames.set(playbackFrames(track))
             track.play()
             trimCount.incrementAndGet()
+            audioLatencyMs = Double.NaN
+            return true
         } catch (_: IllegalStateException) {
+            return false
         }
     }
 

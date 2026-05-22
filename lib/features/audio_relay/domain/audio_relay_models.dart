@@ -177,9 +177,11 @@ enum OutputAudioBackend {
   }
 
   static OutputAudioBackend fromName(String? value) {
-    final normalized = value?.toLowerCase();
+    final normalized = value?.toLowerCase().replaceAll(RegExp(r'[-_\s]'), '');
     return OutputAudioBackend.values.firstWhere(
-      (candidate) => candidate.name.toLowerCase() == normalized,
+      (candidate) =>
+          candidate.name.toLowerCase().replaceAll(RegExp(r'[-_\s]'), '') ==
+          normalized,
       orElse: () => OutputAudioBackend.auto,
     );
   }

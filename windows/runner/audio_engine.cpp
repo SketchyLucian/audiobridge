@@ -4975,11 +4975,7 @@ class WindowsAudioEngine::Impl {
     const int64_t underruns = local_underrun_count_.load();
     if (!HasLocalAdaptivePlaybackSignal()) {
       ResetLocalAdaptiveGrowthPressure(underruns);
-      const int current_ms =
-          static_cast<int>(local_adaptive_playback_buffer_ms_.load());
-      if (current_ms > requested_ms) {
-        SetLocalAdaptivePlaybackBufferMs(sample_rate, requested_ms);
-      }
+      local_last_playback_pressure_at_ms_ = now;
       return;
     }
 

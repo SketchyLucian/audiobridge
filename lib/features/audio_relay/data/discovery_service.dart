@@ -205,7 +205,7 @@ class DiscoveryService {
 
     await sendProbe();
     _scanProbeTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      unawaited(sendProbe());
+      unawaited(sendProbe().catchError((Object _) {}));
     });
   }
 

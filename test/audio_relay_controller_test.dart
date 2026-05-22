@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:audiorelay_clone/features/audio_relay/application/audio_relay_controller.dart';
@@ -140,6 +141,28 @@ void main() {
 
     controller.dispose();
   });
+
+  test(
+    'custom profile save failures do not escape controller updates',
+    () async {
+      final store = _FakeAudioProfileStore(
+        saveError: StateError('write failed'),
+      );
+      final controller = AudioRelayController(
+        engine: _FakeAudioRelayEngine(),
+        discoveryService: _FakeDiscoveryService(),
+        profileStore: store,
+      );
+
+      controller.saveCustomPreset();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controller.selectedPreset, AudioPreset.custom);
+      expect(controller.profile.mode, AudioPreset.custom);
+
+      controller.dispose();
+    },
+  );
 
   test('initialize loads saved custom mode profile', () async {
     final store = _FakeAudioProfileStore(
@@ -331,7 +354,7 @@ void main() {
       expect(controller.liveLatencyLabel, '18 ms');
       expect(controller.activePlaybackBufferLabel, 'Requested 18 ms');
       expect(controller.playbackQueueFillLabel, '0%');
-      expect(controller.adaptiveBufferCapLabel, '24 ms');
+      expect(controller.adaptiveBufferCapLabel, '30 ms');
 
       controller.dispose();
     },
@@ -411,6 +434,47 @@ void main() {
     expect(profile.toMap()['adaptiveSampleRate'], true);
     expect(profile.toMap()['adaptiveBitrate'], true);
   });
+
+  test('output backend names parse platform aliases', () {
+    expect(
+      OutputAudioBackend.fromName('audio-track'),
+      OutputAudioBackend.audioTrack,
+    );
+    expect(
+      OutputAudioBackend.fromName('WASAPI shared'),
+      OutputAudioBackend.wasapiShared,
+    );
+    expect(
+      OutputAudioBackend.fromName('wasapi_exclusive'),
+      OutputAudioBackend.wasapiExclusive,
+    );
+  });
+
+  test(
+    'initialize completion after dispose does not notify listeners',
+    () async {
+      final capabilitiesGate = Completer<void>();
+      final controller = AudioRelayController(
+        engine: _FakeAudioRelayEngine(
+          capabilities: _supportedCapabilities,
+          capabilitiesGate: capabilitiesGate,
+        ),
+        discoveryService: _FakeDiscoveryService(),
+        profileStore: _FakeAudioProfileStore(),
+      );
+      var notifications = 0;
+      controller.addListener(() {
+        notifications += 1;
+      });
+
+      final initialize = controller.initialize();
+      controller.dispose();
+      capabilitiesGate.complete();
+      await initialize;
+
+      expect(notifications, 0);
+    },
+  );
 
   test('aac is modeled as an implemented native codec path', () {
     expect(AudioCodec.aac.isImplemented, true);
@@ -1914,9 +1978,15 @@ const _soundboardMixedVirtualCapabilities = PlatformAudioCapabilities(
 );
 
 class _FakeAudioRelayEngine implements AudioRelayEngine {
-  _FakeAudioRelayEngine({this.prepareUsbError});
+  _FakeAudioRelayEngine({
+    this.prepareUsbError,
+    PlatformAudioCapabilities? capabilities,
+    this.capabilitiesGate,
+  }) : capabilities = capabilities ?? PlatformAudioCapabilities.fallback();
 
   final PlatformException? prepareUsbError;
+  final PlatformAudioCapabilities capabilities;
+  final Completer<void>? capabilitiesGate;
   final List<String> calls = [];
   final List<AudioProfile> profiles = [];
   final List<AudioProfile> startedProfiles = [];
@@ -1940,7 +2010,8 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
 
   @override
   Future<PlatformAudioCapabilities> getCapabilities() async {
-    return PlatformAudioCapabilities.fallback();
+    await capabilitiesGate?.future;
+    return capabilities;
   }
 
   @override
@@ -2027,9 +2098,10 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
 }
 
 class _FakeAudioProfileStore implements AudioProfileStore {
-  _FakeAudioProfileStore({this.savedProfile});
+  _FakeAudioProfileStore({this.savedProfile, this.saveError});
 
   AudioProfile? savedProfile;
+  Object? saveError;
 
   @override
   Future<AudioProfile?> loadCustomProfile() async {
@@ -2038,6 +2110,10 @@ class _FakeAudioProfileStore implements AudioProfileStore {
 
   @override
   Future<void> saveCustomProfile(AudioProfile profile) async {
+    final error = saveError;
+    if (error != null) {
+      throw error;
+    }
     savedProfile = profile;
   }
 }

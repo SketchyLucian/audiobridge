@@ -85,6 +85,7 @@ class AudioRelayController extends ChangeNotifier {
   bool _profileApplyInFlight = false;
   bool _virtualMicPassthroughEnabled = false;
   String? _virtualMicPassthroughOutputDeviceId;
+  bool _isDisposed = false;
   _AdaptiveProfileApplyReason _pendingProfileApplyReason =
       _AdaptiveProfileApplyReason.settings;
   AudioProfile _savedCustomProfile = AudioPreset.custom.profile;
@@ -1000,7 +1001,7 @@ class AudioRelayController extends ChangeNotifier {
     selectedPreset = AudioPreset.custom;
     profile = _profileForCurrentRole(_normalizeProfile(customProfile));
     notifyListeners();
-    unawaited(_profileStore.saveCustomProfile(_savedCustomProfile));
+    _persistCustomProfile(_savedCustomProfile);
     _scheduleActiveProfileApply();
   }
 
@@ -1302,13 +1303,25 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   @override
+  void notifyListeners() {
+    if (_isDisposed) {
+      return;
+    }
+    super.notifyListeners();
+  }
+
+  @override
   void dispose() {
+    if (_isDisposed) {
+      return;
+    }
+    _isDisposed = true;
     _meterTimer?.cancel();
     _profileApplyTimer?.cancel();
     _resetAutoCodecSession();
     _stopVirtualMicPassthrough();
-    _engine.disconnect();
-    _discoveryService.dispose();
+    unawaited(_engine.disconnect().catchError((Object _) {}));
+    unawaited(_discoveryService.dispose().catchError((Object _) {}));
     super.dispose();
   }
 
@@ -1582,7 +1595,13 @@ class AudioRelayController extends ChangeNotifier {
     }
 
     _savedCustomProfile = _profileForSavedCustom(nextProfile);
-    unawaited(_profileStore.saveCustomProfile(_savedCustomProfile));
+    _persistCustomProfile(_savedCustomProfile);
+  }
+
+  void _persistCustomProfile(AudioProfile customProfile) {
+    unawaited(
+      _profileStore.saveCustomProfile(customProfile).catchError((Object _) {}),
+    );
   }
 
   void _applyTransportProfile(RelayTransport nextTransport) {
@@ -1679,7 +1698,7 @@ class AudioRelayController extends ChangeNotifier {
       AudioPreset.gaming =>
         requestedMs <= 10
             ? max(_adaptiveUltraLowLatencyCapMs, requestedMs * 4)
-            : max(requestedMs, requestedMs + 6),
+            : max(requestedMs, requestedMs + 12),
       AudioPreset.balanced => min(
         max(96, requestedMs * 2),
         _adaptiveBalancedCapMs,
@@ -2532,7 +2551,11 @@ class AudioRelayController extends ChangeNotifier {
     }
     _virtualMicPassthroughEnabled = false;
     _virtualMicPassthroughOutputDeviceId = null;
-    unawaited(_engine.configureVirtualMicPassthrough(enabled: false));
+    unawaited(
+      _engine
+          .configureVirtualMicPassthrough(enabled: false)
+          .catchError((Object _) {}),
+    );
   }
 
   static int _compareSoundboardCableRoutes(
