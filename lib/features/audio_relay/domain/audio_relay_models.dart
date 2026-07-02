@@ -495,7 +495,7 @@ class AudioProfile {
         fallback: _readInt(payload['latencyMs'], fallback: 35),
       ),
       packetTimeMs: _readInt(payload['packetTimeMs'], fallback: 3),
-      channels: 2,
+      channels: _readInt(payload['channels'], fallback: 2).clamp(1, 2).toInt(),
       receiverAdaptiveBuffer: _readBool(
         payload['receiverAdaptiveBuffer'],
         fallback: true,

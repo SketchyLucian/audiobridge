@@ -6,8 +6,9 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
-import '../data/discovery_service.dart';
 import '../data/audio_profile_store.dart';
+import '../data/audio_relay_preferences_store.dart';
+import '../data/discovery_service.dart';
 import '../data/native_audio_engine.dart';
 import '../data/update_platform.dart';
 import '../data/update_service.dart';
@@ -28,6 +29,7 @@ class AudioRelayController extends ChangeNotifier {
     AudioRelayEngine? engine,
     DiscoveryService? discoveryService,
     AudioProfileStore? profileStore,
+    AudioRelayPreferencesStore? preferencesStore,
     AppUpdateService? updateService,
     UpdateInstaller? updateInstaller,
     Future<String> Function()? appVersionProvider,
@@ -37,10 +39,19 @@ class AudioRelayController extends ChangeNotifier {
     Duration profileApplyDelay = const Duration(milliseconds: 250),
     @visibleForTesting Duration autoCodecWarmup = const Duration(seconds: 60),
     @visibleForTesting Duration autoCodecQuietHold = const Duration(seconds: 3),
+    @visibleForTesting
+    Duration discoveryIdleTimeout = const Duration(minutes: 2),
+    @visibleForTesting
+    Duration streamConnectionTimeout = const Duration(seconds: 45),
+    @visibleForTesting
+    Duration preferencesSaveDelay = const Duration(milliseconds: 200),
   }) : _engine = engine ?? const MethodChannelAudioRelayEngine(),
        _discoveryService = discoveryService ?? DiscoveryService(),
        _profileStore =
            profileStore ?? const SharedPreferencesAudioProfileStore(),
+       _preferencesStore =
+           preferencesStore ??
+           const SharedPreferencesAudioRelayPreferencesStore(),
        _updateService = updateService ?? CodebergUpdateService(),
        _updateInstaller =
            updateInstaller ?? const MethodChannelUpdateInstaller(),
@@ -50,6 +61,9 @@ class AudioRelayController extends ChangeNotifier {
        _profileApplyDelay = profileApplyDelay,
        _autoCodecWarmup = autoCodecWarmup,
        _autoCodecQuietHold = autoCodecQuietHold,
+       _discoveryIdleTimeout = discoveryIdleTimeout,
+       _streamConnectionTimeout = streamConnectionTimeout,
+       _preferencesSaveDelay = preferencesSaveDelay,
        profile = AudioPreset.balanced.profile,
        role = _defaultRole(),
        localDeviceName = _defaultDeviceName();
@@ -57,6 +71,7 @@ class AudioRelayController extends ChangeNotifier {
   final AudioRelayEngine _engine;
   final DiscoveryService _discoveryService;
   final AudioProfileStore _profileStore;
+  final AudioRelayPreferencesStore _preferencesStore;
   final AppUpdateService _updateService;
   final UpdateInstaller _updateInstaller;
   final Future<String> Function() _appVersionProvider;
@@ -65,6 +80,9 @@ class AudioRelayController extends ChangeNotifier {
   final Duration _profileApplyDelay;
   final Duration _autoCodecWarmup;
   final Duration _autoCodecQuietHold;
+  final Duration _discoveryIdleTimeout;
+  final Duration _streamConnectionTimeout;
+  final Duration _preferencesSaveDelay;
   RelayRole role;
   RelayTransport transport = RelayTransport.wifi;
   RelayActivity activity = RelayActivity.idle;
@@ -97,6 +115,9 @@ class AudioRelayController extends ChangeNotifier {
 
   Timer? _meterTimer;
   Timer? _profileApplyTimer;
+  Timer? _discoveryIdleTimer;
+  Timer? _streamConnectionTimer;
+  Timer? _preferencesSaveTimer;
   AudioProfile? _appliedSenderProfile;
   AudioCodec _autoResolvedCodec = AudioCodec.pcm;
   DateTime? _autoCodecStartedAt;
@@ -114,6 +135,9 @@ class AudioRelayController extends ChangeNotifier {
   String? _virtualMicPassthroughOutputDeviceId;
   String? _downloadedUpdatePath;
   bool _isDisposed = false;
+  bool _streamPeerConnected = false;
+  bool _preferencesReady = false;
+  bool _preferencesDirty = false;
   _AdaptiveProfileApplyReason _pendingProfileApplyReason =
       _AdaptiveProfileApplyReason.settings;
   AudioProfile _savedCustomProfile = AudioPreset.custom.profile;
@@ -123,7 +147,7 @@ class AudioRelayController extends ChangeNotifier {
   static const _adaptiveGamingCapMs = 120;
   static const _adaptiveBalancedCapMs = 240;
   static const _adaptiveFormatRecoveryPolls = 4;
-  static const _fallbackAppVersion = '1.1.0';
+  static const _fallbackAppVersion = '1.2.0';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -192,6 +216,47 @@ class AudioRelayController extends ChangeNotifier {
       AppUpdateStatus.failed => 'Update check failed',
     };
   }
+
+  String get updateCurrentVersionLabel => 'v$appVersion';
+
+  String get updateLatestVersionLabel {
+    final release = availableUpdate;
+    if (release != null) {
+      return release.tagName;
+    }
+    return switch (updateStatus) {
+      AppUpdateStatus.current => 'No newer release',
+      AppUpdateStatus.checking => 'Checking',
+      AppUpdateStatus.failed => 'Unavailable',
+      _ => 'Not checked',
+    };
+  }
+
+  String get updateLatestVersionDetailLabel {
+    final release = availableUpdate;
+    if (release != null) {
+      return 'Latest ${release.asset.target.platformLabel} release';
+    }
+    return 'Installed $updateCurrentVersionLabel';
+  }
+
+  String get updatePackageLabel {
+    final release = availableUpdate;
+    if (release == null) {
+      return 'No package';
+    }
+    return release.asset.name;
+  }
+
+  String get updatePackageDetailLabel {
+    final release = availableUpdate;
+    if (release == null) {
+      return 'Target ${_updateTarget.platformLabel}';
+    }
+    return '${_formatByteSize(release.asset.sizeBytes)} ${release.asset.target.platformLabel} package';
+  }
+
+  String get updatePlatformLabel => _updateTarget.platformLabel;
 
   String get updateActionLabel {
     return switch (updateStatus) {
@@ -401,15 +466,16 @@ class AudioRelayController extends ChangeNotifier {
   String get audibleQualityTitle {
     final effectiveLatencyMs =
         profile.captureBufferMs + profile.playbackBufferMs;
+    final channelLabel = profile.channels == 1 ? 'mono' : 'stereo';
     if (profile.sampleRate >= 96000 && profile.channels >= 2) {
       return effectiveLatencyMs >= 120
           ? 'High fidelity, relaxed response'
           : 'High fidelity, moderate response';
     }
     if (effectiveLatencyMs <= 60 && profile.packetTimeMs <= 3) {
-      return 'Responsive stereo, light buffering';
+      return 'Responsive $channelLabel, light buffering';
     }
-    return 'Clean stereo, balanced buffering';
+    return 'Clean $channelLabel, balanced buffering';
   }
 
   String get audibleQualityDescription {
@@ -427,7 +493,7 @@ class AudioRelayController extends ChangeNotifier {
     final outputBackends = capabilities.supportedOutputBackends
         .map((backend) => backend.label)
         .join(', ');
-    return 'Current engine controls: receiver adaptive buffer, adaptive sample rate, stereo format, codec ($codecs), adaptive bitrate target, sender buffer, receiver buffer, packet time, volume, mute, and role/discovery. Receiver output backends: $outputBackends.';
+    return 'Current engine controls: receiver adaptive buffer, adaptive sample rate, mono/stereo format, codec ($codecs), adaptive bitrate target, sender buffer, receiver buffer, packet time, volume, mute, and role/discovery. Receiver output backends: $outputBackends.';
   }
 
   String get liveLatencyLabel {
@@ -511,25 +577,40 @@ class AudioRelayController extends ChangeNotifier {
 
   String get receiverAdaptiveBufferDetailLabel {
     return profile.receiverAdaptiveBuffer
-        ? 'Tracks packet jitter, underruns, and sustained low queue.'
-        : 'Keeps the requested target.';
+        ? 'Raises above minimum for jitter, underruns, or low queue.'
+        : 'Keeps the receiver buffer fixed.';
+  }
+
+  String get receiverBufferDescription {
+    return profile.receiverAdaptiveBuffer
+        ? 'Sets the minimum receiver delay. Adaptive may raise it to prevent pops and dropouts on unstable links.'
+        : 'Sets a fixed receiver delay. Lower feels more immediate; higher is safer on unstable links.';
+  }
+
+  String get receiverBufferValueLabel {
+    return profile.receiverAdaptiveBuffer
+        ? '${profile.playbackBufferMs} ms min'
+        : '${profile.playbackBufferMs} ms';
   }
 
   String get receiverBufferDetailLabel {
+    final requestedFramesLabel = profile.receiverAdaptiveBuffer
+        ? '$playbackBufferFramesLabel minimum'
+        : '$playbackBufferFramesLabel fixed';
     final activeMs = activePlaybackBufferMs;
     if (activeMs == null || !isStreaming) {
-      return playbackBufferFramesLabel;
+      return requestedFramesLabel;
     }
     final targetFrames = metrics.targetBufferFrames;
     if (targetFrames == null) {
-      return '$playbackBufferFramesLabel requested';
+      return requestedFramesLabel;
     }
     final capMs = metrics.adaptiveMaxPlaybackBufferMs;
     final capLabel = profile.receiverAdaptiveBuffer && capMs != null
         ? ' · $capMs ms cap'
         : '';
     final limitLabel = metrics.adaptiveLimitReached == true ? ' · cap hit' : '';
-    return '$targetFrames frames active · $playbackBufferFramesLabel requested$capLabel$limitLabel';
+    return '$targetFrames frames active · $requestedFramesLabel$capLabel$limitLabel';
   }
 
   String get captureBufferLabel {
@@ -861,9 +942,12 @@ class AudioRelayController extends ChangeNotifier {
   Future<void> initialize() async {
     appVersion = await _appVersionProvider();
     capabilities = await _engine.getCapabilities();
+    if (_isDisposed) {
+      return;
+    }
     await _loadSavedCustomProfile();
+    await _loadSavedPreferences();
     await _refreshLocalAddress();
-    _selectDefaultSoundboardOutputDevice();
     if (!isOutputBackendSupported(receiverOutputBackend)) {
       receiverOutputBackend = OutputAudioBackend.auto;
     }
@@ -876,6 +960,13 @@ class AudioRelayController extends ChangeNotifier {
       selectedPreset = profile.mode;
     }
 
+    _selectDefaultSoundboardOutputDevice();
+    await _applyRestoredEnginePreferences();
+    if (_isDisposed) {
+      return;
+    }
+    _preferencesReady = true;
+    _schedulePreferencesSave();
     _syncVirtualMicPassthrough();
     notifyListeners();
     if (!_isDisposed && _checkForUpdatesOnInitialize) {
@@ -898,6 +989,7 @@ class AudioRelayController extends ChangeNotifier {
     noticeMessage = null;
     _syncVirtualMicPassthrough();
     notifyListeners();
+    _schedulePreferencesSave();
   }
 
   Future<void> setTransport(RelayTransport value) async {
@@ -917,6 +1009,7 @@ class AudioRelayController extends ChangeNotifier {
     noticeMessage = null;
     _syncVirtualMicPassthrough();
     notifyListeners();
+    _schedulePreferencesSave();
   }
 
   Future<void> startDiscovery() async {
@@ -960,6 +1053,11 @@ class AudioRelayController extends ChangeNotifier {
           activity = RelayActivity.scanning;
         }
       }
+      if (activity == RelayActivity.streaming) {
+        _startStreamConnectionWatch();
+      } else if (isDiscovering) {
+        _scheduleDiscoveryIdleTimeout();
+      }
       notifyListeners();
     } on SocketException catch (error) {
       _fail('Network discovery failed: ${error.message}');
@@ -975,6 +1073,7 @@ class AudioRelayController extends ChangeNotifier {
       return;
     }
 
+    _cancelDiscoveryIdleTimeout();
     errorMessage = null;
     noticeMessage = null;
     activity = RelayActivity.connecting;
@@ -996,6 +1095,7 @@ class AudioRelayController extends ChangeNotifier {
       _rememberAutoResolvedCodec(senderProfile);
       activity = RelayActivity.streaming;
       _startMeters();
+      _startStreamConnectionWatch();
       notifyListeners();
     } on PlatformException catch (error) {
       _fail(error.message ?? 'Unable to start sender.');
@@ -1007,6 +1107,7 @@ class AudioRelayController extends ChangeNotifier {
       return;
     }
 
+    _cancelDiscoveryIdleTimeout();
     selectedDevice = device;
     final receiverProfile = _receiverProfileFor(device.profile);
     profile = receiverProfile;
@@ -1024,6 +1125,7 @@ class AudioRelayController extends ChangeNotifier {
       await _engine.startStream(receiverProfile);
       activity = RelayActivity.streaming;
       _startMeters();
+      _startStreamConnectionWatch();
       notifyListeners();
     } on PlatformException catch (error) {
       await _discoveryService.stopScanning();
@@ -1032,6 +1134,7 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   Future<void> stopStream() async {
+    _cancelStreamConnectionTimeout();
     await _engine.stopStream();
     _stopMeters();
     _resetAutoCodecSession();
@@ -1039,7 +1142,9 @@ class AudioRelayController extends ChangeNotifier {
 
     if (role == RelayRole.sender) {
       activity = RelayActivity.advertising;
+      _scheduleDiscoveryIdleTimeout();
     } else {
+      _cancelDiscoveryIdleTimeout();
       await _discoveryService.stopScanning();
       activity = RelayActivity.idle;
       if (isUsbTunnelTransport) {
@@ -1054,6 +1159,8 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   Future<void> stopAll() async {
+    _cancelDiscoveryIdleTimeout();
+    _cancelStreamConnectionTimeout();
     _cancelPendingProfileApply();
     await _engine.disconnect();
     _virtualMicPassthroughEnabled = false;
@@ -1103,7 +1210,8 @@ class AudioRelayController extends ChangeNotifier {
             : 'Installed v$appVersion is current.';
       } else {
         updateStatus = AppUpdateStatus.available;
-        updateMessage = '${result.release!.tagName} is ready to download.';
+        updateMessage =
+            'Current v$appVersion, latest ${result.release!.tagName}.';
       }
     } on AppUpdateException catch (error) {
       updateStatus = AppUpdateStatus.failed;
@@ -1236,6 +1344,7 @@ class AudioRelayController extends ChangeNotifier {
         : requestedProfile;
     profile = _profileForCurrentRole(_normalizeProfile(nextProfile));
     notifyListeners();
+    _schedulePreferencesSave();
     _scheduleActiveProfileApply(
       reason: livePresetChange
           ? _AdaptiveProfileApplyReason.liveBufferPolicy
@@ -1256,6 +1365,7 @@ class AudioRelayController extends ChangeNotifier {
         : customProfile;
     profile = _profileForCurrentRole(_normalizeProfile(nextProfile));
     notifyListeners();
+    _schedulePreferencesSave();
     _persistCustomProfile(_savedCustomProfile);
     _scheduleActiveProfileApply(
       reason: livePresetChange
@@ -1288,6 +1398,7 @@ class AudioRelayController extends ChangeNotifier {
     receiverOutputBackend = value;
     profile = _receiverProfileFor(profile);
     notifyListeners();
+    _schedulePreferencesSave();
     unawaited(_refreshActiveReceiverProfile());
   }
 
@@ -1377,7 +1488,8 @@ class AudioRelayController extends ChangeNotifier {
     if (!_canChangeRestartRequiredSenderSetting()) {
       return;
     }
-    _updateProfile(_normalizeProfile(profile.copyWith(channels: value)));
+    final channels = value.clamp(1, 2).toInt();
+    _updateProfile(_normalizeProfile(profile.copyWith(channels: channels)));
   }
 
   void updateCaptureBuffer(double value) {
@@ -1423,6 +1535,7 @@ class AudioRelayController extends ChangeNotifier {
   Future<void> updateVolume(double value) async {
     volume = value;
     notifyListeners();
+    _schedulePreferencesSave();
     await _engine.setVolume(value);
   }
 
@@ -1432,6 +1545,7 @@ class AudioRelayController extends ChangeNotifier {
       signalLevel = 0;
     }
     notifyListeners();
+    _schedulePreferencesSave();
     await _engine.setMuted(value);
   }
 
@@ -1453,12 +1567,14 @@ class AudioRelayController extends ChangeNotifier {
     selectedSoundboardItem ??= soundboardItems.firstOrNull;
     soundboardMessage = null;
     notifyListeners();
+    _schedulePreferencesSave();
   }
 
   void selectSoundboardItem(SoundPlaybackItem item) {
     selectedSoundboardItem = item;
     soundboardMessage = null;
     notifyListeners();
+    _schedulePreferencesSave();
   }
 
   void removeSoundboardItem(SoundPlaybackItem item) {
@@ -1470,11 +1586,13 @@ class AudioRelayController extends ChangeNotifier {
       selectedSoundboardItem = soundboardItems.firstOrNull;
     }
     notifyListeners();
+    _schedulePreferencesSave();
   }
 
   void updateSoundboardVolume(double value) {
     soundboardVolume = value.clamp(0, 1).toDouble();
     notifyListeners();
+    _schedulePreferencesSave();
   }
 
   void updateSoundboardTarget(SoundboardPlaybackTarget value) {
@@ -1485,6 +1603,7 @@ class AudioRelayController extends ChangeNotifier {
     soundboardMessage = null;
     _syncVirtualMicPassthrough();
     notifyListeners();
+    _schedulePreferencesSave();
   }
 
   void selectSoundboardOutputDevice(String? id) {
@@ -1495,10 +1614,12 @@ class AudioRelayController extends ChangeNotifier {
     soundboardMessage = null;
     _syncVirtualMicPassthrough();
     notifyListeners();
+    _schedulePreferencesSave();
   }
 
   Future<void> playSoundboardItem(SoundPlaybackItem item) async {
     selectedSoundboardItem = item;
+    _schedulePreferencesSave();
     await playSelectedSoundboardItem();
   }
 
@@ -1557,6 +1678,15 @@ class AudioRelayController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> flushPreferences() async {
+    _preferencesSaveTimer?.cancel();
+    _preferencesSaveTimer = null;
+    if (!_preferencesReady || !_preferencesDirty) {
+      return;
+    }
+    await _savePreferences();
+  }
+
   @visibleForTesting
   Future<void> pollMetricsForTesting() {
     return _pollMetrics();
@@ -1578,6 +1708,12 @@ class AudioRelayController extends ChangeNotifier {
     _isDisposed = true;
     _meterTimer?.cancel();
     _profileApplyTimer?.cancel();
+    _discoveryIdleTimer?.cancel();
+    _streamConnectionTimer?.cancel();
+    _preferencesSaveTimer?.cancel();
+    if (_preferencesReady && _preferencesDirty) {
+      unawaited(_savePreferences());
+    }
     _resetAutoCodecSession();
     _stopVirtualMicPassthrough();
     unawaited(_engine.disconnect().catchError((Object _) {}));
@@ -1623,6 +1759,104 @@ class AudioRelayController extends ChangeNotifier {
     _adaptiveFormatQuietPolls = 0;
   }
 
+  void _scheduleDiscoveryIdleTimeout() {
+    _discoveryIdleTimer?.cancel();
+    if (_discoveryIdleTimeout.isNegative) {
+      return;
+    }
+
+    _discoveryIdleTimer = Timer(_discoveryIdleTimeout, () {
+      unawaited(_pauseInactiveDiscovery());
+    });
+  }
+
+  void _cancelDiscoveryIdleTimeout() {
+    _discoveryIdleTimer?.cancel();
+    _discoveryIdleTimer = null;
+  }
+
+  Future<void> _pauseInactiveDiscovery() async {
+    if (_isDisposed || !isDiscovering) {
+      return;
+    }
+
+    _cancelDiscoveryIdleTimeout();
+    if (activity == RelayActivity.scanning) {
+      await _discoveryService.stopScanning();
+    } else {
+      await _engine.disconnect();
+      await _discoveryService.dispose();
+      _appliedSenderProfile = null;
+      _resetAutoCodecSession();
+    }
+
+    activity = RelayActivity.idle;
+    signalLevel = 0;
+    noticeMessage =
+        'Paused ${role.label.toLowerCase()} discovery after '
+        '${_durationLabel(_discoveryIdleTimeout)} without a connection.';
+    notifyListeners();
+  }
+
+  void _startStreamConnectionWatch() {
+    _streamPeerConnected = false;
+    _scheduleStreamConnectionTimeout();
+  }
+
+  void _scheduleStreamConnectionTimeout() {
+    _streamConnectionTimer?.cancel();
+    if (_streamConnectionTimeout.isNegative) {
+      return;
+    }
+
+    _streamConnectionTimer = Timer(_streamConnectionTimeout, () {
+      unawaited(_stopUnconnectedStream());
+    });
+  }
+
+  void _cancelStreamConnectionTimeout() {
+    _streamConnectionTimer?.cancel();
+    _streamConnectionTimer = null;
+    _streamPeerConnected = false;
+  }
+
+  Future<void> _stopUnconnectedStream() async {
+    if (_isDisposed || activity != RelayActivity.streaming) {
+      return;
+    }
+    if (_streamPeerConnected) {
+      return;
+    }
+
+    final message = role == RelayRole.sender
+        ? 'Stopped stream after ${_durationLabel(_streamConnectionTimeout)} '
+              'without a receiver.'
+        : 'Stopped stream after ${_durationLabel(_streamConnectionTimeout)} '
+              'without source audio packets.';
+    await stopStream();
+    noticeMessage = message;
+    notifyListeners();
+  }
+
+  void _updateStreamConnectionFromMetrics(AudioRelayMetrics nextMetrics) {
+    if (activity != RelayActivity.streaming) {
+      _cancelStreamConnectionTimeout();
+      return;
+    }
+
+    if (nextMetrics.peerConnected == true) {
+      _streamPeerConnected = true;
+      _streamConnectionTimer?.cancel();
+      _streamConnectionTimer = null;
+      return;
+    }
+
+    _streamPeerConnected = false;
+    if (_streamConnectionTimer == null) {
+      _scheduleStreamConnectionTimeout();
+    }
+  }
+
   Future<void> _pollMetrics() async {
     if (_metricsPollInFlight) {
       return;
@@ -1632,6 +1866,7 @@ class AudioRelayController extends ChangeNotifier {
     try {
       final nextMetrics = await _engine.getMetrics();
       metrics = nextMetrics;
+      _updateStreamConnectionFromMetrics(nextMetrics);
       signalLevel = muted ? 0 : nextMetrics.signalLevel ?? 0;
       _updateAdaptiveFormatPressureFromMetrics(nextMetrics);
       _syncReceiverProfileFromMetrics(nextMetrics);
@@ -1647,6 +1882,8 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void _fail(String message) {
+    _cancelDiscoveryIdleTimeout();
+    _cancelStreamConnectionTimeout();
     activity = RelayActivity.error;
     errorMessage = message;
     noticeMessage = null;
@@ -1672,6 +1909,7 @@ class AudioRelayController extends ChangeNotifier {
     selectedPreset = profile.mode;
     _saveCustomProfileIfNeeded(profile);
     notifyListeners();
+    _schedulePreferencesSave();
     _scheduleActiveProfileApply(reason: applyReason);
   }
 
@@ -1840,11 +2078,90 @@ class AudioRelayController extends ChangeNotifier {
     );
   }
 
+  Future<void> _loadSavedPreferences() async {
+    final AudioRelayPreferences? savedPreferences;
+    try {
+      savedPreferences = await _preferencesStore.loadPreferences();
+    } catch (_) {
+      return;
+    }
+    if (savedPreferences == null) {
+      return;
+    }
+
+    role = savedPreferences.role;
+    transport = savedPreferences.transport;
+    profile = _normalizeProfile(savedPreferences.profile);
+    receiverOutputBackend = savedPreferences.receiverOutputBackend;
+    volume = savedPreferences.volume;
+    muted = savedPreferences.muted;
+    soundboardItems = List.unmodifiable(
+      savedPreferences.soundboardPaths.map(_soundboardItemForPath),
+    );
+    final selectedSoundboardPath = savedPreferences.selectedSoundboardPath;
+    selectedSoundboardItem = soundboardItems
+        .where((item) => item.path == selectedSoundboardPath)
+        .firstOrNull;
+    selectedSoundboardItem ??= soundboardItems.firstOrNull;
+    soundboardTarget = savedPreferences.soundboardTarget;
+    selectedSoundboardOutputDeviceId =
+        savedPreferences.selectedSoundboardOutputDeviceId;
+    soundboardVolume = savedPreferences.soundboardVolume;
+  }
+
+  Future<void> _applyRestoredEnginePreferences() async {
+    try {
+      await _engine.setVolume(volume);
+      await _engine.setMuted(muted);
+    } on PlatformException {
+      // Keep the restored UI values if the native backend is unavailable.
+    }
+  }
+
+  AudioRelayPreferences _preferencesSnapshot() {
+    return AudioRelayPreferences(
+      role: role,
+      transport: transport,
+      profile: profile,
+      receiverOutputBackend: receiverOutputBackend,
+      volume: volume,
+      muted: muted,
+      soundboardPaths: soundboardItems
+          .map((item) => item.path)
+          .toList(growable: false),
+      selectedSoundboardPath: selectedSoundboardItem?.path,
+      soundboardTarget: soundboardTarget,
+      selectedSoundboardOutputDeviceId: selectedSoundboardOutputDeviceId,
+      soundboardVolume: soundboardVolume,
+    );
+  }
+
+  void _schedulePreferencesSave() {
+    if (!_preferencesReady) {
+      return;
+    }
+    _preferencesDirty = true;
+    _preferencesSaveTimer?.cancel();
+    _preferencesSaveTimer = Timer(_preferencesSaveDelay, () {
+      _preferencesSaveTimer = null;
+      unawaited(_savePreferences());
+    });
+  }
+
+  Future<void> _savePreferences() async {
+    final preferences = _preferencesSnapshot();
+    _preferencesDirty = false;
+    try {
+      await _preferencesStore.savePreferences(preferences);
+    } catch (_) {
+      _preferencesDirty = true;
+    }
+  }
+
   AudioProfile _profileForSavedCustom(AudioProfile sourceProfile) {
     final customProfile = sourceProfile.copyWith(
       mode: AudioPreset.custom,
       outputBackend: OutputAudioBackend.auto,
-      channels: 2,
     );
     final capMs = _effectiveAdaptiveBufferCap(customProfile);
     return customProfile.copyWith(adaptiveBufferCapMs: capMs);
@@ -1917,9 +2234,10 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   AudioProfile _normalizeProfile(AudioProfile nextProfile) {
-    final formatNormalized = nextProfile.channels == 2
+    final channels = nextProfile.channels.clamp(1, 2).toInt();
+    final formatNormalized = nextProfile.channels == channels
         ? nextProfile
-        : nextProfile.copyWith(channels: 2);
+        : nextProfile.copyWith(channels: channels);
     final sampleRateNormalized = switch (formatNormalized.codec) {
       AudioCodec.opus =>
         formatNormalized.sampleRate == 48000
@@ -2810,6 +3128,22 @@ class AudioRelayController extends ChangeNotifier {
     return hostname;
   }
 
+  static String _formatByteSize(int sizeBytes) {
+    if (sizeBytes <= 0) {
+      return 'Unknown size';
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB'];
+    var value = sizeBytes.toDouble();
+    var unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    final decimals = value >= 10 || unitIndex == 0 ? 0 : 1;
+    return '${value.toStringAsFixed(decimals)} ${units[unitIndex]}';
+  }
+
   SoundPlaybackItem _soundboardItemForPath(String path) {
     final segments = path.split(RegExp(r'[\\/]'));
     final name = segments.last.trim();
@@ -2959,6 +3293,16 @@ class AudioRelayController extends ChangeNotifier {
       return DevicePlatform.android;
     }
     return DevicePlatform.unknown;
+  }
+
+  static String _durationLabel(Duration duration) {
+    if (duration.inMinutes >= 1 && duration.inSeconds % 60 == 0) {
+      return '${duration.inMinutes} min';
+    }
+    if (duration.inSeconds >= 1) {
+      return '${duration.inSeconds} sec';
+    }
+    return 'a moment';
   }
 
   AudioCodec get _bitrateTargetCodec {

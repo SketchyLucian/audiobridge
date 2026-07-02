@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:audiorelay_clone/features/audio_relay/application/audio_relay_controller.dart';
 import 'package:audiorelay_clone/features/audio_relay/data/audio_profile_store.dart';
+import 'package:audiorelay_clone/features/audio_relay/data/audio_relay_preferences_store.dart';
 import 'package:audiorelay_clone/features/audio_relay/data/discovery_service.dart';
 import 'package:audiorelay_clone/features/audio_relay/data/native_audio_engine.dart';
 import 'package:audiorelay_clone/features/audio_relay/data/update_platform.dart';
@@ -55,23 +56,41 @@ void main() {
     expect(AudioProfile.usbTetheringLowLatency.codec, AudioCodec.auto);
   });
 
-  test('all presets and loaded profiles stay stereo', () {
+  test('all presets default to stereo', () {
     for (final preset in AudioPreset.values) {
       expect(preset.profile.channels, 2);
     }
+  });
 
-    final parsedProfile = AudioProfile.fromMap({
+  test('audio profiles parse and clamp mono or stereo channels', () {
+    final monoProfile = AudioProfile.fromMap({
       'mode': 'gaming',
       'sampleRate': 48000,
       'channels': 1,
     });
-    expect(parsedProfile.channels, 2);
+    final excessiveProfile = AudioProfile.fromMap({'channels': 8});
 
+    expect(monoProfile.channels, 1);
+    expect(monoProfile.toMap()['channels'], 1);
+    expect(excessiveProfile.channels, 2);
+  });
+
+  test('channel setting changes between mono and stereo', () {
     final controller = AudioRelayController(engine: _FakeAudioRelayEngine());
+
     controller.updateChannels(1);
-    expect(controller.profile.channels, 2);
+
+    expect(controller.profile.channels, 1);
+    expect(controller.channelModeLabel, 'Mono');
 
     controller.dispose();
+  });
+
+  test('mono PCM uses half the stereo bandwidth', () {
+    final stereo = AudioPreset.balanced.profile;
+    final mono = stereo.copyWith(channels: 1);
+
+    expect(mono.effectiveBitrateKbps, stereo.effectiveBitrateKbps ~/ 2);
   });
 
   test('manual values auto-match a known preset again', () {
@@ -125,6 +144,7 @@ void main() {
     );
 
     controller.updatePreset(AudioPreset.gaming);
+    controller.updateChannels(1);
     controller.updatePlaybackBuffer(22);
     controller.saveCustomPreset();
     controller.updateAdaptiveBufferCap(54);
@@ -132,15 +152,18 @@ void main() {
     expect(controller.selectedPreset, AudioPreset.custom);
     expect(controller.profile.mode, AudioPreset.custom);
     expect(controller.profile.playbackBufferMs, 22);
+    expect(controller.profile.channels, 1);
     expect(controller.profile.adaptiveBufferCapMs, 54);
     expect(store.savedProfile?.mode, AudioPreset.custom);
     expect(store.savedProfile?.playbackBufferMs, 22);
+    expect(store.savedProfile?.channels, 1);
 
     controller.updatePreset(AudioPreset.music);
     controller.updatePreset(AudioPreset.custom);
 
     expect(controller.profile.mode, AudioPreset.custom);
     expect(controller.profile.playbackBufferMs, 22);
+    expect(controller.profile.channels, 1);
     expect(controller.profile.adaptiveBufferCapMs, 54);
 
     controller.dispose();
@@ -179,6 +202,7 @@ void main() {
       engine: _FakeAudioRelayEngine(),
       discoveryService: _FakeDiscoveryService(),
       profileStore: store,
+      preferencesStore: _FakeAudioRelayPreferencesStore(),
     );
 
     await controller.initialize();
@@ -187,6 +211,99 @@ void main() {
     expect(controller.profile.mode, AudioPreset.custom);
     expect(controller.profile.playbackBufferMs, 72);
     expect(controller.profile.adaptiveBufferCapMs, 144);
+
+    controller.dispose();
+  });
+
+  test('initialize restores durable app preferences', () async {
+    const firstSound = r'C:\sounds\first.wav';
+    const secondSound = r'C:\sounds\second.wav';
+    final preferencesStore = _FakeAudioRelayPreferencesStore(
+      savedPreferences: AudioRelayPreferences(
+        role: RelayRole.sender,
+        transport: RelayTransport.usbTethering,
+        profile: AudioProfile(
+          mode: AudioPreset.custom,
+          codec: AudioCodec.pcm,
+          sampleRate: 48000,
+          bitrateKbps: 768,
+          latencyMs: 24,
+          captureBufferMs: 12,
+          playbackBufferMs: 24,
+          packetTimeMs: 2,
+          channels: 1,
+        ),
+        receiverOutputBackend: OutputAudioBackend.auto,
+        volume: 0.41,
+        muted: true,
+        soundboardPaths: [firstSound, secondSound],
+        selectedSoundboardPath: secondSound,
+        soundboardTarget: SoundboardPlaybackTarget.stream,
+        selectedSoundboardOutputDeviceId: 'route-1',
+        soundboardVolume: 0.36,
+      ),
+    );
+    final controller = AudioRelayController(
+      engine: _FakeAudioRelayEngine(capabilities: _soundboardCapabilities),
+      discoveryService: _FakeDiscoveryService(),
+      profileStore: _FakeAudioProfileStore(),
+      preferencesStore: preferencesStore,
+      appVersionProvider: () async => '1.1.0',
+      checkForUpdatesOnInitialize: false,
+      preferencesSaveDelay: const Duration(days: 1),
+    );
+
+    await controller.initialize();
+
+    expect(controller.role, RelayRole.sender);
+    expect(controller.transport, RelayTransport.usbTethering);
+    expect(controller.profile.mode, AudioPreset.custom);
+    expect(controller.profile.channels, 1);
+    expect(controller.volume, 0.41);
+    expect(controller.muted, true);
+    expect(controller.soundboardItems.map((item) => item.path), [
+      firstSound,
+      secondSound,
+    ]);
+    expect(controller.selectedSoundboardItem?.path, secondSound);
+    expect(controller.soundboardTarget, SoundboardPlaybackTarget.stream);
+    expect(controller.selectedSoundboardOutputDeviceId, 'route-1');
+    expect(controller.soundboardVolume, 0.36);
+
+    controller.dispose();
+  });
+
+  test('flush persists the latest user-controlled settings', () async {
+    const soundPath = r'C:\sounds\airhorn.wav';
+    final preferencesStore = _FakeAudioRelayPreferencesStore();
+    final controller = AudioRelayController(
+      engine: _FakeAudioRelayEngine(capabilities: _soundboardCapabilities),
+      discoveryService: _FakeDiscoveryService(),
+      profileStore: _FakeAudioProfileStore(),
+      preferencesStore: preferencesStore,
+      appVersionProvider: () async => '1.1.0',
+      checkForUpdatesOnInitialize: false,
+      preferencesSaveDelay: const Duration(days: 1),
+    );
+    await controller.initialize();
+    preferencesStore.savedPreferences = null;
+
+    controller.updateChannels(1);
+    await controller.updateVolume(0.52);
+    await controller.updateMuted(true);
+    controller.addSoundboardFiles([soundPath]);
+    controller.updateSoundboardTarget(SoundboardPlaybackTarget.stream);
+    controller.updateSoundboardVolume(0.28);
+    await controller.flushPreferences();
+
+    final saved = preferencesStore.savedPreferences;
+    expect(saved?.profile.channels, 1);
+    expect(saved?.volume, 0.52);
+    expect(saved?.muted, true);
+    expect(saved?.soundboardPaths, [soundPath]);
+    expect(saved?.selectedSoundboardPath, soundPath);
+    expect(saved?.soundboardTarget, SoundboardPlaybackTarget.stream);
+    expect(saved?.soundboardVolume, 0.28);
 
     controller.dispose();
   });
@@ -380,6 +497,17 @@ void main() {
       expect(controller.activePlaybackBufferLabel, 'Requested 18 ms');
       expect(controller.playbackQueueFillLabel, '0%');
       expect(controller.adaptiveBufferCapLabel, '120 ms');
+      expect(controller.receiverBufferValueLabel, '18 ms min');
+      expect(controller.receiverBufferDetailLabel, '864 frames minimum');
+      expect(
+        controller.receiverBufferDescription,
+        contains('minimum receiver delay'),
+      );
+
+      controller.updateReceiverAdaptiveBuffer(false);
+      expect(controller.receiverBufferValueLabel, '18 ms');
+      expect(controller.receiverBufferDetailLabel, '864 frames fixed');
+      expect(controller.receiverBufferDescription, contains('fixed'));
 
       controller.dispose();
     },
@@ -415,6 +543,7 @@ void main() {
       'adaptiveUnderrunsInBurst': '4',
       'adaptiveLowQueueSamples': 3,
       'playbackQueueFillPercent': 72,
+      'peerConnected': 'true',
     });
 
     expect(metrics.audioLatencyMs, 51);
@@ -430,6 +559,7 @@ void main() {
     expect(metrics.adaptiveUnderrunsInBurst, 4);
     expect(metrics.adaptiveLowQueueSamples, 3);
     expect(metrics.playbackQueueFillPercent, 72);
+    expect(metrics.peerConnected, true);
     expect(metrics.effectiveLatencyMs, 51);
   });
 
@@ -501,6 +631,7 @@ void main() {
         ),
         discoveryService: _FakeDiscoveryService(),
         profileStore: _FakeAudioProfileStore(),
+        preferencesStore: _FakeAudioRelayPreferencesStore(),
         checkForUpdatesOnInitialize: false,
       );
       var notifications = 0;
@@ -530,13 +661,19 @@ void main() {
       appVersionProvider: () async => '1.0.4',
       updateTarget: AppUpdateTarget.android,
     );
+    controller.appVersion = '1.0.4';
 
     await controller.checkForUpdates();
 
     expect(controller.updateStatus, AppUpdateStatus.available);
     expect(controller.availableUpdate?.tagName, 'v1.0.5');
     expect(controller.updateActionLabel, 'Download');
-    expect(controller.updateDetailLabel, 'v1.0.5 is ready to download.');
+    expect(controller.updateCurrentVersionLabel, 'v1.0.4');
+    expect(controller.updateLatestVersionLabel, 'v1.0.5');
+    expect(controller.updateLatestVersionDetailLabel, 'Latest Android release');
+    expect(controller.updatePackageLabel, 'AudioBridge-1.0.5-android.apk');
+    expect(controller.updatePackageDetailLabel, '3 B Android package');
+    expect(controller.updateDetailLabel, 'Current v1.0.4, latest v1.0.5.');
 
     controller.dispose();
   });
@@ -547,6 +684,7 @@ void main() {
       engine: _FakeAudioRelayEngine(),
       discoveryService: _FakeDiscoveryService(),
       profileStore: _FakeAudioProfileStore(),
+      preferencesStore: _FakeAudioRelayPreferencesStore(),
       updateService: updateService,
       appVersionProvider: () async => '1.1.0',
       updateTarget: AppUpdateTarget.windows,
@@ -2002,6 +2140,76 @@ void main() {
     },
   );
 
+  test('receiver scan auto-pauses when no connection is made', () async {
+    final discoveryService = _FakeDiscoveryService();
+    final controller =
+        AudioRelayController(
+            engine: _FakeAudioRelayEngine(),
+            discoveryService: discoveryService,
+            discoveryIdleTimeout: Duration.zero,
+          )
+          ..role = RelayRole.receiver
+          ..capabilities = _supportedCapabilities;
+
+    await controller.startDiscovery();
+    await _pumpEventQueue();
+
+    expect(controller.activity, RelayActivity.idle);
+    expect(discoveryService.scanningStarted, false);
+    expect(
+      controller.noticeMessage,
+      'Paused receiver discovery after a moment without a connection.',
+    );
+
+    controller.dispose();
+  });
+
+  test('sender stream stops when no receiver connects', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: _FakeDiscoveryService(),
+            streamConnectionTimeout: Duration.zero,
+          )
+          ..role = RelayRole.sender
+          ..capabilities = _supportedCapabilities;
+
+    await controller.startSenderStream();
+    await _pumpEventQueue();
+
+    expect(controller.activity, RelayActivity.advertising);
+    expect(engine.calls, ['prepareSender', 'startStream', 'stopStream']);
+    expect(
+      controller.noticeMessage,
+      'Stopped stream after a moment without a receiver.',
+    );
+
+    controller.dispose();
+  });
+
+  test('sender stream stays active when peer metrics arrive', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: _FakeDiscoveryService(),
+            streamConnectionTimeout: const Duration(milliseconds: 20),
+          )
+          ..role = RelayRole.sender
+          ..capabilities = _supportedCapabilities;
+
+    await controller.startSenderStream();
+    engine.metrics = const AudioRelayMetrics(peerConnected: true);
+    await controller.pollMetricsForTesting();
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+
+    expect(controller.activity, RelayActivity.streaming);
+    expect(engine.calls, ['prepareSender', 'startStream']);
+
+    controller.dispose();
+  });
+
   test('sender cannot change receiver output backend', () {
     final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
       ..role = RelayRole.sender
@@ -2316,6 +2524,11 @@ AppUpdateRelease _updateRelease({
   );
 }
 
+Future<void> _pumpEventQueue() async {
+  await Future<void>.delayed(Duration.zero);
+  await Future<void>.delayed(Duration.zero);
+}
+
 class _FakeAudioRelayEngine implements AudioRelayEngine {
   _FakeAudioRelayEngine({
     this.prepareUsbError,
@@ -2454,6 +2667,22 @@ class _FakeAudioProfileStore implements AudioProfileStore {
       throw error;
     }
     savedProfile = profile;
+  }
+}
+
+class _FakeAudioRelayPreferencesStore implements AudioRelayPreferencesStore {
+  _FakeAudioRelayPreferencesStore({this.savedPreferences});
+
+  AudioRelayPreferences? savedPreferences;
+
+  @override
+  Future<AudioRelayPreferences?> loadPreferences() async {
+    return savedPreferences;
+  }
+
+  @override
+  Future<void> savePreferences(AudioRelayPreferences preferences) async {
+    savedPreferences = preferences;
   }
 }
 

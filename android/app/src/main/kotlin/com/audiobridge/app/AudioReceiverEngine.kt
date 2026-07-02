@@ -462,6 +462,7 @@ class AudioReceiverEngine(private val context: Context) {
     )
 
     fun getMetrics(): Map<String, Any> {
+        val now = SystemClock.elapsedRealtime()
         if (engineRole == EngineRole.SENDER) {
             val metrics = mutableMapOf<String, Any>()
             if (running) {
@@ -469,7 +470,9 @@ class AudioReceiverEngine(private val context: Context) {
             }
 
             val receivedAt = remoteMetricsReceivedAtMs.get()
-            if (receivedAt <= 0 || SystemClock.elapsedRealtime() - receivedAt > 3000L) {
+            val peerConnected = receivedAt > 0 && now - receivedAt <= 3000L
+            metrics["peerConnected"] = peerConnected
+            if (!peerConnected) {
                 return metrics
             }
 
@@ -508,7 +511,6 @@ class AudioReceiverEngine(private val context: Context) {
             return metrics
         }
 
-        val now = SystemClock.elapsedRealtime()
         val sampleRate = currentSampleRate.takeIf { it > 0 } ?: profile.sampleRate
         val track = audioTrack
         if (track == null) {
@@ -553,6 +555,7 @@ class AudioReceiverEngine(private val context: Context) {
             "lostPacketCount" to lostPackets.get(),
             "trimCount" to trimCount.get(),
             "signalLevel" to signalLevel,
+            "peerConnected" to true,
             "activeProfile" to activeProfileForMetrics()
         )
         if (!audioLatencyMs.isNaN()) {
@@ -606,6 +609,7 @@ class AudioReceiverEngine(private val context: Context) {
             "lostPacketCount" to lostPackets.get(),
             "trimCount" to trimCount.get(),
             "signalLevel" to 0.0,
+            "peerConnected" to false,
             "activeProfile" to activeProfileForMetrics()
         )
     }
@@ -1284,7 +1288,7 @@ class AudioReceiverEngine(private val context: Context) {
         audioRecord = capture.record
         currentInputSampleRate = capture.sampleRate
         currentSampleRate = capture.sampleRate
-        currentChannels = 2
+        currentChannels = profile.channels.coerceIn(1, 2)
 
         val packetFrames = profile.packetFrames(sampleRate = capture.sampleRate)
         val readBuffer = ShortArray(packetFrames * capture.channels)
@@ -1377,7 +1381,7 @@ class AudioReceiverEngine(private val context: Context) {
         sampleRate: Int,
         channels: Int
     ) {
-        val packetChannels = 2
+        val packetChannels = profile.channels.coerceIn(1, 2)
         val packetData: ShortArray
         val packetSampleCount: Int
         if (channels == packetChannels) {
@@ -1386,18 +1390,27 @@ class AudioReceiverEngine(private val context: Context) {
         } else {
             val inputChannels = max(1, channels)
             val frameCount = sampleCount / inputChannels
-            val upmixed = ShortArray(frameCount * packetChannels)
+            val remixed = ShortArray(frameCount * packetChannels)
             var input = 0
             var output = 0
             repeat(frameCount) {
-                val sample = data[input]
-                upmixed[output] = sample
-                upmixed[output + 1] = sample
+                if (packetChannels == 1) {
+                    var sum = 0
+                    repeat(inputChannels) { channel ->
+                        sum += data[input + channel].toInt()
+                    }
+                    remixed[output] = (sum / inputChannels).toShort()
+                } else {
+                    repeat(packetChannels) { channel ->
+                        remixed[output + channel] =
+                            data[input + min(channel, inputChannels - 1)]
+                    }
+                }
                 input += inputChannels
                 output += packetChannels
             }
-            packetData = upmixed
-            packetSampleCount = upmixed.size
+            packetData = remixed
+            packetSampleCount = remixed.size
         }
 
         val codecId = senderCodecId()
@@ -4667,7 +4680,7 @@ private data class AudioProfile(
                 outputBackend = OutputAudioBackend.fromName(map["outputBackend"]?.toString()),
                 sampleRate = (map["sampleRate"] as? Number)?.toInt() ?: 48000,
                 bitrateKbps = (map["bitrateKbps"] as? Number)?.toInt() ?: 192,
-                channels = 2,
+                channels = ((map["channels"] as? Number)?.toInt() ?: 2).coerceIn(1, 2),
                 latencyMs = latencyMs,
                 captureBufferMs = (map["captureBufferMs"] as? Number)?.toInt() ?: latencyMs,
                 playbackBufferMs = (map["playbackBufferMs"] as? Number)?.toInt() ?: latencyMs,

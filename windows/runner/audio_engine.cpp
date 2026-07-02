@@ -837,7 +837,8 @@ AudioProfile ReadProfile(const flutter::EncodableValue* arguments) {
   profile.mode = ReadMode(map);
   profile.codec = ReadCodec(map);
   profile.sample_rate = ReadInt(map, "sampleRate", profile.sample_rate);
-  profile.channels = 2;
+  profile.channels =
+      std::clamp(ReadInt(map, "channels", profile.channels), 1, 2);
   profile.bitrate_kbps = ReadInt(map, "bitrateKbps", profile.bitrate_kbps);
   profile.latency_ms = ReadInt(map, "latencyMs", profile.latency_ms);
   profile.capture_buffer_ms =
@@ -2039,6 +2040,13 @@ class WindowsAudioEngine::Impl {
   flutter::EncodableMap GetMetrics() const {
     flutter::EncodableMap metrics;
     if (playback_running_.load()) {
+      const int64_t last_packet_at =
+          local_last_audio_packet_received_at_ms_.load();
+      metrics[flutter::EncodableValue("peerConnected")] =
+          flutter::EncodableValue(last_packet_at > 0 &&
+                                  NowMillis() - last_packet_at <=
+                                      kSourceIdleTimeoutMs);
+
       const double output_latency_ms = LocalOutputLatencyMs();
       if (output_latency_ms < 0) {
         return metrics;
@@ -2109,7 +2117,11 @@ class WindowsAudioEngine::Impl {
     const int64_t received_at = remote_metrics_received_at_ms_.load();
     const double output_latency_ms = remote_output_latency_ms_.load();
     const double audio_latency_ms = remote_audio_latency_ms_.load();
-    if (received_at <= 0 || NowMillis() - received_at > 3000) {
+    const bool peer_connected =
+        received_at > 0 && NowMillis() - received_at <= 3000;
+    metrics[flutter::EncodableValue("peerConnected")] =
+        flutter::EncodableValue(peer_connected);
+    if (!peer_connected) {
       return metrics;
     }
 
@@ -2497,6 +2509,7 @@ class WindowsAudioEngine::Impl {
     local_render_started_at_ms_ = 0;
     local_signal_peak_ = 0.0;
     local_last_playback_signal_level_ = 0.0;
+    local_last_audio_packet_received_at_ms_ = 0;
     ResetLocalAdaptiveDelayTracker();
     opus_codec_.Shutdown();
     aac_codec_.Shutdown();
@@ -4678,6 +4691,7 @@ class WindowsAudioEngine::Impl {
     local_input_sample_rate_ = sample_rate;
     local_input_channels_ = channels;
     local_codec_id_ = kCodecPcm;
+    local_last_audio_packet_received_at_ms_ = NowMillis();
 
     PcmPlaybackPacket packet;
     packet.sample_rate = sample_rate;
@@ -5677,6 +5691,7 @@ class WindowsAudioEngine::Impl {
   std::vector<std::string> remote_supported_codecs_;
   mutable std::atomic<double> local_signal_peak_ = 0.0;
   std::atomic<double> local_last_playback_signal_level_ = 0.0;
+  std::atomic<int64_t> local_last_audio_packet_received_at_ms_ = 0;
   std::atomic<int64_t> local_buffer_size_frames_ = 0;
   std::atomic<int64_t> local_target_buffer_frames_ = 0;
   std::atomic<int64_t> local_adaptive_playback_buffer_ms_ = 0;

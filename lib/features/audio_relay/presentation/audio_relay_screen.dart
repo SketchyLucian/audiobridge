@@ -1,5 +1,8 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:ui' show AppExitResponse;
+
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/material.dart';
 
 import '../application/audio_relay_controller.dart';
 import '../data/discovery_service.dart';
@@ -45,95 +48,174 @@ class AudioRelayScreen extends StatefulWidget {
 
 class _AudioRelayScreenState extends State<AudioRelayScreen> {
   late final AudioRelayController controller;
+  late final AppLifecycleListener _lifecycleListener;
 
   @override
   void initState() {
     super.initState();
     controller = AudioRelayController();
+    _lifecycleListener = AppLifecycleListener(
+      onStateChange: (state) {
+        if (state == AppLifecycleState.inactive ||
+            state == AppLifecycleState.paused ||
+            state == AppLifecycleState.hidden ||
+            state == AppLifecycleState.detached) {
+          unawaited(controller.flushPreferences());
+        }
+      },
+      onExitRequested: () async {
+        await controller.flushPreferences();
+        return AppExitResponse.exit;
+      },
+    );
     controller.initialize();
   }
 
   @override
   void dispose() {
+    _lifecycleListener.dispose();
+    unawaited(controller.flushPreferences());
     controller.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: controller,
-      builder: (context, _) {
-        final width = MediaQuery.sizeOf(context).width;
-        final compact = width < 820;
-
-        return Scaffold(
-          appBar: AppBar(
-            title: const Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.spatial_audio_off_rounded),
-                SizedBox(width: 10),
-                Text('AudioBridge'),
-              ],
-            ),
-            actions: [
-              Padding(
-                padding: const EdgeInsets.only(right: 16),
-                child: _StatusPill(activity: controller.activity),
+    return DefaultTabController(
+      length: 2,
+      child: AnimatedBuilder(
+        animation: controller,
+        builder: (context, _) {
+          return Scaffold(
+            appBar: AppBar(
+              title: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.spatial_audio_off_rounded),
+                  SizedBox(width: 10),
+                  Text('AudioBridge'),
+                ],
               ),
-            ],
-          ),
-          body: SafeArea(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 1180),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _Header(controller: controller),
-                      const SizedBox(height: 16),
-                      _UpdatePanel(controller: controller),
-                      const SizedBox(height: 16),
-                      if (compact)
-                        Column(
-                          children: [
-                            _ControlPanel(controller: controller),
-                            const SizedBox(height: 16),
-                            _DevicesPanel(controller: controller),
-                          ],
-                        )
-                      else
-                        Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Expanded(
-                              flex: 6,
-                              child: _ControlPanel(controller: controller),
-                            ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              flex: 5,
-                              child: _DevicesPanel(controller: controller),
-                            ),
-                          ],
-                        ),
-                      if (controller.role == RelayRole.sender) ...[
-                        const SizedBox(height: 16),
-                        _SoundboardPanel(controller: controller),
-                      ],
-                      const SizedBox(height: 16),
-                      _SettingsPanel(controller: controller),
-                    ],
-                  ),
+              actions: [
+                Padding(
+                  padding: const EdgeInsets.only(right: 16),
+                  child: _StatusPill(activity: controller.activity),
                 ),
+              ],
+              bottom: const TabBar(
+                tabs: [
+                  Tab(
+                    key: ValueKey('relay-tab'),
+                    icon: Icon(Icons.settings_input_antenna_rounded),
+                    text: 'Relay',
+                  ),
+                  Tab(
+                    key: ValueKey('soundboard-tab'),
+                    icon: Icon(Icons.library_music_rounded),
+                    text: 'Soundboard',
+                  ),
+                ],
               ),
             ),
-          ),
+            body: SafeArea(
+              child: TabBarView(
+                children: [
+                  _RelayWorkspace(controller: controller),
+                  _SoundboardWorkspace(controller: controller),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _RelayWorkspace extends StatelessWidget {
+  const _RelayWorkspace({required this.controller});
+
+  final AudioRelayController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact = constraints.maxWidth < 820;
+
+        return _WorkspaceScrollView(
+          children: [
+            _Header(controller: controller),
+            const SizedBox(height: 16),
+            _UpdatePanel(controller: controller),
+            const SizedBox(height: 16),
+            if (compact)
+              Column(
+                children: [
+                  _ControlPanel(controller: controller),
+                  const SizedBox(height: 16),
+                  _DevicesPanel(controller: controller),
+                ],
+              )
+            else
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    flex: 6,
+                    child: _ControlPanel(controller: controller),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    flex: 5,
+                    child: _DevicesPanel(controller: controller),
+                  ),
+                ],
+              ),
+            const SizedBox(height: 16),
+            _SettingsPanel(controller: controller),
+          ],
         );
       },
+    );
+  }
+}
+
+class _SoundboardWorkspace extends StatelessWidget {
+  const _SoundboardWorkspace({required this.controller});
+
+  final AudioRelayController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return _WorkspaceScrollView(
+      children: [
+        _Header(controller: controller),
+        const SizedBox(height: 16),
+        _SoundboardPanel(controller: controller),
+      ],
+    );
+  }
+}
+
+class _WorkspaceScrollView extends StatelessWidget {
+  const _WorkspaceScrollView({required this.children});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 1180),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: children,
+          ),
+        ),
+      ),
     );
   }
 }
@@ -154,7 +236,7 @@ class _UpdatePanel extends StatelessWidget {
           _PanelTitle(
             icon: Icons.system_update_alt_rounded,
             title: 'Updates',
-            trailing: Text('v${controller.appVersion}'),
+            trailing: Text(controller.updateCurrentVersionLabel),
           ),
           const SizedBox(height: 12),
           Wrap(
@@ -168,6 +250,24 @@ class _UpdatePanel extends StatelessWidget {
                   icon: Icons.verified_rounded,
                   value: controller.updateStatusLabel,
                   label: controller.updateDetailLabel,
+                  labelMaxLines: 2,
+                ),
+              ),
+              ConstrainedBox(
+                constraints: const BoxConstraints(minWidth: 200, maxWidth: 300),
+                child: _ReadoutValue(
+                  icon: Icons.new_releases_rounded,
+                  value: controller.updateLatestVersionLabel,
+                  label: controller.updateLatestVersionDetailLabel,
+                ),
+              ),
+              ConstrainedBox(
+                constraints: const BoxConstraints(minWidth: 240, maxWidth: 420),
+                child: _ReadoutValue(
+                  icon: Icons.inventory_2_rounded,
+                  value: controller.updatePackageLabel,
+                  label: controller.updatePackageDetailLabel,
+                  labelMaxLines: 2,
                 ),
               ),
               FilledButton.icon(
@@ -1083,11 +1183,12 @@ class _UnifiedAudioSettings extends StatelessWidget {
       _SettingBlock(
         compact: true,
         title: 'Channels',
-        description: 'All modes keep left/right playback positioning.',
-        child: _ReadoutValue(
-          icon: Icons.surround_sound_rounded,
-          value: 'Stereo',
-          label: controller.channelModeLabel,
+        description:
+            'Mono combines left and right to reduce bandwidth. Stereo preserves playback positioning.',
+        child: _ChannelPicker(
+          channels: profile.channels,
+          enabled: !restartRequiredLocked,
+          onChanged: controller.updateChannels,
         ),
       ),
       _SettingBlock(
@@ -1140,8 +1241,15 @@ class _UnifiedAudioSettings extends StatelessWidget {
       _SettingBlock(
         compact: true,
         title: 'Receiver buffer',
-        description:
-            'Lower feels more immediate. Higher adds latency but prevents pops and dropouts on unstable links.',
+        titleTrailing: _InlineSettingToggle(
+          label: 'Adaptive',
+          value: profile.receiverAdaptiveBuffer,
+          tooltip: controller.receiverAdaptiveBufferDetailLabel,
+          onChanged: liveControlsLocked
+              ? null
+              : controller.updateReceiverAdaptiveBuffer,
+        ),
+        description: controller.receiverBufferDescription,
         child: _ReceiverBufferControl(
           controller: controller,
           locked: liveControlsLocked,
@@ -1548,6 +1656,45 @@ class _SampleRatePicker extends StatelessWidget {
   }
 }
 
+class _ChannelPicker extends StatelessWidget {
+  const _ChannelPicker({
+    required this.channels,
+    required this.enabled,
+    required this.onChanged,
+  });
+
+  final int channels;
+  final bool enabled;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return SegmentedButton<int>(
+      key: const ValueKey('channel-picker'),
+      expandedInsets: EdgeInsets.zero,
+      showSelectedIcon: false,
+      segments: const [
+        ButtonSegment(
+          value: 1,
+          icon: Icon(Icons.speaker_rounded),
+          label: Text('Mono', key: ValueKey('mono-channel-option')),
+        ),
+        ButtonSegment(
+          value: 2,
+          icon: Icon(Icons.surround_sound_rounded),
+          label: Text('Stereo', key: ValueKey('stereo-channel-option')),
+        ),
+      ],
+      selected: {channels},
+      onSelectionChanged: enabled
+          ? (selection) {
+              onChanged(selection.first);
+            }
+          : null,
+    );
+  }
+}
+
 class _BitratePicker extends StatelessWidget {
   const _BitratePicker({required this.controller, required this.enabled});
 
@@ -1787,16 +1934,9 @@ class _ReceiverBufferControl extends StatelessWidget {
           min: AudioProfile.minBufferMs.toDouble(),
           max: AudioProfile.maxBufferMs.toDouble(),
           divisions: AudioProfile.maxBufferMs - AudioProfile.minBufferMs,
-          valueLabel: '${profile.playbackBufferMs} ms',
+          valueLabel: controller.receiverBufferValueLabel,
           detail: controller.receiverBufferDetailLabel,
           onChanged: locked ? null : controller.updatePlaybackBuffer,
-        ),
-        const SizedBox(height: 8),
-        _SettingSwitch(
-          value: profile.receiverAdaptiveBuffer,
-          valueLabel: controller.receiverAdaptiveBufferLabel,
-          detail: controller.receiverAdaptiveBufferDetailLabel,
-          onChanged: locked ? null : controller.updateReceiverAdaptiveBuffer,
         ),
       ],
     );
@@ -1869,58 +2009,76 @@ class _SettingSlider extends StatelessWidget {
   }
 }
 
-class _SettingSwitch extends StatelessWidget {
-  const _SettingSwitch({
+class _InlineSettingToggle extends StatelessWidget {
+  const _InlineSettingToggle({
+    required this.label,
     required this.value,
-    required this.valueLabel,
-    required this.detail,
+    required this.tooltip,
     required this.onChanged,
   });
 
+  final String label;
   final bool value;
-  final String valueLabel;
-  final String detail;
+  final String tooltip;
   final ValueChanged<bool>? onChanged;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final enabled = onChanged != null;
+    final foregroundColor = enabled
+        ? theme.colorScheme.onSurface
+        : theme.colorScheme.onSurfaceVariant;
+    final borderColor = value && enabled
+        ? theme.colorScheme.secondary.withValues(alpha: 0.65)
+        : theme.colorScheme.outlineVariant;
+    final backgroundColor = value && enabled
+        ? theme.colorScheme.secondaryContainer.withValues(alpha: 0.42)
+        : Colors.transparent;
 
-    return Container(
-      constraints: const BoxConstraints(minHeight: 48),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: theme.colorScheme.outlineVariant),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(999),
+          onTap: enabled ? () => onChanged!(!value) : null,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 140),
+            constraints: const BoxConstraints(minHeight: 28),
+            padding: const EdgeInsets.only(left: 8, right: 2),
+            decoration: BoxDecoration(
+              color: backgroundColor,
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: borderColor),
+            ),
+            child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  valueLabel,
-                  style: theme.textTheme.labelLarge?.copyWith(
+                  label,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: foregroundColor,
                     fontWeight: FontWeight.w800,
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  detail,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
+                SizedBox(
+                  width: 38,
+                  height: 24,
+                  child: IgnorePointer(
+                    child: FittedBox(
+                      fit: BoxFit.contain,
+                      child: Switch(
+                        value: value,
+                        onChanged: enabled ? onChanged : null,
+                      ),
+                    ),
                   ),
                 ),
               ],
             ),
           ),
-          const SizedBox(width: 12),
-          Switch(value: value, onChanged: onChanged),
-        ],
+        ),
       ),
     );
   }
@@ -1931,11 +2089,13 @@ class _ReadoutValue extends StatelessWidget {
     required this.icon,
     required this.value,
     required this.label,
+    this.labelMaxLines = 1,
   });
 
   final IconData icon;
   final String value;
   final String label;
+  final int labelMaxLines;
 
   @override
   Widget build(BuildContext context) {
@@ -1967,7 +2127,7 @@ class _ReadoutValue extends StatelessWidget {
                 ),
                 Text(
                   label,
-                  maxLines: 1,
+                  maxLines: labelMaxLines,
                   overflow: TextOverflow.ellipsis,
                   style: theme.textTheme.labelSmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
@@ -2398,12 +2558,14 @@ class _SettingBlock extends StatelessWidget {
   const _SettingBlock({
     required this.title,
     required this.child,
+    this.titleTrailing,
     this.description,
     this.compact = false,
   });
 
   final String title;
   final Widget child;
+  final Widget? titleTrailing;
   final String? description;
   final bool compact;
 
@@ -2414,11 +2576,19 @@ class _SettingBlock extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          title,
-          style: theme.textTheme.labelLarge?.copyWith(
-            color: theme.colorScheme.onSurfaceVariant,
-          ),
+        Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text(
+              title,
+              style: theme.textTheme.labelLarge?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            ?titleTrailing,
+          ],
         ),
         if (description != null) ...[
           SizedBox(height: compact ? 2 : 4),

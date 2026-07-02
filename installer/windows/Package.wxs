@@ -8,7 +8,6 @@
       Scope="perMachine"
       InstallerVersion="500">
     <MajorUpgrade
-        AllowSameVersionUpgrades="yes"
         DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
@@ -41,7 +40,7 @@
               Id="VirtualMicSetupShortcut"
               Name="$(var.ProductName) Virtual Mic Setup"
               Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
-              Arguments="-NoExit -NoProfile -ExecutionPolicy Bypass -File &quot;[#VirtualMicSetupScriptFile]&quot; -OpenDownloadPage"
+              Arguments="-NoExit -NoProfile -ExecutionPolicy Bypass -File &quot;[VIRTUALMICFOLDER]setup_windows_virtual_mic.ps1&quot; -OpenDownloadPage"
               WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
           <RegistryValue
