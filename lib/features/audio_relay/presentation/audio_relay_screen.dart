@@ -4,6 +4,7 @@ import 'package:file_selector/file_selector.dart';
 import '../application/audio_relay_controller.dart';
 import '../data/discovery_service.dart';
 import '../domain/audio_relay_models.dart';
+import '../domain/update_models.dart';
 
 extension _AudioProfileDisplay on AudioProfile {
   String get sourceSampleRateText {
@@ -94,6 +95,8 @@ class _AudioRelayScreenState extends State<AudioRelayScreen> {
                     children: [
                       _Header(controller: controller),
                       const SizedBox(height: 16),
+                      _UpdatePanel(controller: controller),
+                      const SizedBox(height: 16),
                       if (compact)
                         Column(
                           children: [
@@ -131,6 +134,71 @@ class _AudioRelayScreenState extends State<AudioRelayScreen> {
           ),
         );
       },
+    );
+  }
+}
+
+class _UpdatePanel extends StatelessWidget {
+  const _UpdatePanel({required this.controller});
+
+  final AudioRelayController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = controller.updateDownloadProgress;
+
+    return _Panel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _PanelTitle(
+            icon: Icons.system_update_alt_rounded,
+            title: 'Updates',
+            trailing: Text('v${controller.appVersion}'),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              ConstrainedBox(
+                constraints: const BoxConstraints(minWidth: 240, maxWidth: 520),
+                child: _ReadoutValue(
+                  icon: Icons.verified_rounded,
+                  value: controller.updateStatusLabel,
+                  label: controller.updateDetailLabel,
+                ),
+              ),
+              FilledButton.icon(
+                onPressed: controller.canRunUpdateAction
+                    ? controller.runUpdateAction
+                    : null,
+                icon: Icon(switch (controller.updateStatus) {
+                  AppUpdateStatus.available => Icons.download_rounded,
+                  AppUpdateStatus.ready => Icons.system_update_alt_rounded,
+                  AppUpdateStatus.checking ||
+                  AppUpdateStatus.downloading ||
+                  AppUpdateStatus.installing => Icons.sync_rounded,
+                  _ => Icons.refresh_rounded,
+                }),
+                label: Text(controller.updateActionLabel),
+              ),
+              OutlinedButton.icon(
+                onPressed: controller.canOpenUpdateReleasePage
+                    ? controller.openUpdateReleasePage
+                    : null,
+                icon: const Icon(Icons.open_in_new_rounded),
+                label: const Text('Release'),
+              ),
+            ],
+          ),
+          if (progress != null) ...[
+            const SizedBox(height: 10),
+            LinearProgressIndicator(value: progress.clamp(0, 1).toDouble()),
+          ],
+        ],
+      ),
     );
   }
 }

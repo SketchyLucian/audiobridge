@@ -1,8 +1,13 @@
 #include "flutter_window.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <optional>
 #include <shellapi.h>
 #include <string>
+#include <variant>
+#include <windows.h>
 
 #include "flutter/generated_plugin_registrant.h"
 #include "resource.h"
@@ -20,6 +25,68 @@ void ReturnError(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
   } else {
     result->Success();
   }
+}
+
+std::optional<std::string> StringArgument(
+    const flutter::EncodableValue* arguments,
+    const std::string& key) {
+  if (!arguments ||
+      !std::holds_alternative<flutter::EncodableMap>(*arguments)) {
+    return std::nullopt;
+  }
+
+  const auto& map = std::get<flutter::EncodableMap>(*arguments);
+  auto iterator = map.find(flutter::EncodableValue(key));
+  if (iterator == map.end() ||
+      !std::holds_alternative<std::string>(iterator->second)) {
+    return std::nullopt;
+  }
+
+  return std::get<std::string>(iterator->second);
+}
+
+std::wstring Utf8ToWide(const std::string& value) {
+  if (value.empty()) {
+    return std::wstring();
+  }
+
+  const int size = MultiByteToWideChar(
+      CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+      static_cast<int>(value.size()), nullptr, 0);
+  if (size <= 0) {
+    return std::wstring();
+  }
+
+  std::wstring wide(size, L'\0');
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                      static_cast<int>(value.size()), wide.data(), size);
+  return wide;
+}
+
+bool HasCaseInsensitiveSuffix(const std::string& value,
+                              const std::string& suffix) {
+  if (value.size() < suffix.size()) {
+    return false;
+  }
+
+  std::string tail = value.substr(value.size() - suffix.size());
+  std::transform(tail.begin(), tail.end(), tail.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::tolower(character));
+                 });
+  return tail == suffix;
+}
+
+bool ShellOpen(const std::string& target) {
+  const std::wstring wide_target = Utf8ToWide(target);
+  if (wide_target.empty()) {
+    return false;
+  }
+
+  const HINSTANCE outcome =
+      ShellExecuteW(nullptr, L"open", wide_target.c_str(), nullptr, nullptr,
+                    SW_SHOWNORMAL);
+  return reinterpret_cast<intptr_t>(outcome) > 32;
 }
 
 }  // namespace
@@ -147,6 +214,44 @@ bool FlutterWindow::OnCreate() {
 
         if (method == "disconnect") {
           native_audio_engine_->Disconnect();
+          result->Success();
+          return;
+        }
+
+        if (method == "openExternalUrl") {
+          const auto url = StringArgument(call.arguments(), "url");
+          if (!url.has_value() || url->rfind("https://", 0) != 0) {
+            result->Error("update_url", "The release link is not secure.");
+            return;
+          }
+          if (!ShellOpen(url.value())) {
+            result->Error("update_url", "Unable to open release page.");
+            return;
+          }
+          result->Success();
+          return;
+        }
+
+        if (method == "installUpdatePackage") {
+          const auto path = StringArgument(call.arguments(), "path");
+          if (!path.has_value() ||
+              !HasCaseInsensitiveSuffix(path.value(), ".msi")) {
+            result->Error("update_package",
+                          "The downloaded Windows installer is missing.");
+            return;
+          }
+          const std::wstring wide_path = Utf8ToWide(path.value());
+          if (wide_path.empty() ||
+              GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            result->Error("update_package",
+                          "The downloaded Windows installer is missing.");
+            return;
+          }
+          if (!ShellOpen(path.value())) {
+            result->Error("update_package",
+                          "Unable to open Windows installer.");
+            return;
+          }
           result->Success();
           return;
         }

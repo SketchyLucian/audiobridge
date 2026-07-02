@@ -4,11 +4,15 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../data/discovery_service.dart';
 import '../data/audio_profile_store.dart';
 import '../data/native_audio_engine.dart';
+import '../data/update_platform.dart';
+import '../data/update_service.dart';
 import '../domain/audio_relay_models.dart';
+import '../domain/update_models.dart';
 
 enum _AdaptiveProfileApplyReason {
   settings,
@@ -24,6 +28,11 @@ class AudioRelayController extends ChangeNotifier {
     AudioRelayEngine? engine,
     DiscoveryService? discoveryService,
     AudioProfileStore? profileStore,
+    AppUpdateService? updateService,
+    UpdateInstaller? updateInstaller,
+    Future<String> Function()? appVersionProvider,
+    AppUpdateTarget? updateTarget,
+    bool checkForUpdatesOnInitialize = true,
     @visibleForTesting
     Duration profileApplyDelay = const Duration(milliseconds: 250),
     @visibleForTesting Duration autoCodecWarmup = const Duration(seconds: 60),
@@ -32,6 +41,12 @@ class AudioRelayController extends ChangeNotifier {
        _discoveryService = discoveryService ?? DiscoveryService(),
        _profileStore =
            profileStore ?? const SharedPreferencesAudioProfileStore(),
+       _updateService = updateService ?? CodebergUpdateService(),
+       _updateInstaller =
+           updateInstaller ?? const MethodChannelUpdateInstaller(),
+       _appVersionProvider = appVersionProvider ?? _defaultAppVersion,
+       _updateTarget = updateTarget ?? AppUpdateTarget.current(),
+       _checkForUpdatesOnInitialize = checkForUpdatesOnInitialize,
        _profileApplyDelay = profileApplyDelay,
        _autoCodecWarmup = autoCodecWarmup,
        _autoCodecQuietHold = autoCodecQuietHold,
@@ -42,6 +57,11 @@ class AudioRelayController extends ChangeNotifier {
   final AudioRelayEngine _engine;
   final DiscoveryService _discoveryService;
   final AudioProfileStore _profileStore;
+  final AppUpdateService _updateService;
+  final UpdateInstaller _updateInstaller;
+  final Future<String> Function() _appVersionProvider;
+  final AppUpdateTarget _updateTarget;
+  final bool _checkForUpdatesOnInitialize;
   final Duration _profileApplyDelay;
   final Duration _autoCodecWarmup;
   final Duration _autoCodecQuietHold;
@@ -69,6 +89,11 @@ class AudioRelayController extends ChangeNotifier {
   double soundboardVolume = 0.82;
   bool soundboardBusy = false;
   String? soundboardMessage;
+  String appVersion = _fallbackAppVersion;
+  AppUpdateStatus updateStatus = AppUpdateStatus.idle;
+  AppUpdateRelease? availableUpdate;
+  String? updateMessage;
+  double? updateDownloadProgress;
 
   Timer? _meterTimer;
   Timer? _profileApplyTimer;
@@ -87,6 +112,7 @@ class AudioRelayController extends ChangeNotifier {
   bool _profileApplyInFlight = false;
   bool _virtualMicPassthroughEnabled = false;
   String? _virtualMicPassthroughOutputDeviceId;
+  String? _downloadedUpdatePath;
   bool _isDisposed = false;
   _AdaptiveProfileApplyReason _pendingProfileApplyReason =
       _AdaptiveProfileApplyReason.settings;
@@ -97,6 +123,7 @@ class AudioRelayController extends ChangeNotifier {
   static const _adaptiveGamingCapMs = 120;
   static const _adaptiveBalancedCapMs = 240;
   static const _adaptiveFormatRecoveryPolls = 4;
+  static const _fallbackAppVersion = '1.1.0';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -120,6 +147,71 @@ class AudioRelayController extends ChangeNotifier {
 
   bool get canEditReceiverOutputBackend =>
       role == RelayRole.receiver && !isBusy && !isStreaming;
+
+  bool get isUpdateBusy {
+    return updateStatus == AppUpdateStatus.checking ||
+        updateStatus == AppUpdateStatus.downloading ||
+        updateStatus == AppUpdateStatus.installing;
+  }
+
+  bool get canRunUpdateAction => !isUpdateBusy;
+
+  bool get canOpenUpdateReleasePage => availableUpdate != null;
+
+  String get updateStatusLabel {
+    return switch (updateStatus) {
+      AppUpdateStatus.idle => 'Ready',
+      AppUpdateStatus.checking => 'Checking',
+      AppUpdateStatus.current => 'Current',
+      AppUpdateStatus.available => 'Available',
+      AppUpdateStatus.downloading => 'Downloading',
+      AppUpdateStatus.ready => 'Downloaded',
+      AppUpdateStatus.installing => 'Opening',
+      AppUpdateStatus.failed => 'Failed',
+    };
+  }
+
+  String get updateDetailLabel {
+    final release = availableUpdate;
+    final message = updateMessage;
+    if (message != null) {
+      return message;
+    }
+    return switch (updateStatus) {
+      AppUpdateStatus.idle => 'Installed v$appVersion',
+      AppUpdateStatus.checking => 'Contacting Codeberg',
+      AppUpdateStatus.current => 'Installed v$appVersion',
+      AppUpdateStatus.available =>
+        release == null
+            ? 'Update available'
+            : '${release.tagName} for ${release.asset.target.platformLabel}',
+      AppUpdateStatus.downloading =>
+        _updateProgressLabel ?? 'Downloading package',
+      AppUpdateStatus.ready => 'Installer package is ready',
+      AppUpdateStatus.installing => 'Opening system installer',
+      AppUpdateStatus.failed => 'Update check failed',
+    };
+  }
+
+  String get updateActionLabel {
+    return switch (updateStatus) {
+      AppUpdateStatus.available => 'Download',
+      AppUpdateStatus.ready => 'Install',
+      AppUpdateStatus.downloading => 'Downloading',
+      AppUpdateStatus.checking => 'Checking',
+      AppUpdateStatus.installing => 'Opening',
+      _ => 'Check',
+    };
+  }
+
+  String? get _updateProgressLabel {
+    final progress = updateDownloadProgress;
+    if (progress == null) {
+      return null;
+    }
+    final percent = (progress.clamp(0, 1) * 100).round();
+    return '$percent% downloaded';
+  }
 
   bool get canUseSoundboard {
     return role == RelayRole.sender && capabilities.canPlaySoundEffects;
@@ -767,6 +859,7 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   Future<void> initialize() async {
+    appVersion = await _appVersionProvider();
     capabilities = await _engine.getCapabilities();
     await _loadSavedCustomProfile();
     await _refreshLocalAddress();
@@ -785,6 +878,9 @@ class AudioRelayController extends ChangeNotifier {
 
     _syncVirtualMicPassthrough();
     notifyListeners();
+    if (!_isDisposed && _checkForUpdatesOnInitialize) {
+      unawaited(checkForUpdates());
+    }
   }
 
   Future<void> setRole(RelayRole value) async {
@@ -970,6 +1066,142 @@ class AudioRelayController extends ChangeNotifier {
     signalLevel = 0;
     noticeMessage = null;
     notifyListeners();
+  }
+
+  Future<void> runUpdateAction() {
+    if (!canRunUpdateAction) {
+      return Future<void>.value();
+    }
+    return switch (updateStatus) {
+      AppUpdateStatus.available => downloadAndInstallUpdate(),
+      AppUpdateStatus.ready => installDownloadedUpdate(),
+      _ => checkForUpdates(),
+    };
+  }
+
+  Future<void> checkForUpdates() async {
+    if (isUpdateBusy) {
+      return;
+    }
+
+    updateStatus = AppUpdateStatus.checking;
+    updateMessage = null;
+    updateDownloadProgress = null;
+    notifyListeners();
+
+    try {
+      final result = await _updateService.checkForUpdate(
+        currentVersion: appVersion,
+        target: _updateTarget,
+      );
+      availableUpdate = result.release;
+      _downloadedUpdatePath = null;
+      if (result.release == null) {
+        updateStatus = AppUpdateStatus.current;
+        updateMessage = _updateTarget == AppUpdateTarget.unsupported
+            ? 'Updates are not available on ${_updateTarget.platformLabel}.'
+            : 'Installed v$appVersion is current.';
+      } else {
+        updateStatus = AppUpdateStatus.available;
+        updateMessage = '${result.release!.tagName} is ready to download.';
+      }
+    } on AppUpdateException catch (error) {
+      updateStatus = AppUpdateStatus.failed;
+      updateMessage = error.message;
+    } catch (_) {
+      updateStatus = AppUpdateStatus.failed;
+      updateMessage = 'Unable to check for updates.';
+    }
+    notifyListeners();
+  }
+
+  Future<void> downloadAndInstallUpdate() async {
+    if (isUpdateBusy) {
+      return;
+    }
+
+    var release = availableUpdate;
+    if (release == null) {
+      await checkForUpdates();
+      release = availableUpdate;
+      if (release == null) {
+        return;
+      }
+    }
+
+    updateStatus = AppUpdateStatus.downloading;
+    updateMessage = null;
+    updateDownloadProgress = null;
+    notifyListeners();
+
+    try {
+      final packageFile = await _updateService.downloadUpdate(
+        release,
+        onProgress: (progress) {
+          updateDownloadProgress = progress;
+          notifyListeners();
+        },
+      );
+      _downloadedUpdatePath = packageFile.path;
+      updateStatus = AppUpdateStatus.ready;
+      updateMessage = '${release.tagName} downloaded.';
+      notifyListeners();
+      await installDownloadedUpdate();
+    } on AppUpdateException catch (error) {
+      updateStatus = AppUpdateStatus.failed;
+      updateMessage = error.message;
+      notifyListeners();
+    } catch (_) {
+      updateStatus = AppUpdateStatus.failed;
+      updateMessage = 'Unable to download update.';
+      notifyListeners();
+    }
+  }
+
+  Future<void> installDownloadedUpdate() async {
+    if (isUpdateBusy) {
+      return;
+    }
+
+    final path = _downloadedUpdatePath;
+    if (path == null) {
+      updateStatus = AppUpdateStatus.failed;
+      updateMessage = 'Download the update first.';
+      notifyListeners();
+      return;
+    }
+
+    updateStatus = AppUpdateStatus.installing;
+    updateMessage = null;
+    notifyListeners();
+
+    try {
+      await _updateInstaller.installPackage(File(path));
+      updateStatus = AppUpdateStatus.ready;
+      updateMessage = 'System installer opened.';
+    } on PlatformException catch (error) {
+      updateStatus = AppUpdateStatus.failed;
+      updateMessage = error.message ?? 'Unable to open installer.';
+    } catch (_) {
+      updateStatus = AppUpdateStatus.failed;
+      updateMessage = 'Unable to open installer.';
+    }
+    notifyListeners();
+  }
+
+  Future<void> openUpdateReleasePage() async {
+    final release = availableUpdate;
+    if (release == null) {
+      return;
+    }
+
+    try {
+      await _updateInstaller.openReleasePage(release.pageUrl);
+    } on PlatformException catch (error) {
+      updateStatus = AppUpdateStatus.failed;
+      updateMessage = error.message ?? 'Unable to open release page.';
+      notifyListeners();
+    }
   }
 
   void selectDevice(RelayDevice device) {
@@ -2559,6 +2791,15 @@ class AudioRelayController extends ChangeNotifier {
 
   static RelayRole _defaultRole() {
     return Platform.isAndroid ? RelayRole.receiver : RelayRole.sender;
+  }
+
+  static Future<String> _defaultAppVersion() async {
+    try {
+      final packageInfo = await PackageInfo.fromPlatform();
+      return packageInfo.version;
+    } catch (_) {
+      return _fallbackAppVersion;
+    }
   }
 
   static String _defaultDeviceName() {

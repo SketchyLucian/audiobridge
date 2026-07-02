@@ -8,12 +8,16 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
@@ -124,6 +128,14 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
+                    "openExternalUrl" -> {
+                        openExternalUrl(call.arguments, result)
+                    }
+
+                    "installUpdatePackage" -> {
+                        installUpdatePackage(call.arguments, result)
+                    }
+
                     else -> result.notImplemented()
                 }
             } catch (error: IllegalStateException) {
@@ -180,6 +192,78 @@ class MainActivity : FlutterActivity() {
             usbPermissionReceiverRegistered = false
         }
         super.onDestroy()
+    }
+
+    private fun openExternalUrl(arguments: Any?, result: MethodChannel.Result) {
+        val url = readStringArgument(arguments, "url")
+        val uri = Uri.parse(url)
+        if (uri.scheme != "https") {
+            result.error("update_url", "The release link is not secure.", null)
+            return
+        }
+
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+            result.success(null)
+        } catch (_: Exception) {
+            result.error("update_url", "Unable to open release page.", null)
+        }
+    }
+
+    private fun installUpdatePackage(arguments: Any?, result: MethodChannel.Result) {
+        val path = readStringArgument(arguments, "path")
+        val packageFile = File(path)
+        if (!packageFile.exists() || packageFile.extension.lowercase() != "apk") {
+            result.error("update_package", "The downloaded Android package is missing.", null)
+            return
+        }
+        if (!isInAppCache(packageFile)) {
+            result.error("update_package", "The update package is outside app storage.", null)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !packageManager.canRequestPackageInstalls()
+        ) {
+            val settingsIntent = Intent(
+                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:$packageName")
+            )
+            startActivity(settingsIntent)
+            result.error(
+                "update_install_permission",
+                "Allow AudioBridge to install updates, then try again.",
+                null
+            )
+            return
+        }
+
+        val packageUri = FileProvider.getUriForFile(
+            this,
+            "$packageName.update_file_provider",
+            packageFile
+        )
+        val installIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(packageUri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(installIntent)
+            result.success(null)
+        } catch (_: Exception) {
+            result.error("update_package", "Unable to open Android installer.", null)
+        }
+    }
+
+    private fun isInAppCache(file: File): Boolean {
+        val canonicalFile = file.canonicalFile
+        val canonicalCache = cacheDir.canonicalFile
+        return canonicalFile.path.startsWith(canonicalCache.path + File.separator)
+    }
+
+    private fun readStringArgument(arguments: Any?, key: String): String {
+        val payload = arguments as? Map<*, *> ?: return ""
+        return payload[key]?.toString()?.trim() ?: ""
     }
 
     private fun startStreamWhenPermissionsAllowed(

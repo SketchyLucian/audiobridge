@@ -10,6 +10,7 @@ audio engines.
 
 - Windows sender and receiver mode UI
 - Android Wi-Fi sender and receiver mode UI
+- Codeberg release checks with assisted APK and MSI installation
 - UDP LAN discovery on port `47884`
 - Audio streaming on port `47885`
 - USB tethering mode that uses the phone's USB network interface with UDP
@@ -148,6 +149,8 @@ Flutter calls the `audio_bridge/native_engine` method channel:
 - `playSoundEffect`
 - `stopSoundEffects`
 - `disconnect`
+- `openExternalUrl`
+- `installUpdatePackage`
 
 Implemented behind that channel:
 

@@ -5,7 +5,10 @@ import 'package:audiorelay_clone/features/audio_relay/application/audio_relay_co
 import 'package:audiorelay_clone/features/audio_relay/data/audio_profile_store.dart';
 import 'package:audiorelay_clone/features/audio_relay/data/discovery_service.dart';
 import 'package:audiorelay_clone/features/audio_relay/data/native_audio_engine.dart';
+import 'package:audiorelay_clone/features/audio_relay/data/update_platform.dart';
+import 'package:audiorelay_clone/features/audio_relay/data/update_service.dart';
 import 'package:audiorelay_clone/features/audio_relay/domain/audio_relay_models.dart';
+import 'package:audiorelay_clone/features/audio_relay/domain/update_models.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -118,6 +121,7 @@ void main() {
       engine: _FakeAudioRelayEngine(),
       discoveryService: _FakeDiscoveryService(),
       profileStore: store,
+      checkForUpdatesOnInitialize: false,
     );
 
     controller.updatePreset(AudioPreset.gaming);
@@ -497,6 +501,7 @@ void main() {
         ),
         discoveryService: _FakeDiscoveryService(),
         profileStore: _FakeAudioProfileStore(),
+        checkForUpdatesOnInitialize: false,
       );
       var notifications = 0;
       controller.addListener(() {
@@ -511,6 +516,89 @@ void main() {
       expect(notifications, 0);
     },
   );
+
+  test('update check reports an available platform release', () async {
+    final release = _updateRelease(
+      tagName: 'v1.0.5',
+      assetName: 'AudioBridge-1.0.5-android.apk',
+      target: AppUpdateTarget.android,
+    );
+    final controller = AudioRelayController(
+      engine: _FakeAudioRelayEngine(),
+      updateService: _FakeUpdateService(release: release),
+      updateInstaller: _FakeUpdateInstaller(),
+      appVersionProvider: () async => '1.0.4',
+      updateTarget: AppUpdateTarget.android,
+    );
+
+    await controller.checkForUpdates();
+
+    expect(controller.updateStatus, AppUpdateStatus.available);
+    expect(controller.availableUpdate?.tagName, 'v1.0.5');
+    expect(controller.updateActionLabel, 'Download');
+    expect(controller.updateDetailLabel, 'v1.0.5 is ready to download.');
+
+    controller.dispose();
+  });
+
+  test('initialize checks Codeberg releases automatically', () async {
+    final updateService = _FakeUpdateService();
+    final controller = AudioRelayController(
+      engine: _FakeAudioRelayEngine(),
+      discoveryService: _FakeDiscoveryService(),
+      profileStore: _FakeAudioProfileStore(),
+      updateService: updateService,
+      appVersionProvider: () async => '1.1.0',
+      updateTarget: AppUpdateTarget.windows,
+    );
+
+    await controller.initialize();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(updateService.checkCount, 1);
+    expect(controller.updateStatus, AppUpdateStatus.current);
+
+    controller.dispose();
+  });
+
+  test('download update opens the downloaded package installer', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'audiobridge_update_test_',
+    );
+    addTearDown(() async {
+      if (await tempDir.exists()) {
+        await tempDir.delete(recursive: true);
+      }
+    });
+    final packageFile = File('${tempDir.path}${Platform.pathSeparator}app.apk');
+    await packageFile.writeAsBytes([1, 2, 3]);
+    final release = _updateRelease(
+      tagName: 'v1.0.5',
+      assetName: 'AudioBridge-1.0.5-android.apk',
+      target: AppUpdateTarget.android,
+    );
+    final installer = _FakeUpdateInstaller();
+    final controller = AudioRelayController(
+      engine: _FakeAudioRelayEngine(),
+      updateService: _FakeUpdateService(
+        release: release,
+        downloadedFile: packageFile,
+      ),
+      updateInstaller: installer,
+      appVersionProvider: () async => '1.0.4',
+      updateTarget: AppUpdateTarget.android,
+    );
+
+    await controller.checkForUpdates();
+    await controller.downloadAndInstallUpdate();
+
+    expect(controller.updateStatus, AppUpdateStatus.ready);
+    expect(controller.updateMessage, 'System installer opened.');
+    expect(installer.installedPackages, [packageFile.path]);
+    expect(controller.updateDownloadProgress, 1);
+
+    controller.dispose();
+  });
 
   test('aac is modeled as an implemented native codec path', () {
     expect(AudioCodec.aac.isImplemented, true);
@@ -2206,6 +2294,28 @@ const _soundboardMixedVirtualCapabilities = PlatformAudioCapabilities(
   canPlaySoundEffects: true,
 );
 
+AppUpdateRelease _updateRelease({
+  required String tagName,
+  required String assetName,
+  required AppUpdateTarget target,
+}) {
+  return AppUpdateRelease(
+    tagName: tagName,
+    version: tagName.replaceFirst('v', ''),
+    pageUrl: Uri.parse(
+      'https://codeberg.org/SketchyLucian/audiobridge/releases/tag/$tagName',
+    ),
+    asset: AppUpdateAsset(
+      name: assetName,
+      downloadUrl: Uri.parse(
+        'https://codeberg.org/SketchyLucian/audiobridge/releases/download/$tagName/$assetName',
+      ),
+      sizeBytes: 3,
+      target: target,
+    ),
+  );
+}
+
 class _FakeAudioRelayEngine implements AudioRelayEngine {
   _FakeAudioRelayEngine({
     this.prepareUsbError,
@@ -2397,5 +2507,50 @@ class _FakeDiscoveryService extends DiscoveryService {
 
   void emit(RelayDevice device) {
     onDeviceSeen?.call(device);
+  }
+}
+
+class _FakeUpdateService implements AppUpdateService {
+  _FakeUpdateService({this.release, this.downloadedFile});
+
+  final AppUpdateRelease? release;
+  final File? downloadedFile;
+  int checkCount = 0;
+
+  @override
+  Future<AppUpdateCheckResult> checkForUpdate({
+    required String currentVersion,
+    required AppUpdateTarget target,
+  }) async {
+    checkCount += 1;
+    return AppUpdateCheckResult(
+      currentVersion: currentVersion,
+      target: target,
+      release: release,
+    );
+  }
+
+  @override
+  Future<File> downloadUpdate(
+    AppUpdateRelease release, {
+    ValueChanged<double?>? onProgress,
+  }) async {
+    onProgress?.call(1);
+    return downloadedFile ?? File('');
+  }
+}
+
+class _FakeUpdateInstaller implements UpdateInstaller {
+  final List<String> openedUrls = [];
+  final List<String> installedPackages = [];
+
+  @override
+  Future<void> openReleasePage(Uri url) async {
+    openedUrls.add(url.toString());
+  }
+
+  @override
+  Future<void> installPackage(File packageFile) async {
+    installedPackages.add(packageFile.path);
   }
 }
