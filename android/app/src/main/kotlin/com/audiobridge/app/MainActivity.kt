@@ -217,8 +217,13 @@ class MainActivity : FlutterActivity() {
             result.error("update_package", "The downloaded Android package is missing.", null)
             return
         }
-        if (!isInAppCache(packageFile)) {
+        if (!isInAppStorage(packageFile)) {
             result.error("update_package", "The update package is outside app storage.", null)
+            return
+        }
+        val installFile = prepareUpdatePackageForInstall(packageFile)
+        if (installFile == null) {
+            result.error("update_package", "Unable to prepare Android update package.", null)
             return
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
@@ -240,7 +245,7 @@ class MainActivity : FlutterActivity() {
         val packageUri = FileProvider.getUriForFile(
             this,
             "$packageName.update_file_provider",
-            packageFile
+            installFile
         )
         val installIntent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(packageUri, "application/vnd.android.package-archive")
@@ -255,10 +260,33 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun isInAppCache(file: File): Boolean {
-        val canonicalFile = file.canonicalFile
-        val canonicalCache = cacheDir.canonicalFile
-        return canonicalFile.path.startsWith(canonicalCache.path + File.separator)
+    private fun isInAppStorage(file: File): Boolean {
+        return try {
+            val canonicalFile = file.canonicalFile
+            val appDirectories = listOfNotNull(cacheDir, codeCacheDir, filesDir, noBackupFilesDir)
+            appDirectories.any { directory ->
+                val canonicalDirectory = directory.canonicalFile
+                canonicalFile.path == canonicalDirectory.path ||
+                    canonicalFile.path.startsWith(canonicalDirectory.path + File.separator)
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun prepareUpdatePackageForInstall(packageFile: File): File? {
+        return try {
+            val installDirectory = File(cacheDir, "updates").apply { mkdirs() }
+            val installFile = File(installDirectory, "AudioBridge-update.apk")
+            val canonicalSource = packageFile.canonicalFile
+            val canonicalInstallFile = installFile.canonicalFile
+            if (canonicalSource.path != canonicalInstallFile.path) {
+                canonicalSource.copyTo(canonicalInstallFile, overwrite = true)
+            }
+            canonicalInstallFile
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun readStringArgument(arguments: Any?, key: String): String {

@@ -147,7 +147,7 @@ class AudioRelayController extends ChangeNotifier {
   static const _adaptiveGamingCapMs = 120;
   static const _adaptiveBalancedCapMs = 240;
   static const _adaptiveFormatRecoveryPolls = 4;
-  static const _fallbackAppVersion = '1.2.0';
+  static const _fallbackAppVersion = '1.2.1';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,

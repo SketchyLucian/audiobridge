@@ -89,6 +89,105 @@ bool ShellOpen(const std::string& target) {
   return reinterpret_cast<intptr_t>(outcome) > 32;
 }
 
+std::string Base64Encode(const uint8_t* data, size_t length) {
+  static constexpr char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  std::string output;
+  output.reserve(((length + 2) / 3) * 4);
+  for (size_t index = 0; index < length; index += 3) {
+    const uint32_t byte0 = data[index];
+    const uint32_t byte1 = index + 1 < length ? data[index + 1] : 0;
+    const uint32_t byte2 = index + 2 < length ? data[index + 2] : 0;
+    const uint32_t chunk = (byte0 << 16) | (byte1 << 8) | byte2;
+
+    output.push_back(alphabet[(chunk >> 18) & 0x3F]);
+    output.push_back(alphabet[(chunk >> 12) & 0x3F]);
+    output.push_back(index + 1 < length ? alphabet[(chunk >> 6) & 0x3F]
+                                        : '=');
+    output.push_back(index + 2 < length ? alphabet[chunk & 0x3F] : '=');
+  }
+  return output;
+}
+
+std::string PowerShellEncodedCommand(const std::wstring& script) {
+  const auto* bytes = reinterpret_cast<const uint8_t*>(script.data());
+  return Base64Encode(bytes, script.size() * sizeof(wchar_t));
+}
+
+std::wstring PowerShellSingleQuoted(const std::wstring& value) {
+  std::wstring quoted = L"'";
+  for (const wchar_t character : value) {
+    if (character == L'\'') {
+      quoted += L"''";
+    } else {
+      quoted.push_back(character);
+    }
+  }
+  quoted += L"'";
+  return quoted;
+}
+
+std::wstring CurrentExecutablePath() {
+  std::wstring buffer(MAX_PATH, L'\0');
+  DWORD size = GetModuleFileNameW(nullptr, buffer.data(),
+                                  static_cast<DWORD>(buffer.size()));
+  if (size == 0) {
+    return std::wstring();
+  }
+
+  while (size == buffer.size() &&
+         GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+    buffer.resize(buffer.size() * 2);
+    size = GetModuleFileNameW(nullptr, buffer.data(),
+                              static_cast<DWORD>(buffer.size()));
+    if (size == 0) {
+      return std::wstring();
+    }
+  }
+
+  buffer.resize(size);
+  return buffer;
+}
+
+bool LaunchWindowsInstallerAndRestart(const std::string& installer_path) {
+  const std::wstring wide_installer_path = Utf8ToWide(installer_path);
+  const std::wstring executable_path = CurrentExecutablePath();
+  if (wide_installer_path.empty() || executable_path.empty()) {
+    return false;
+  }
+
+  std::wstring script;
+  script += L"$ErrorActionPreference = 'SilentlyContinue'\n";
+  script += L"$msi = " + PowerShellSingleQuoted(wide_installer_path) + L"\n";
+  script += L"$exe = " + PowerShellSingleQuoted(executable_path) + L"\n";
+  script += L"$pidToWatch = " + std::to_wstring(GetCurrentProcessId()) + L"\n";
+  script +=
+      L"Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $msi) "
+      L"-Wait\n";
+  script += L"Start-Sleep -Milliseconds 800\n";
+  script +=
+      L"if (-not (Get-Process -Id $pidToWatch -ErrorAction "
+      L"SilentlyContinue)) {\n";
+  script += L"  if (Test-Path -LiteralPath $exe) {\n";
+  script +=
+      L"    Start-Process -FilePath $exe -WorkingDirectory "
+      L"(Split-Path -Parent $exe)\n";
+  script += L"  }\n";
+  script += L"}\n";
+
+  const std::string encoded = PowerShellEncodedCommand(script);
+  const std::wstring encoded_wide(encoded.begin(), encoded.end());
+  const std::wstring parameters =
+      L"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
+      L"-EncodedCommand " +
+      encoded_wide;
+  const HINSTANCE outcome = ShellExecuteW(
+      nullptr, L"open", L"powershell.exe", parameters.c_str(), nullptr,
+      SW_HIDE);
+  return reinterpret_cast<intptr_t>(outcome) > 32;
+}
+
 }  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
@@ -247,7 +346,7 @@ bool FlutterWindow::OnCreate() {
                           "The downloaded Windows installer is missing.");
             return;
           }
-          if (!ShellOpen(path.value())) {
+          if (!LaunchWindowsInstallerAndRestart(path.value())) {
             result->Error("update_package",
                           "Unable to open Windows installer.");
             return;
