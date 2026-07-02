@@ -94,9 +94,8 @@ class AudioRelayController extends ChangeNotifier {
   static const _nativeUsbSourceId = 'native-usb-source';
   static const _autoCodecSwitchCooldown = Duration(seconds: 30);
   static const _autoCodecQuietSignalThreshold = 0.015;
-  static const _adaptiveUltraLowLatencyCapMs = 24;
-  static const _adaptiveGamingCapMs = 30;
-  static const _adaptiveBalancedCapMs = 160;
+  static const _adaptiveGamingCapMs = 120;
+  static const _adaptiveBalancedCapMs = 240;
   static const _adaptiveFormatRecoveryPolls = 4;
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
@@ -111,6 +110,8 @@ class AudioRelayController extends ChangeNotifier {
   bool get isStreaming => activity == RelayActivity.streaming;
 
   bool get canEditAudioSettings => role == RelayRole.sender && !isBusy;
+
+  bool get canEditAudioMode => role == RelayRole.sender && !isBusy;
 
   bool get canEditRestartRequiredAudioSettings =>
       canEditAudioSettings && !isStreaming;
@@ -990,26 +991,45 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void updatePreset(AudioPreset value) {
-    if (!_canChangeRestartRequiredSenderSetting()) {
+    if (!canEditAudioMode) {
       return;
     }
     selectedPreset = value;
-    final nextProfile = value == AudioPreset.custom
+    final requestedProfile = value == AudioPreset.custom
         ? _savedCustomProfile
         : _profileForPreset(value).copyWith(mode: value);
+    final livePresetChange = role == RelayRole.sender && isStreaming;
+    final nextProfile = livePresetChange
+        ? _activeSenderPolicyProfileFor(requestedProfile)
+        : requestedProfile;
     profile = _profileForCurrentRole(_normalizeProfile(nextProfile));
     notifyListeners();
-    _scheduleActiveProfileApply();
+    _scheduleActiveProfileApply(
+      reason: livePresetChange
+          ? _AdaptiveProfileApplyReason.liveBufferPolicy
+          : _AdaptiveProfileApplyReason.settings,
+    );
   }
 
   void saveCustomPreset() {
+    if (!canEditAudioMode) {
+      return;
+    }
     final customProfile = _profileForSavedCustom(profile);
     _savedCustomProfile = customProfile;
     selectedPreset = AudioPreset.custom;
-    profile = _profileForCurrentRole(_normalizeProfile(customProfile));
+    final livePresetChange = role == RelayRole.sender && isStreaming;
+    final nextProfile = livePresetChange
+        ? _activeSenderPolicyProfileFor(customProfile)
+        : customProfile;
+    profile = _profileForCurrentRole(_normalizeProfile(nextProfile));
     notifyListeners();
     _persistCustomProfile(_savedCustomProfile);
-    _scheduleActiveProfileApply();
+    _scheduleActiveProfileApply(
+      reason: livePresetChange
+          ? _AdaptiveProfileApplyReason.liveBufferPolicy
+          : _AdaptiveProfileApplyReason.settings,
+    );
   }
 
   void updateCodec(AudioCodec value) {
@@ -1444,7 +1464,6 @@ class AudioRelayController extends ChangeNotifier {
     AudioProfile nextProfile,
   ) {
     final sameConcreteFormat =
-        previousProfile.mode == nextProfile.mode &&
         previousProfile.codec == nextProfile.codec &&
         previousProfile.outputBackend == nextProfile.outputBackend &&
         previousProfile.sampleRate == nextProfile.sampleRate &&
@@ -1599,6 +1618,24 @@ class AudioRelayController extends ChangeNotifier {
     return customProfile.copyWith(adaptiveBufferCapMs: capMs);
   }
 
+  AudioProfile _activeSenderPolicyProfileFor(AudioProfile requestedProfile) {
+    final activeProfile = _appliedSenderProfile;
+    if (activeProfile == null) {
+      return requestedProfile;
+    }
+
+    return requestedProfile.copyWith(
+      codec: activeProfile.codec,
+      outputBackend: activeProfile.outputBackend,
+      sampleRate: activeProfile.sampleRate,
+      bitrateKbps: activeProfile.bitrateKbps,
+      adaptiveSampleRate: false,
+      adaptiveBitrate: false,
+      captureBufferMs: activeProfile.captureBufferMs,
+      channels: activeProfile.channels,
+    );
+  }
+
   void _saveCustomProfileIfNeeded(AudioProfile nextProfile) {
     if (nextProfile.mode != AudioPreset.custom) {
       return;
@@ -1705,21 +1742,12 @@ class AudioRelayController extends ChangeNotifier {
       AudioProfile.maxBufferMs,
     );
     final capMs = switch (nextProfile.mode) {
-      AudioPreset.gaming =>
-        requestedMs <= 10
-            ? max(_adaptiveUltraLowLatencyCapMs, requestedMs * 4)
-            : max(requestedMs, requestedMs + 12),
-      AudioPreset.balanced => min(
-        max(96, requestedMs * 2),
-        _adaptiveBalancedCapMs,
-      ),
+      AudioPreset.gaming => _adaptiveGamingCapMs,
+      AudioPreset.balanced => _adaptiveBalancedCapMs,
       AudioPreset.music => AudioProfile.maxBufferMs,
       AudioPreset.custom => _effectiveAdaptiveBufferCap(nextProfile),
     };
-    final modeCapMs = nextProfile.mode == AudioPreset.gaming
-        ? min(capMs, _adaptiveGamingCapMs)
-        : capMs;
-    return modeCapMs.clamp(requestedMs, AudioProfile.maxBufferMs).toInt();
+    return capMs.clamp(requestedMs, AudioProfile.maxBufferMs).toInt();
   }
 
   void _scheduleActiveProfileApply({

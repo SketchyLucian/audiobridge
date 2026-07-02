@@ -99,19 +99,19 @@ private const val ADAPTIVE_ACCEPTABLE_UNDERRUNS_PER_SLOW_WINDOW = 6
 private const val ADAPTIVE_UNDERRUN_BURST_WINDOW_MS = 2000L
 private const val ADAPTIVE_ACCEPTABLE_UNDERRUNS_PER_BURST = 4
 private const val ADAPTIVE_LOW_QUEUE_DIVISOR = 4L
+private const val ADAPTIVE_LOW_QUEUE_GROWTH_SAMPLES = 3
 private const val ADAPTIVE_LOW_LATENCY_STEP_MS = 4
 private const val ADAPTIVE_GAMING_RELAX_STEP_MS = 1
 private const val ADAPTIVE_BALANCED_STEP_MS = 8
 private const val ADAPTIVE_STABLE_STEP_MS = 20
-private const val ADAPTIVE_ULTRA_LOW_LATENCY_CAP_MS = 24
-private const val ADAPTIVE_GAMING_CAP_MS = 30
-private const val ADAPTIVE_BALANCED_CAP_MS = 160
+private const val ADAPTIVE_GAMING_CAP_MS = 120
+private const val ADAPTIVE_BALANCED_CAP_MS = 240
 private const val ADAPTIVE_DELAY_SAMPLE_INTERVAL_MS = 500L
 private const val ADAPTIVE_DELAY_HISTORY_SAMPLES = 32
-private const val ADAPTIVE_DELAY_MIN_HISTORY_SAMPLES = 8
-private const val ADAPTIVE_DELAY_QUANTILE = 0.60
-private const val ADAPTIVE_DELAY_HEADROOM_NUMERATOR = 1
-private const val ADAPTIVE_DELAY_HEADROOM_DENOMINATOR = 3
+private const val ADAPTIVE_DELAY_MIN_HISTORY_SAMPLES = 4
+private const val ADAPTIVE_DELAY_QUANTILE = 0.75
+private const val ADAPTIVE_DELAY_HEADROOM_NUMERATOR = 3
+private const val ADAPTIVE_DELAY_HEADROOM_DENOMINATOR = 5
 private const val ADAPTIVE_DELAY_MAX_MS = 2000.0
 private const val ADAPTIVE_SEQUENCE_RESET_GAP = 50L
 private const val ADAPTIVE_NETWORK_TARGET_HYSTERESIS_MS = 5
@@ -169,6 +169,9 @@ internal fun latencyRecoveryDecision(
                     LatencyRecoveryDecision.TRIM_AND_DROP
                 }
             }
+            if (queuedFrames <= targetFrames) {
+                return LatencyRecoveryDecision.ACCEPT
+            }
             return LatencyRecoveryDecision.DROP
         }
     }
@@ -178,6 +181,25 @@ internal fun latencyRecoveryDecision(
     }
 
     return LatencyRecoveryDecision.ACCEPT
+}
+
+internal fun shouldGrowAdaptiveBufferForLowQueue(lowQueueSamples: Int): Boolean {
+    return lowQueueSamples >= ADAPTIVE_LOW_QUEUE_GROWTH_SAMPLES
+}
+
+internal fun adaptiveBufferIncreaseTargetMs(
+    currentBufferMs: Int,
+    stepMs: Int,
+    networkFloorMs: Int,
+    pressureIncrease: Boolean,
+    networkFloorIncrease: Boolean
+): Int {
+    val stepTargetMs = currentBufferMs + stepMs
+    return if (pressureIncrease || networkFloorIncrease) {
+        max(stepTargetMs, networkFloorMs)
+    } else {
+        stepTargetMs
+    }
 }
 
 private enum class TransportMode {
@@ -3524,20 +3546,32 @@ class AudioReceiverEngine(private val context: Context) {
 
         if (isPlaybackStable && isPlaybackQueueTooLow(sampleRate, queuedFrames, targetFrames)) {
             adaptiveLowQueueSamples += 1
+            if (shouldGrowAdaptiveBufferForLowQueue(adaptiveLowQueueSamples)) {
+                lastPlaybackPressureAtMs = now
+                shouldIncrease = true
+                pressureIncrease = true
+            }
         } else {
             adaptiveLowQueueSamples = 0
         }
 
         val currentBufferMs = adaptivePlaybackBufferMs
-        if (networkFloorMs > currentBufferMs + ADAPTIVE_NETWORK_TARGET_HYSTERESIS_MS) {
+        val networkFloorIncrease =
+            networkFloorMs > currentBufferMs + ADAPTIVE_NETWORK_TARGET_HYSTERESIS_MS
+        if (networkFloorIncrease) {
             shouldIncrease = true
         }
 
         if (shouldIncrease && now - lastAdaptiveBufferIncreaseAtMs >= ADAPTIVE_BUFFER_COOLDOWN_MS) {
-            val stepTargetMs = currentBufferMs + adaptiveBufferStepMs(requestedLatencyMs)
             updateAdaptivePlaybackBuffer(
                 sampleRate,
-                if (pressureIncrease) max(stepTargetMs, networkFloorMs) else stepTargetMs
+                adaptiveBufferIncreaseTargetMs(
+                    currentBufferMs = currentBufferMs,
+                    stepMs = adaptiveBufferStepMs(requestedLatencyMs),
+                    networkFloorMs = networkFloorMs,
+                    pressureIncrease = pressureIncrease,
+                    networkFloorIncrease = networkFloorIncrease
+                )
             )
             lastAdaptiveBufferIncreaseAtMs = now
             adaptiveLowQueueSamples = 0
@@ -3593,17 +3627,22 @@ class AudioReceiverEngine(private val context: Context) {
     private fun resetAdaptiveBufferPressure(underruns: Int) {
         lastKnownUnderrunCount = underruns
         playbackStartedAtMs = 0L
-        resetAdaptiveGrowthPressure(underruns)
+        resetAdaptiveGrowthPressure(underruns, resetDelayTracker = true)
     }
 
-    private fun resetAdaptiveGrowthPressure(underruns: Int) {
+    private fun resetAdaptiveGrowthPressure(
+        underruns: Int,
+        resetDelayTracker: Boolean = false
+    ) {
         lastKnownUnderrunCount = underruns
         adaptiveUnderrunWindowStartAtMs = 0L
         adaptiveUnderrunsInWindow = 0
         adaptiveUnderrunBurstStartAtMs = 0L
         adaptiveUnderrunsInBurst = 0
         adaptiveLowQueueSamples = 0
-        resetAdaptiveDelayTracker()
+        if (resetDelayTracker) {
+            resetAdaptiveDelayTracker()
+        }
     }
 
     private fun hasAdaptivePlaybackSignal(): Boolean {
@@ -3834,15 +3873,8 @@ class AudioReceiverEngine(private val context: Context) {
         )
     ): Int {
         val capMs = when (profile.mode) {
-            AudioMode.GAMING -> when {
-                requestedLatencyMs <= 10 -> max(
-                    ADAPTIVE_ULTRA_LOW_LATENCY_CAP_MS,
-                    requestedLatencyMs * 4
-                )
-                else -> max(requestedLatencyMs, requestedLatencyMs + 12)
-            }.coerceAtMost(ADAPTIVE_GAMING_CAP_MS)
-            AudioMode.BALANCED -> max(96, requestedLatencyMs * 2)
-                .coerceAtMost(ADAPTIVE_BALANCED_CAP_MS)
+            AudioMode.GAMING -> ADAPTIVE_GAMING_CAP_MS
+            AudioMode.BALANCED -> ADAPTIVE_BALANCED_CAP_MS
             AudioMode.MUSIC -> MAX_LATENCY_MS
             AudioMode.CUSTOM -> {
                 if (profile.adaptiveBufferCapMs > 0) {

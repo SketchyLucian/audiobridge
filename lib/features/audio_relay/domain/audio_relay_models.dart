@@ -266,7 +266,7 @@ enum AudioPreset {
         playbackBufferMs: 45,
         packetTimeMs: 3,
         channels: 2,
-        adaptiveBufferCapMs: 160,
+        adaptiveBufferCapMs: 240,
       ),
     };
   }

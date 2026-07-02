@@ -897,7 +897,6 @@ class _SettingsPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final senderControlsSettings = controller.role == RelayRole.sender;
-    final settingsLocked = !controller.canEditAudioSettings;
 
     return _Panel(
       child: Column(
@@ -919,10 +918,7 @@ class _SettingsPanel extends StatelessWidget {
           if (!senderControlsSettings)
             _ReceiverAudioSettingsSummary(controller: controller)
           else
-            _UnifiedAudioSettings(
-              controller: controller,
-              settingsLocked: settingsLocked,
-            ),
+            _UnifiedAudioSettings(controller: controller),
         ],
       ),
     );
@@ -989,13 +985,9 @@ class _ReceiverAudioSettingsSummary extends StatelessWidget {
 }
 
 class _UnifiedAudioSettings extends StatelessWidget {
-  const _UnifiedAudioSettings({
-    required this.controller,
-    required this.settingsLocked,
-  });
+  const _UnifiedAudioSettings({required this.controller});
 
   final AudioRelayController controller;
-  final bool settingsLocked;
 
   @override
   Widget build(BuildContext context) {
@@ -1007,6 +999,7 @@ class _UnifiedAudioSettings extends StatelessWidget {
     final restartRequiredLocked =
         !controller.canEditRestartRequiredAudioSettings;
     final liveControlsLocked = !controller.canEditLiveAudioSettings;
+    final audioModeLocked = !controller.canEditAudioMode;
 
     final formatControls = [
       _SettingBlock(
@@ -1127,7 +1120,7 @@ class _UnifiedAudioSettings extends StatelessWidget {
       children: [
         _PresetPicker(
           controller: controller,
-          settingsLocked: restartRequiredLocked,
+          settingsLocked: audioModeLocked,
           compact: compact,
         ),
         const SizedBox(height: 8),

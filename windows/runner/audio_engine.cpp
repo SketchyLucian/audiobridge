@@ -191,12 +191,12 @@ constexpr int kAdaptiveAcceptableUnderrunsPerSlowWindow = 4;
 constexpr int kAdaptiveUnderrunBurstWindowMs = 2000;
 constexpr int kAdaptiveAcceptableUnderrunsPerBurst = 3;
 constexpr int64_t kAdaptiveLowQueueDivisor = 4;
+constexpr int kAdaptiveLowQueueGrowthSamples = 3;
 constexpr int kAdaptiveLowLatencyStepMs = 4;
 constexpr int kAdaptiveBalancedStepMs = 8;
 constexpr int kAdaptiveStableStepMs = 20;
-constexpr int kAdaptiveUltraLowLatencyCapMs = 24;
-constexpr int kAdaptiveGamingCapMs = 30;
-constexpr int kAdaptiveBalancedCapMs = 160;
+constexpr int kAdaptiveGamingCapMs = 120;
+constexpr int kAdaptiveBalancedCapMs = 240;
 constexpr int64_t kAdaptiveDelaySampleIntervalMs = 500;
 constexpr size_t kAdaptiveDelayHistorySamples = 32;
 constexpr size_t kAdaptiveDelayMinHistorySamples = 4;
@@ -229,6 +229,20 @@ enum class AudioMode {
   kMusic,
   kCustom,
 };
+
+bool ShouldGrowAdaptiveBufferForLowQueue(int low_queue_samples) {
+  return low_queue_samples >= kAdaptiveLowQueueGrowthSamples;
+}
+
+int AdaptiveBufferIncreaseTargetMs(int current_ms, int step_ms,
+                                   int network_floor_ms,
+                                   bool pressure_increase,
+                                   bool network_floor_increase) {
+  const int step_target_ms = current_ms + step_ms;
+  return pressure_increase || network_floor_increase
+             ? std::max(step_target_ms, network_floor_ms)
+             : step_target_ms;
+}
 
 enum class TransportMode {
   kWifi,
@@ -4745,14 +4759,10 @@ class WindowsAudioEngine::Impl {
     int cap_ms = kMaxBufferMs;
     switch (profile_.mode) {
       case AudioMode::kGaming:
-        cap_ms = requested_ms <= 10
-                     ? std::max(kAdaptiveUltraLowLatencyCapMs, requested_ms * 4)
-                     : std::max(requested_ms, requested_ms + 12);
-        cap_ms = std::min(cap_ms, kAdaptiveGamingCapMs);
+        cap_ms = kAdaptiveGamingCapMs;
         break;
       case AudioMode::kBalanced:
-        cap_ms = std::min(std::max(96, requested_ms * 2),
-                          kAdaptiveBalancedCapMs);
+        cap_ms = kAdaptiveBalancedCapMs;
         break;
       case AudioMode::kMusic:
         cap_ms = kMaxBufferMs;
@@ -4989,13 +4999,9 @@ class WindowsAudioEngine::Impl {
 
     const int requested_ms = RequestedPlaybackBufferMs();
     if (!profile_.receiver_adaptive_buffer) {
-      ResetLocalAdaptiveDelayTracker();
+      ResetLocalAdaptiveGrowthPressure(local_underrun_count_.load(),
+                                       true);
       SetLocalAdaptivePlaybackBufferMs(sample_rate, requested_ms);
-      local_last_known_underrun_count_ = local_underrun_count_.load();
-      local_adaptive_underruns_in_window_ = 0;
-      local_adaptive_underruns_in_burst_ = 0;
-      local_adaptive_low_queue_samples_ = 0;
-      local_adaptive_low_queue_sample_count_ = 0;
       return;
     }
 
@@ -5036,6 +5042,12 @@ class WindowsAudioEngine::Impl {
       ++local_adaptive_low_queue_sample_count_;
       local_adaptive_low_queue_samples_ =
           local_adaptive_low_queue_sample_count_;
+      if (ShouldGrowAdaptiveBufferForLowQueue(
+              local_adaptive_low_queue_sample_count_)) {
+        local_last_playback_pressure_at_ms_ = now;
+        should_increase = true;
+        pressure_increase = true;
+      }
     } else {
       local_adaptive_low_queue_sample_count_ = 0;
       local_adaptive_low_queue_samples_ = 0;
@@ -5043,19 +5055,20 @@ class WindowsAudioEngine::Impl {
 
     const int current_ms =
         static_cast<int>(local_adaptive_playback_buffer_ms_.load());
-    if (network_floor_ms > current_ms + kAdaptiveNetworkTargetHysteresisMs) {
+    const bool network_floor_increase =
+        network_floor_ms > current_ms + kAdaptiveNetworkTargetHysteresisMs;
+    if (network_floor_increase) {
       should_increase = true;
     }
 
     if (should_increase &&
         now - local_last_adaptive_buffer_increase_at_ms_ >=
             kAdaptiveBufferCooldownMs) {
-      const int step_target_ms =
-          current_ms + AdaptiveBufferStepMs(requested_ms);
       SetLocalAdaptivePlaybackBufferMs(
           sample_rate,
-          pressure_increase ? std::max(step_target_ms, network_floor_ms)
-                            : step_target_ms);
+          AdaptiveBufferIncreaseTargetMs(
+              current_ms, AdaptiveBufferStepMs(requested_ms), network_floor_ms,
+              pressure_increase, network_floor_increase));
       local_last_adaptive_buffer_increase_at_ms_ = now;
       local_adaptive_low_queue_sample_count_ = 0;
       local_adaptive_low_queue_samples_ = 0;
@@ -5071,7 +5084,8 @@ class WindowsAudioEngine::Impl {
     local_last_known_underrun_count_ = underruns;
   }
 
-  void ResetLocalAdaptiveGrowthPressure(int64_t underruns) {
+  void ResetLocalAdaptiveGrowthPressure(int64_t underruns,
+                                        bool reset_delay_tracker = false) {
     local_last_known_underrun_count_ = underruns;
     local_adaptive_underrun_window_start_at_ms_ = 0;
     local_adaptive_underruns_in_window_counter_ = 0;
@@ -5081,7 +5095,9 @@ class WindowsAudioEngine::Impl {
     local_adaptive_underruns_in_burst_ = 0;
     local_adaptive_low_queue_sample_count_ = 0;
     local_adaptive_low_queue_samples_ = 0;
-    ResetLocalAdaptiveDelayTracker();
+    if (reset_delay_tracker) {
+      ResetLocalAdaptiveDelayTracker();
+    }
   }
 
   bool HasLocalAdaptivePlaybackSignal() const {

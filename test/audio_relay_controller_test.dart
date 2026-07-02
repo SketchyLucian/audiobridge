@@ -197,6 +197,27 @@ void main() {
     controller.dispose();
   });
 
+  test('audio mode remains editable while hosting and streaming', () {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
+      ..role = RelayRole.sender
+      ..activity = RelayActivity.advertising;
+
+    expect(controller.canEditAudioMode, true);
+    controller.updatePreset(AudioPreset.gaming);
+
+    expect(controller.selectedPreset, AudioPreset.gaming);
+    expect(controller.profile.mode, AudioPreset.gaming);
+
+    controller.activity = RelayActivity.streaming;
+    expect(controller.canEditAudioMode, true);
+    controller.updatePreset(AudioPreset.music);
+
+    expect(controller.selectedPreset, AudioPreset.music);
+    expect(controller.profile.mode, AudioPreset.music);
+
+    controller.dispose();
+  });
+
   test('profile changes are applied to the active sender stream', () async {
     final engine = _FakeAudioRelayEngine();
     final discoveryService = _FakeDiscoveryService();
@@ -354,11 +375,26 @@ void main() {
       expect(controller.liveLatencyLabel, '18 ms');
       expect(controller.activePlaybackBufferLabel, 'Requested 18 ms');
       expect(controller.playbackQueueFillLabel, '0%');
-      expect(controller.adaptiveBufferCapLabel, '30 ms');
+      expect(controller.adaptiveBufferCapLabel, '120 ms');
 
       controller.dispose();
     },
   );
+
+  test('preset adaptive caps stay mode appropriate', () {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine());
+
+    controller.updatePreset(AudioPreset.gaming);
+    expect(controller.adaptiveBufferCapLabel, '120 ms');
+
+    controller.updatePreset(AudioPreset.balanced);
+    expect(controller.adaptiveBufferCapLabel, '240 ms');
+
+    controller.updatePreset(AudioPreset.music);
+    expect(controller.adaptiveBufferCapLabel, '500 ms');
+
+    controller.dispose();
+  });
 
   test('metrics parse audio and network latency fields', () {
     final metrics = AudioRelayMetrics.fromMap({
@@ -838,6 +874,100 @@ void main() {
       expect(engine.profiles.single.playbackBufferMs, 24);
       expect(engine.profiles.single.packetTimeMs, 2);
       expect(engine.profiles.single.receiverAdaptiveBuffer, false);
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'custom preset applies to active sender as live receiver policy',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final discoveryService = _FakeDiscoveryService();
+      final controller = AudioRelayController(
+        engine: engine,
+        discoveryService: discoveryService,
+        profileApplyDelay: Duration.zero,
+      )..role = RelayRole.sender;
+
+      controller.updatePlaybackBuffer(72);
+      controller.saveCustomPreset();
+      controller.updateAdaptiveBufferCap(180);
+      controller.updatePreset(AudioPreset.balanced);
+      await controller.startSenderStream();
+      final startedProfile = engine.startedProfiles.single;
+      engine.calls.clear();
+      engine.profiles.clear();
+      discoveryService.advertisedProfiles.clear();
+
+      controller.updatePreset(AudioPreset.custom);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controller.selectedPreset, AudioPreset.custom);
+      expect(controller.profile.mode, AudioPreset.custom);
+      expect(controller.profile.sampleRate, startedProfile.sampleRate);
+      expect(
+        controller.profile.captureBufferMs,
+        startedProfile.captureBufferMs,
+      );
+      expect(engine.calls, ['prepareSender']);
+      expect(engine.profiles.single.mode, AudioPreset.custom);
+      expect(engine.profiles.single.sampleRate, startedProfile.sampleRate);
+      expect(
+        engine.profiles.single.captureBufferMs,
+        startedProfile.captureBufferMs,
+      );
+      expect(engine.profiles.single.playbackBufferMs, 72);
+      expect(engine.profiles.single.adaptiveBufferCapMs, 180);
+      expect(
+        discoveryService.advertisedProfiles.single.mode,
+        AudioPreset.custom,
+      );
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'music preset applies to active sender as live receiver policy',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final discoveryService = _FakeDiscoveryService();
+      final controller = AudioRelayController(
+        engine: engine,
+        discoveryService: discoveryService,
+        profileApplyDelay: Duration.zero,
+      )..role = RelayRole.sender;
+
+      await controller.startSenderStream();
+      final startedProfile = engine.startedProfiles.single;
+      engine.calls.clear();
+      engine.profiles.clear();
+      discoveryService.advertisedProfiles.clear();
+
+      controller.updatePreset(AudioPreset.music);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controller.selectedPreset, AudioPreset.music);
+      expect(controller.profile.mode, AudioPreset.music);
+      expect(controller.profile.sampleRate, startedProfile.sampleRate);
+      expect(
+        controller.profile.captureBufferMs,
+        startedProfile.captureBufferMs,
+      );
+      expect(engine.calls, ['prepareSender']);
+      expect(engine.profiles.single.mode, AudioPreset.music);
+      expect(engine.profiles.single.sampleRate, startedProfile.sampleRate);
+      expect(
+        engine.profiles.single.captureBufferMs,
+        startedProfile.captureBufferMs,
+      );
+      expect(engine.profiles.single.playbackBufferMs, 320);
+      expect(engine.profiles.single.packetTimeMs, 12);
+      expect(
+        discoveryService.advertisedProfiles.single.mode,
+        AudioPreset.music,
+      );
 
       controller.dispose();
     },

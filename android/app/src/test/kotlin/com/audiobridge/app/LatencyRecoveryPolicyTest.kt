@@ -35,11 +35,26 @@ class LatencyRecoveryPolicyTest {
     }
 
     @Test
-    fun dropsWhenIncomingPacketIsAlreadyTooLate() {
+    fun acceptsLatePacketWhenQueueCannotReduceNetworkLatency() {
+        assertEquals(
+            LatencyRecoveryDecision.ACCEPT,
+            latencyRecoveryDecision(
+                queuedFrames = framesForMs(30),
+                targetFrames = framesForMs(30),
+                packetFrames = framesForMs(1),
+                hardLimitFrames = framesForMs(90),
+                sampleRate = sampleRate,
+                networkSampleMs = 100.0
+            )
+        )
+    }
+
+    @Test
+    fun dropsLatePacketWhenQueueIsAboveTargetButCannotTrim() {
         assertEquals(
             LatencyRecoveryDecision.DROP,
             latencyRecoveryDecision(
-                queuedFrames = framesForMs(30),
+                queuedFrames = framesForMs(31),
                 targetFrames = framesForMs(30),
                 packetFrames = framesForMs(1),
                 hardLimitFrames = framesForMs(90),
@@ -75,6 +90,40 @@ class LatencyRecoveryPolicyTest {
                 hardLimitFrames = framesForMs(90),
                 sampleRate = sampleRate,
                 networkSampleMs = null
+            )
+        )
+    }
+
+    @Test
+    fun sustainedLowQueueTriggersAdaptiveBufferGrowth() {
+        assertEquals(false, shouldGrowAdaptiveBufferForLowQueue(2))
+        assertEquals(true, shouldGrowAdaptiveBufferForLowQueue(3))
+    }
+
+    @Test
+    fun networkFloorIncreaseJumpsToMeasuredFloor() {
+        assertEquals(
+            96,
+            adaptiveBufferIncreaseTargetMs(
+                currentBufferMs = 30,
+                stepMs = 8,
+                networkFloorMs = 96,
+                pressureIncrease = false,
+                networkFloorIncrease = true
+            )
+        )
+    }
+
+    @Test
+    fun nonPressureIncreaseKeepsNormalStep() {
+        assertEquals(
+            38,
+            adaptiveBufferIncreaseTargetMs(
+                currentBufferMs = 30,
+                stepMs = 8,
+                networkFloorMs = 96,
+                pressureIncrease = false,
+                networkFloorIncrease = false
             )
         )
     }
