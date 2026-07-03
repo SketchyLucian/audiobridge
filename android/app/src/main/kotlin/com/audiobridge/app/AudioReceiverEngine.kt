@@ -38,6 +38,7 @@ import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
@@ -55,10 +56,12 @@ private const val PACKET_HEADER_BYTES = 16
 private const val PACKET_V2_HEADER_BYTES = 24
 private const val PACKET_V3_HEADER_BYTES = 48
 private const val PACKET_V4_HEADER_BYTES = 56
+private const val PACKET_V5_HEADER_BYTES = 64
 private const val PACKET_MAGIC = 0x31524241
 private const val PACKET_V2_MAGIC = 0x32524241
 private const val PACKET_V3_MAGIC = 0x33524241
 private const val PACKET_V4_MAGIC = 0x34524241
+private const val PACKET_V5_MAGIC = 0x35524241
 private const val CODEC_PCM = 0
 private const val CODEC_OPUS = 1
 private const val CODEC_AAC = 2
@@ -66,6 +69,7 @@ private const val CODEC_G711_MU_LAW = 8
 private const val CODEC_G711_A_LAW = 9
 private const val CODEC_IMA_ADPCM = 10
 private const val PACKET_KIND_AUDIO = 0
+private const val PACKET_KIND_HEARTBEAT = 1
 private const val PACKET_FLAG_MUTED = 1
 private const val RECEIVER_OPTION_ADAPTIVE_BUFFER = 1
 private const val RECEIVER_OPTION_MODE_SHIFT = 4
@@ -86,6 +90,8 @@ private const val UDP_BUFFER_BYTES = 256 * 1024
 private const val SUBSCRIBE_INTERVAL_MS = 300L
 private const val SUBSCRIBE_MAX_BYTES = 2048
 private const val SOURCE_IDLE_TIMEOUT_MS = 1200L
+private const val PEER_HEARTBEAT_TIMEOUT_MS = 3000L
+private const val HEARTBEAT_INTERVAL_MS = 800L
 private const val START_BUFFER_PACKETS = 4
 private const val START_BUFFER_EXTRA_MS = 2
 private const val ADAPTIVE_BUFFER_COOLDOWN_MS = 1500L
@@ -202,6 +208,14 @@ internal fun adaptiveBufferIncreaseTargetMs(
     }
 }
 
+internal fun acceptsSessionPacket(expectedSessionId: Long, packetSessionId: Long): Boolean {
+    return expectedSessionId > 0L && packetSessionId == expectedSessionId
+}
+
+internal fun acceptsLegacyPacket(sessionProtocolActive: Boolean): Boolean {
+    return !sessionProtocolActive
+}
+
 private enum class TransportMode {
     WIFI,
     USB_TETHERING,
@@ -284,11 +298,17 @@ private data class RemoteReceiverClockEcho(
     val receivedAtSenderTimeMs: Long = 0L
 )
 
+private data class SenderPeer(
+    val endpoint: InetSocketAddress?,
+    val sessionId: Long?
+)
+
 class AudioReceiverEngine(private val context: Context) {
     private var profile = AudioProfile()
     private var engineRole = EngineRole.RECEIVER
     private var source: InetSocketAddress? = null
-    private var senderEndpoint: InetSocketAddress? = null
+    @Volatile
+    private var senderPeer: SenderPeer? = null
     private var transportMode = TransportMode.WIFI
     private var networkBindAddress: InetAddress? = null
     private var socket: DatagramSocket? = null
@@ -354,6 +374,11 @@ class AudioReceiverEngine(private val context: Context) {
     private var playbackHeadWraps = 0L
     private var lastSequence = -1L
     private var lastAudioPacketReceivedAtMs = 0L
+    private var lastPeerPacketReceivedAtMs = 0L
+    private var receiverSessionId = 0L
+    private var sessionProtocolActive = false
+    private var lastHeartbeatSentAtMs = 0L
+    private val sessionRandom = SecureRandom()
     private var lastCodecId = CODEC_PCM
     private val nativeOutputSampleRate = readNativeOutputSampleRate()
     private val opusNative = OpusNative()
@@ -512,9 +537,10 @@ class AudioReceiverEngine(private val context: Context) {
         }
 
         val sampleRate = currentSampleRate.takeIf { it > 0 } ?: profile.sampleRate
+        val peerConnected = isPeerConnected(now)
         val track = audioTrack
         if (track == null) {
-            return idleReceiverMetrics(sampleRate)
+            return idleReceiverMetrics(sampleRate, peerConnected)
         }
         val playedFrames = playbackFrames(track)
         val queuedFrames = max(0L, writtenFrames.get() - playedFrames)
@@ -525,7 +551,7 @@ class AudioReceiverEngine(private val context: Context) {
         }
         if (isSourceIdle(now)) {
             parkIdlePlayback(track, underruns)
-            return idleReceiverMetrics(sampleRate)
+            return idleReceiverMetrics(sampleRate, peerConnected)
         }
 
         val outputLatencyMs = queuedFrames * 1000.0 / sampleRate
@@ -555,7 +581,7 @@ class AudioReceiverEngine(private val context: Context) {
             "lostPacketCount" to lostPackets.get(),
             "trimCount" to trimCount.get(),
             "signalLevel" to signalLevel,
-            "peerConnected" to true,
+            "peerConnected" to peerConnected,
             "activeProfile" to activeProfileForMetrics()
         )
         if (!audioLatencyMs.isNaN()) {
@@ -572,7 +598,15 @@ class AudioReceiverEngine(private val context: Context) {
         return lastPacketAt <= 0L || now - lastPacketAt > SOURCE_IDLE_TIMEOUT_MS
     }
 
-    private fun idleReceiverMetrics(sampleRate: Int): Map<String, Any> {
+    private fun isPeerConnected(now: Long): Boolean {
+        val lastPacketAt = lastPeerPacketReceivedAtMs
+        return lastPacketAt > 0L && now - lastPacketAt <= PEER_HEARTBEAT_TIMEOUT_MS
+    }
+
+    private fun idleReceiverMetrics(
+        sampleRate: Int,
+        peerConnected: Boolean = false
+    ): Map<String, Any> {
         val activeSampleRate = sampleRate.takeIf { it > 0 } ?: profile.sampleRate
         val requestedLatencyMs = profile.playbackBufferMs.coerceIn(
             minLatencyMs(),
@@ -609,7 +643,7 @@ class AudioReceiverEngine(private val context: Context) {
             "lostPacketCount" to lostPackets.get(),
             "trimCount" to trimCount.get(),
             "signalLevel" to 0.0,
-            "peerConnected" to false,
+            "peerConnected" to peerConnected,
             "activeProfile" to activeProfileForMetrics()
         )
     }
@@ -707,7 +741,7 @@ class AudioReceiverEngine(private val context: Context) {
         transportMode = TransportMode.USB
         networkBindAddress = null
         source = null
-        senderEndpoint = null
+        senderPeer = null
         adaptiveLinkMemoryKey = null
         socket?.close()
         socket = null
@@ -805,6 +839,9 @@ class AudioReceiverEngine(private val context: Context) {
         networkLatencyMs = Double.NaN
         signalLevel = 0.0
         lastAudioPacketReceivedAtMs = 0L
+        lastPeerPacketReceivedAtMs = 0L
+        receiverSessionId = nextSessionId()
+        sessionProtocolActive = false
         lastSequence = -1L
         lastCodecId = CODEC_PCM
         receiveThread = Thread({
@@ -834,6 +871,9 @@ class AudioReceiverEngine(private val context: Context) {
         releaseOpusDecoder()
         releaseAacDecoder()
         releaseAudioTrack()
+        lastPeerPacketReceivedAtMs = 0L
+        receiverSessionId = 0L
+        sessionProtocolActive = false
     }
 
     fun setVolume(arguments: Any?) {
@@ -1166,7 +1206,8 @@ class AudioReceiverEngine(private val context: Context) {
         senderControlThread?.join(800)
         senderControlThread = null
         socket = null
-        senderEndpoint = null
+        senderPeer = null
+        lastHeartbeatSentAtMs = 0L
         closeUsbConnection()
         resetRemoteMetrics()
     }
@@ -1185,7 +1226,12 @@ class AudioReceiverEngine(private val context: Context) {
 
                 val message = String(packet.data, packet.offset, packet.length, Charsets.UTF_8)
                 updateRemoteMetrics(message)
-                senderEndpoint = InetSocketAddress(packet.address, packet.port)
+                val peer = SenderPeer(
+                    endpoint = InetSocketAddress(packet.address, packet.port),
+                    sessionId = parseSessionId(message)
+                )
+                senderPeer = peer
+                maybeSendHeartbeat(activeSocket, peer)
             } catch (_: SocketTimeoutException) {
                 continue
             } catch (_: SocketException) {
@@ -1223,7 +1269,14 @@ class AudioReceiverEngine(private val context: Context) {
                 val payload = ByteArray(length)
                 readFully(input, payload)
                 if (isSubscribeMessage(payload, payload.size)) {
-                    updateRemoteMetrics(String(payload, Charsets.UTF_8))
+                    val message = String(payload, Charsets.UTF_8)
+                    updateRemoteMetrics(message)
+                    val peer = SenderPeer(
+                        endpoint = null,
+                        sessionId = parseSessionId(message)
+                    )
+                    senderPeer = peer
+                    maybeSendUsbHeartbeat(peer)
                 }
             } catch (_: EOFException) {
                 closeUsbConnection()
@@ -1231,6 +1284,74 @@ class AudioReceiverEngine(private val context: Context) {
                 closeUsbConnection()
             } catch (_: SecurityException) {
                 closeUsbConnection()
+            }
+        }
+    }
+
+    private fun maybeSendHeartbeat(activeSocket: DatagramSocket, peer: SenderPeer) {
+        val endpoint = peer.endpoint ?: return
+        val sessionId = peer.sessionId ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastHeartbeatSentAtMs < HEARTBEAT_INTERVAL_MS) {
+            return
+        }
+
+        val packet = heartbeatPacket(sessionId, now)
+        try {
+            activeSocket.send(
+                DatagramPacket(packet, packet.size, endpoint.address, endpoint.port)
+            )
+            lastHeartbeatSentAtMs = now
+        } catch (_: IOException) {
+            droppedPackets.incrementAndGet()
+        } catch (_: SecurityException) {
+            droppedPackets.incrementAndGet()
+        }
+    }
+
+    private fun maybeSendUsbHeartbeat(peer: SenderPeer) {
+        val sessionId = peer.sessionId ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastHeartbeatSentAtMs < HEARTBEAT_INTERVAL_MS) {
+            return
+        }
+
+        lastHeartbeatSentAtMs = now
+        sendUsbFrame(heartbeatPacket(sessionId, now))
+    }
+
+    private fun heartbeatPacket(sessionId: Long, sendTimeMs: Long): ByteArray {
+        return ByteBuffer.allocate(PACKET_V5_HEADER_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(PACKET_V5_MAGIC)
+            .putInt(senderSequence)
+            .putInt(0)
+            .putShort(0)
+            .putShort(0)
+            .putShort(CODEC_PCM.toShort())
+            .putShort(PACKET_KIND_HEARTBEAT.toShort())
+            .putInt(0)
+            .putLong(sendTimeMs)
+            .putLong(0)
+            .putLong(0)
+            .putInt(profile.playbackBufferMs.coerceIn(minLatencyMs(), MAX_LATENCY_MS))
+            .putInt(receiverOptionsFor(profile))
+            .putLong(sessionId)
+            .array()
+    }
+
+    private fun parseSessionId(message: String): Long? {
+        if ((parseLongMetric(message, "protocol") ?: 0L) < 5L) {
+            return null
+        }
+        return parseLongMetric(message, "sessionId")?.takeIf { it > 0L }
+    }
+
+    private fun nextSessionId(): Long {
+        while (true) {
+            val candidate = sessionRandom.nextLong() and Long.MAX_VALUE
+            if (candidate != 0L) {
+                return candidate
             }
         }
     }
@@ -1495,9 +1616,16 @@ class AudioReceiverEngine(private val context: Context) {
             0L
         }
 
-        val packet = ByteBuffer.allocate(PACKET_V4_HEADER_BYTES + encoded.payload.size)
+        val peer = senderPeer
+        val sessionId = peer?.sessionId
+        val headerBytes = if (sessionId == null) {
+            PACKET_V4_HEADER_BYTES
+        } else {
+            PACKET_V5_HEADER_BYTES
+        }
+        val packetBuilder = ByteBuffer.allocate(headerBytes + encoded.payload.size)
             .order(ByteOrder.LITTLE_ENDIAN)
-            .putInt(PACKET_V4_MAGIC)
+            .putInt(if (sessionId == null) PACKET_V4_MAGIC else PACKET_V5_MAGIC)
             .putInt(senderSequence++)
             .putInt(sampleRate)
             .putShort(channels.toShort())
@@ -1510,8 +1638,10 @@ class AudioReceiverEngine(private val context: Context) {
             .putLong(echoReceivedAtSenderTimeMs)
             .putInt(profile.playbackBufferMs.coerceIn(minLatencyMs(), MAX_LATENCY_MS))
             .putInt(receiverOptionsFor(profile))
-            .put(encoded.payload)
-            .array()
+        if (sessionId != null) {
+            packetBuilder.putLong(sessionId)
+        }
+        val packet = packetBuilder.put(encoded.payload).array()
 
         if (transportMode == TransportMode.USB) {
             sendUsbFrame(packet)
@@ -1519,7 +1649,7 @@ class AudioReceiverEngine(private val context: Context) {
         }
 
         val activeSocket = socket ?: return
-        val endpoint = senderEndpoint ?: return
+        val endpoint = peer?.endpoint ?: return
         try {
             activeSocket.send(DatagramPacket(packet, packet.size, endpoint.address, endpoint.port))
         } catch (_: IOException) {
@@ -2541,6 +2671,8 @@ class AudioReceiverEngine(private val context: Context) {
 
         val message = buildString {
             append(SUBSCRIBE_MESSAGE)
+            append(" protocol=5 sessionId=")
+            append(receiverSessionId)
             append(" platform=android")
             append(" supportedCodecs=")
             append(RECEIVER_SUPPORTED_CODECS)
@@ -2623,7 +2755,11 @@ class AudioReceiverEngine(private val context: Context) {
         }
 
         val header = ByteBuffer.wrap(data, 0, PACKET_HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN)
-        when (val magic = header.int) {
+        val magic = header.int
+        if (!acceptsLegacyPacket(sessionProtocolActive) && magic != PACKET_V5_MAGIC) {
+            return
+        }
+        when (magic) {
             PACKET_MAGIC -> {
                 logAudioPacketHandled(magic, length)
                 handlePcmV1Packet(header, data, length)
@@ -2639,6 +2775,10 @@ class AudioReceiverEngine(private val context: Context) {
             PACKET_V4_MAGIC -> {
                 logAudioPacketHandled(magic, length)
                 handlePacketV4(data, length)
+            }
+            PACKET_V5_MAGIC -> {
+                logAudioPacketHandled(magic, length)
+                handlePacketV5(data, length)
             }
             else -> {
                 unknownUsbPacketCount += 1
@@ -2818,7 +2958,7 @@ class AudioReceiverEngine(private val context: Context) {
     }
 
     private fun handlePacketV4(data: ByteArray, length: Int) {
-        if (length <= PACKET_V4_HEADER_BYTES) {
+        if (sessionProtocolActive || length <= PACKET_V4_HEADER_BYTES) {
             return
         }
 
@@ -2836,6 +2976,103 @@ class AudioReceiverEngine(private val context: Context) {
         val echoReceivedAtSenderTimeMs = header.long
         val playbackBufferMs = header.int.coerceIn(minLatencyMs(), MAX_LATENCY_MS)
         val receiverOptions = header.int
+        updatePacketLoss(sequence)
+
+        if (packetKind != PACKET_KIND_AUDIO) {
+            droppedPackets.incrementAndGet()
+            return
+        }
+
+        handleSessionAudioPayload(
+            data = data,
+            length = length,
+            payloadOffset = PACKET_V4_HEADER_BYTES,
+            sequence = sequence,
+            sampleRate = sampleRate,
+            channels = channels,
+            flags = flags,
+            codecId = codecId,
+            decodedFrameCount = decodedFrameCount,
+            senderSendTimeMs = senderSendTimeMs,
+            echoedReceiverTimeMs = echoedReceiverTimeMs,
+            echoReceivedAtSenderTimeMs = echoReceivedAtSenderTimeMs,
+            playbackBufferMs = playbackBufferMs,
+            receiverOptions = receiverOptions
+        )
+    }
+
+    private fun handlePacketV5(data: ByteArray, length: Int) {
+        if (length < PACKET_V5_HEADER_BYTES) {
+            return
+        }
+
+        val header = ByteBuffer.wrap(data, 0, PACKET_V5_HEADER_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
+        header.int
+        val sequence = header.int.toLong() and 0xFFFF_FFFFL
+        val sampleRate = header.int
+        val channels = header.short.toInt() and 0xFFFF
+        val flags = header.short.toInt() and 0xFFFF
+        val codecId = header.short.toInt() and 0xFFFF
+        val packetKind = header.short.toInt() and 0xFFFF
+        val decodedFrameCount = header.int
+        val senderSendTimeMs = header.long
+        val echoedReceiverTimeMs = header.long
+        val echoReceivedAtSenderTimeMs = header.long
+        val playbackBufferMs = header.int.coerceIn(minLatencyMs(), MAX_LATENCY_MS)
+        val receiverOptions = header.int
+        val sessionId = header.long
+
+        if (!acceptsSessionPacket(receiverSessionId, sessionId)) {
+            droppedPackets.incrementAndGet()
+            return
+        }
+
+        sessionProtocolActive = true
+        lastPeerPacketReceivedAtMs = SystemClock.elapsedRealtime()
+        if (packetKind == PACKET_KIND_HEARTBEAT) {
+            return
+        }
+        if (packetKind != PACKET_KIND_AUDIO || length <= PACKET_V5_HEADER_BYTES) {
+            droppedPackets.incrementAndGet()
+            return
+        }
+
+        updatePacketLoss(sequence)
+        handleSessionAudioPayload(
+            data = data,
+            length = length,
+            payloadOffset = PACKET_V5_HEADER_BYTES,
+            sequence = sequence,
+            sampleRate = sampleRate,
+            channels = channels,
+            flags = flags,
+            codecId = codecId,
+            decodedFrameCount = decodedFrameCount,
+            senderSendTimeMs = senderSendTimeMs,
+            echoedReceiverTimeMs = echoedReceiverTimeMs,
+            echoReceivedAtSenderTimeMs = echoReceivedAtSenderTimeMs,
+            playbackBufferMs = playbackBufferMs,
+            receiverOptions = receiverOptions
+        )
+    }
+
+    private fun handleSessionAudioPayload(
+        data: ByteArray,
+        length: Int,
+        payloadOffset: Int,
+        sequence: Long,
+        sampleRate: Int,
+        channels: Int,
+        flags: Int,
+        codecId: Int,
+        decodedFrameCount: Int,
+        senderSendTimeMs: Long,
+        echoedReceiverTimeMs: Long,
+        echoReceivedAtSenderTimeMs: Long,
+        playbackBufferMs: Int,
+        receiverOptions: Int
+    ) {
         val receiverAdaptiveBuffer =
             (receiverOptions and RECEIVER_OPTION_ADAPTIVE_BUFFER) != 0
         val mode = AudioMode.fromPacketId(
@@ -2847,12 +3084,6 @@ class AudioReceiverEngine(private val context: Context) {
         val activeBitrateKbps =
             (receiverOptions ushr RECEIVER_OPTION_BITRATE_SHIFT) and
                 RECEIVER_OPTION_BITRATE_MASK
-        updatePacketLoss(sequence)
-
-        if (packetKind != PACKET_KIND_AUDIO) {
-            droppedPackets.incrementAndGet()
-            return
-        }
 
         val adaptivePolicyChanged =
             profile.mode != mode ||
@@ -2909,8 +3140,8 @@ class AudioReceiverEngine(private val context: Context) {
         }
         writeAudioPayload(
             data = data,
-            offset = PACKET_V4_HEADER_BYTES,
-            payloadSize = length - PACKET_V4_HEADER_BYTES,
+            offset = payloadOffset,
+            payloadSize = length - payloadOffset,
             sequence = sequence,
             codecId = codecId,
             decodedFrameCount = decodedFrameCount,
@@ -2994,6 +3225,7 @@ class AudioReceiverEngine(private val context: Context) {
             echoReceivedAtSenderTimeMs = echoReceivedAtSenderTimeMs
         )
         lastAudioPacketReceivedAtMs = packetReceivedAtReceiverMs
+        lastPeerPacketReceivedAtMs = packetReceivedAtReceiverMs
         observeAdaptivePacketArrival(
             now = packetReceivedAtReceiverMs,
             sequence = sequence,

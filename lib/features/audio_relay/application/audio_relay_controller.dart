@@ -42,10 +42,11 @@ class AudioRelayController extends ChangeNotifier {
     @visibleForTesting
     Duration discoveryIdleTimeout = const Duration(minutes: 2),
     @visibleForTesting
-    Duration streamConnectionTimeout = const Duration(seconds: 45),
+    Duration streamConnectionTimeout = const Duration(minutes: 10),
     @visibleForTesting
     Duration receiverNoAudioTimeout = const Duration(minutes: 10),
     @visibleForTesting Duration sourceStaleTimeout = const Duration(seconds: 4),
+    @visibleForTesting List<Duration> reconnectDelays = _defaultReconnectDelays,
     @visibleForTesting
     Duration preferencesSaveDelay = const Duration(milliseconds: 200),
   }) : _engine = engine ?? const MethodChannelAudioRelayEngine(),
@@ -68,6 +69,9 @@ class AudioRelayController extends ChangeNotifier {
        _streamConnectionTimeout = streamConnectionTimeout,
        _receiverNoAudioTimeout = receiverNoAudioTimeout,
        _sourceStaleTimeout = sourceStaleTimeout,
+       _reconnectDelays = List<Duration>.unmodifiable(
+         reconnectDelays.isEmpty ? _defaultReconnectDelays : reconnectDelays,
+       ),
        _preferencesSaveDelay = preferencesSaveDelay,
        profile = AudioPreset.balanced.profile,
        role = _defaultRole(),
@@ -89,6 +93,7 @@ class AudioRelayController extends ChangeNotifier {
   final Duration _streamConnectionTimeout;
   final Duration _receiverNoAudioTimeout;
   final Duration _sourceStaleTimeout;
+  final List<Duration> _reconnectDelays;
   final Duration _preferencesSaveDelay;
   RelayRole role;
   RelayTransport transport = RelayTransport.wifi;
@@ -124,6 +129,7 @@ class AudioRelayController extends ChangeNotifier {
   Timer? _profileApplyTimer;
   Timer? _discoveryIdleTimer;
   Timer? _streamConnectionTimer;
+  Timer? _reconnectTimer;
   Timer? _sourcePruneTimer;
   Timer? _preferencesSaveTimer;
   AudioProfile? _appliedSenderProfile;
@@ -140,11 +146,14 @@ class AudioRelayController extends ChangeNotifier {
   bool _profileApplyPending = false;
   bool _profileApplyInFlight = false;
   bool _virtualMicPassthroughEnabled = false;
-  bool _lostReceiverSourceStopInFlight = false;
+  bool _reconnectAttemptInFlight = false;
   String? _virtualMicPassthroughOutputDeviceId;
   String? _downloadedUpdatePath;
   bool _isDisposed = false;
   bool _streamPeerConnected = false;
+  bool _hasConnectedThisSession = false;
+  int _reconnectAttempt = 0;
+  int _reconnectGeneration = 0;
   bool _preferencesReady = false;
   bool _preferencesDirty = false;
   _AdaptiveProfileApplyReason _pendingProfileApplyReason =
@@ -156,7 +165,15 @@ class AudioRelayController extends ChangeNotifier {
   static const _adaptiveGamingCapMs = 120;
   static const _adaptiveBalancedCapMs = 240;
   static const _adaptiveFormatRecoveryPolls = 4;
-  static const _fallbackAppVersion = '1.2.1';
+  static const _defaultReconnectDelays = [
+    Duration(milliseconds: 500),
+    Duration(seconds: 1),
+    Duration(seconds: 2),
+    Duration(seconds: 4),
+    Duration(seconds: 8),
+    Duration(seconds: 30),
+  ];
+  static const _fallbackAppVersion = '1.3.0';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -167,7 +184,11 @@ class AudioRelayController extends ChangeNotifier {
 
   bool get isBusy => activity == RelayActivity.connecting;
 
-  bool get isStreaming => activity == RelayActivity.streaming;
+  bool get isStreaming =>
+      activity == RelayActivity.streaming ||
+      activity == RelayActivity.reconnecting;
+
+  bool get isReconnecting => activity == RelayActivity.reconnecting;
 
   bool get canEditAudioSettings => role == RelayRole.sender && !isBusy;
 
@@ -1145,6 +1166,7 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   Future<void> stopStream() async {
+    _cancelReconnect();
     _cancelStreamConnectionTimeout();
     _cancelSourcePrune();
     await _engine.stopStream();
@@ -1163,10 +1185,12 @@ class AudioRelayController extends ChangeNotifier {
       selectedDevice = null;
     }
 
+    noticeMessage = null;
     notifyListeners();
   }
 
   Future<void> stopAll() async {
+    _cancelReconnect();
     _cancelDiscoveryIdleTimeout();
     _cancelStreamConnectionTimeout();
     _cancelSourcePrune();
@@ -1299,8 +1323,15 @@ class AudioRelayController extends ChangeNotifier {
       updateStatus = AppUpdateStatus.ready;
       updateMessage = 'System installer opened.';
     } on PlatformException catch (error) {
-      updateStatus = AppUpdateStatus.failed;
-      updateMessage = error.message ?? 'Unable to open installer.';
+      if (error.code == 'update_install_permission') {
+        updateStatus = AppUpdateStatus.ready;
+        updateMessage =
+            error.message ??
+            'Allow AudioBridge to install updates, then return to the app.';
+      } else {
+        updateStatus = AppUpdateStatus.failed;
+        updateMessage = error.message ?? 'Unable to open installer.';
+      }
     } catch (_) {
       updateStatus = AppUpdateStatus.failed;
       updateMessage = 'Unable to open installer.';
@@ -1708,6 +1739,16 @@ class AudioRelayController extends ChangeNotifier {
     return _pruneStaleSources(now: now);
   }
 
+  @visibleForTesting
+  Future<void> reconnectNowForTesting() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    return _runReconnectAttempt(_reconnectGeneration);
+  }
+
+  @visibleForTesting
+  List<Duration> get reconnectDelaysForTesting => _reconnectDelays;
+
   @override
   void notifyListeners() {
     if (_isDisposed) {
@@ -1726,6 +1767,7 @@ class AudioRelayController extends ChangeNotifier {
     _profileApplyTimer?.cancel();
     _discoveryIdleTimer?.cancel();
     _streamConnectionTimer?.cancel();
+    _reconnectTimer?.cancel();
     _sourcePruneTimer?.cancel();
     _preferencesSaveTimer?.cancel();
     if (_preferencesReady && _preferencesDirty) {
@@ -1752,13 +1794,23 @@ class AudioRelayController extends ChangeNotifier {
 
     nextDevices.sort((left, right) => right.lastSeen.compareTo(left.lastSeen));
     devices = List.unmodifiable(nextDevices);
-    if (selectedDevice?.id == device.id) {
+    final selected = selectedDevice;
+    final selectedDeviceSeen =
+        selected?.id == device.id ||
+        (isReconnecting &&
+            selected != null &&
+            selected.name == device.name &&
+            selected.platform == device.platform);
+    if (selectedDeviceSeen) {
       selectedDevice = device;
       profile = _receiverProfileFor(device.profile);
       selectedPreset = profile.mode;
     }
     _scheduleSourcePrune();
     notifyListeners();
+    if (selectedDeviceSeen && isReconnecting) {
+      _scheduleReconnectAttempt(delay: Duration.zero, replace: true);
+    }
   }
 
   void _startMeters() {
@@ -1858,11 +1910,11 @@ class AudioRelayController extends ChangeNotifier {
 
     devices = List.unmodifiable(freshDevices);
     if (selectedExpired) {
-      selectedDevice = null;
-      if (activity == RelayActivity.streaming) {
-        await _stopLostReceiverSource();
+      if (isStreaming) {
+        _enterReconnecting('Source advertisement was lost. Reconnecting...');
         return;
       }
+      selectedDevice = null;
     }
 
     notifyListeners();
@@ -1896,7 +1948,9 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void _startStreamConnectionWatch() {
+    _cancelReconnect();
     _streamPeerConnected = false;
+    _hasConnectedThisSession = false;
     _scheduleStreamConnectionTimeout();
   }
 
@@ -1916,10 +1970,11 @@ class AudioRelayController extends ChangeNotifier {
     _streamConnectionTimer?.cancel();
     _streamConnectionTimer = null;
     _streamPeerConnected = false;
+    _hasConnectedThisSession = false;
   }
 
   Future<void> _stopUnconnectedStream() async {
-    if (_isDisposed || activity != RelayActivity.streaming) {
+    if (_isDisposed || !isStreaming) {
       return;
     }
     if (_streamPeerConnected) {
@@ -1929,9 +1984,9 @@ class AudioRelayController extends ChangeNotifier {
     final timeout = _activeStreamConnectionTimeout;
     final message = role == RelayRole.sender
         ? 'Stopped stream after ${_durationLabel(timeout)} '
-              'without a receiver.'
+              'without reconnecting to a receiver.'
         : 'Stopped stream after ${_durationLabel(timeout)} '
-              'without source audio packets.';
+              'without reconnecting to the source.';
     await stopStream();
     noticeMessage = message;
     notifyListeners();
@@ -1943,44 +1998,186 @@ class AudioRelayController extends ChangeNotifier {
         : _streamConnectionTimeout;
   }
 
-  Future<void> _stopLostReceiverSource() async {
-    if (_isDisposed ||
-        _lostReceiverSourceStopInFlight ||
-        role != RelayRole.receiver ||
-        activity != RelayActivity.streaming) {
+  void _enterReconnecting(String message) {
+    if (_isDisposed || !isStreaming) {
       return;
     }
 
-    _lostReceiverSourceStopInFlight = true;
-    try {
-      await stopStream();
-      noticeMessage =
-          'Stopped receiver because the selected source disconnected.';
+    _streamPeerConnected = false;
+    if (!isReconnecting) {
+      activity = RelayActivity.reconnecting;
+      _reconnectAttempt = 0;
+      noticeMessage = message;
+      if (_streamConnectionTimer == null) {
+        _scheduleStreamConnectionTimeout();
+      }
       notifyListeners();
-    } finally {
-      _lostReceiverSourceStopInFlight = false;
     }
+    _scheduleReconnectAttempt();
+  }
+
+  void _scheduleReconnectAttempt({Duration? delay, bool replace = false}) {
+    if (_isDisposed || !isReconnecting || _reconnectAttemptInFlight) {
+      return;
+    }
+    if (_reconnectTimer != null && !replace) {
+      return;
+    }
+
+    _reconnectTimer?.cancel();
+    final retryDelay =
+        delay ??
+        _reconnectDelays[min(_reconnectAttempt, _reconnectDelays.length - 1)];
+    final generation = _reconnectGeneration;
+    _reconnectTimer = Timer(retryDelay, () {
+      _reconnectTimer = null;
+      unawaited(_runReconnectAttempt(generation));
+    });
+  }
+
+  Future<void> _runReconnectAttempt(int generation) async {
+    if (!_isReconnectCurrent(generation) || _reconnectAttemptInFlight) {
+      return;
+    }
+
+    _reconnectAttemptInFlight = true;
+    try {
+      if (role == RelayRole.receiver) {
+        await _reconnectReceiver(generation);
+      } else {
+        await _reconnectSender(generation);
+      }
+    } on PlatformException catch (error) {
+      if (_isReconnectCurrent(generation)) {
+        noticeMessage =
+            error.message ?? 'Connection is still unavailable. Retrying...';
+        notifyListeners();
+      }
+    } on SocketException catch (error) {
+      if (_isReconnectCurrent(generation)) {
+        noticeMessage = '${error.message} Retrying...';
+        notifyListeners();
+      }
+    } on OSError catch (error) {
+      if (_isReconnectCurrent(generation)) {
+        noticeMessage = '${error.message} Retrying...';
+        notifyListeners();
+      }
+    } finally {
+      _reconnectAttemptInFlight = false;
+      if (_isReconnectCurrent(generation)) {
+        _reconnectAttempt += 1;
+        _scheduleReconnectAttempt();
+      }
+    }
+  }
+
+  Future<void> _reconnectReceiver(int generation) async {
+    if (usesNetworkDiscovery) {
+      await _refreshLocalAddress(requireUsable: true);
+      if (!_isReconnectCurrent(generation)) {
+        return;
+      }
+      await _discoveryService.startScanning(
+        _upsertDevice,
+        scope: _discoveryNetworkScope,
+      );
+    }
+
+    final target = connectionTarget;
+    if (target == null || !_isReconnectCurrent(generation)) {
+      return;
+    }
+
+    final receiverProfile = _receiverProfileFor(target.profile);
+    await _engine.stopStream();
+    if (!_isReconnectCurrent(generation)) {
+      return;
+    }
+    if (target.transport == RelayTransport.usb) {
+      await _engine.prepareUsbReceiver(receiverProfile);
+    } else {
+      await _engine.prepareReceiver(receiverProfile);
+      if (!_isReconnectCurrent(generation)) {
+        return;
+      }
+      await _engine.connectToSender(target, receiverProfile);
+    }
+    if (!_isReconnectCurrent(generation)) {
+      return;
+    }
+    await _engine.startStream(receiverProfile);
+  }
+
+  Future<void> _reconnectSender(int generation) async {
+    final senderProfile = _materializedSenderProfile(profile);
+    if (usesNetworkDiscovery) {
+      await _refreshLocalAddress(requireUsable: true);
+      if (!_isReconnectCurrent(generation)) {
+        return;
+      }
+      await _engine.prepareSender(
+        senderProfile,
+        networkBindAddress: _networkBindAddress,
+      );
+      if (!_isReconnectCurrent(generation)) {
+        return;
+      }
+      await _startAdvertisingCurrentProfile(senderProfile);
+    } else {
+      await _engine.prepareUsbSender(senderProfile);
+    }
+    if (!_isReconnectCurrent(generation)) {
+      return;
+    }
+    await _engine.startStream(senderProfile);
+    _appliedSenderProfile = senderProfile;
+  }
+
+  bool _isReconnectCurrent(int generation) {
+    return !_isDisposed && generation == _reconnectGeneration && isReconnecting;
+  }
+
+  void _cancelReconnect() {
+    _reconnectGeneration += 1;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempt = 0;
   }
 
   Future<void> _updateStreamConnectionFromMetrics(
     AudioRelayMetrics nextMetrics,
   ) async {
-    if (activity != RelayActivity.streaming) {
+    if (!isStreaming) {
       _cancelStreamConnectionTimeout();
+      _cancelReconnect();
       return;
     }
 
     if (nextMetrics.peerConnected == true) {
+      final reconnected = isReconnecting && _hasConnectedThisSession;
       _streamPeerConnected = true;
+      _hasConnectedThisSession = true;
       _streamConnectionTimer?.cancel();
       _streamConnectionTimer = null;
+      _cancelReconnect();
+      if (isReconnecting) {
+        activity = RelayActivity.streaming;
+        noticeMessage = reconnected ? 'Connection restored.' : null;
+        notifyListeners();
+      }
       return;
     }
 
-    _streamPeerConnected = false;
-    if (_streamConnectionTimer == null) {
-      _scheduleStreamConnectionTimeout();
+    if (nextMetrics.peerConnected != false) {
+      return;
     }
+
+    _enterReconnecting(
+      _hasConnectedThisSession
+          ? 'Connection interrupted. Reconnecting...'
+          : 'Waiting for the other device. Reconnecting...',
+    );
   }
 
   Future<void> _pollMetrics() async {
@@ -1993,7 +2190,7 @@ class AudioRelayController extends ChangeNotifier {
       final nextMetrics = await _engine.getMetrics();
       metrics = nextMetrics;
       await _updateStreamConnectionFromMetrics(nextMetrics);
-      if (activity != RelayActivity.streaming) {
+      if (!isStreaming || isReconnecting) {
         return;
       }
       signalLevel = muted ? 0 : nextMetrics.signalLevel ?? 0;
@@ -2011,6 +2208,7 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   void _fail(String message) {
+    _cancelReconnect();
     _cancelDiscoveryIdleTimeout();
     _cancelStreamConnectionTimeout();
     _cancelSourcePrune();
@@ -2434,8 +2632,7 @@ class AudioRelayController extends ChangeNotifier {
     _AdaptiveProfileApplyReason reason = _AdaptiveProfileApplyReason.settings,
   }) {
     if (role != RelayRole.sender ||
-        (activity != RelayActivity.advertising &&
-            activity != RelayActivity.streaming)) {
+        (activity != RelayActivity.advertising && !isStreaming)) {
       return;
     }
 
@@ -2531,6 +2728,11 @@ class AudioRelayController extends ChangeNotifier {
         _rememberAutoResolvedCodec(senderProfile);
         await _startAdvertisingCurrentProfile(senderProfile);
       }
+      return;
+    }
+
+    if (isReconnecting) {
+      _appliedSenderProfile = senderProfile;
       return;
     }
 

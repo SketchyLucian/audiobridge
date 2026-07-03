@@ -39,6 +39,7 @@ enum RelayActivity {
   scanning,
   connecting,
   streaming,
+  reconnecting,
   error;
 
   String get label {
@@ -48,6 +49,7 @@ enum RelayActivity {
       RelayActivity.scanning => 'Scanning',
       RelayActivity.connecting => 'Connecting',
       RelayActivity.streaming => 'Streaming',
+      RelayActivity.reconnecting => 'Reconnecting',
       RelayActivity.error => 'Needs attention',
     };
   }

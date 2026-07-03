@@ -14,6 +14,21 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('reconnect backoff grows before settling at thirty seconds', () {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine());
+
+    expect(controller.reconnectDelaysForTesting, const [
+      Duration(milliseconds: 500),
+      Duration(seconds: 1),
+      Duration(seconds: 2),
+      Duration(seconds: 4),
+      Duration(seconds: 8),
+      Duration(seconds: 30),
+    ]);
+
+    controller.dispose();
+  });
+
   test('starts with the balanced preset profile', () {
     final controller = AudioRelayController(engine: _FakeAudioRelayEngine());
 
@@ -348,6 +363,7 @@ void main() {
       profileApplyDelay: Duration.zero,
     )..role = RelayRole.sender;
 
+    await controller.startDiscovery();
     await controller.startSenderStream();
     engine.calls.clear();
     engine.profiles.clear();
@@ -737,6 +753,59 @@ void main() {
 
     controller.dispose();
   });
+
+  test(
+    'install permission request keeps the downloaded update ready',
+    () async {
+      final tempDir = await Directory.systemTemp.createTemp(
+        'audiobridge_update_permission_test_',
+      );
+      addTearDown(() async {
+        if (await tempDir.exists()) {
+          await tempDir.delete(recursive: true);
+        }
+      });
+      final packageFile = File(
+        '${tempDir.path}${Platform.pathSeparator}app.apk',
+      );
+      await packageFile.writeAsBytes([1, 2, 3]);
+      final release = _updateRelease(
+        tagName: 'v1.0.5',
+        assetName: 'AudioBridge-1.0.5-android.apk',
+        target: AppUpdateTarget.android,
+      );
+      final installer = _FakeUpdateInstaller(
+        installError: PlatformException(
+          code: 'update_install_permission',
+          message:
+              'Allow AudioBridge to install updates, then return to the app.',
+        ),
+      );
+      final controller = AudioRelayController(
+        engine: _FakeAudioRelayEngine(),
+        updateService: _FakeUpdateService(
+          release: release,
+          downloadedFile: packageFile,
+        ),
+        updateInstaller: installer,
+        appVersionProvider: () async => '1.0.4',
+        updateTarget: AppUpdateTarget.android,
+      );
+
+      await controller.checkForUpdates();
+      await controller.downloadAndInstallUpdate();
+
+      expect(controller.updateStatus, AppUpdateStatus.ready);
+      expect(controller.updateActionLabel, 'Install');
+      expect(
+        controller.updateMessage,
+        'Allow AudioBridge to install updates, then return to the app.',
+      );
+      expect(installer.installedPackages, [packageFile.path]);
+
+      controller.dispose();
+    },
+  );
 
   test('aac is modeled as an implemented native codec path', () {
     expect(AudioCodec.aac.isImplemented, true);
@@ -2182,7 +2251,7 @@ void main() {
     expect(engine.calls, ['prepareSender', 'startStream', 'stopStream']);
     expect(
       controller.noticeMessage,
-      'Stopped stream after a moment without a receiver.',
+      'Stopped stream after a moment without reconnecting to a receiver.',
     );
 
     controller.dispose();
@@ -2256,50 +2325,53 @@ void main() {
     controller.dispose();
   });
 
-  test('receiver stops streaming when selected source expires', () async {
-    final discoveryService = _FakeDiscoveryService();
-    final engine = _FakeAudioRelayEngine();
-    final controller =
-        AudioRelayController(
-            engine: engine,
-            discoveryService: discoveryService,
-            sourceStaleTimeout: const Duration(seconds: 10),
-          )
-          ..role = RelayRole.receiver
-          ..capabilities = _supportedCapabilities;
-    final now = DateTime.now();
-    final device = RelayDevice(
-      id: 'source-1',
-      name: 'Windows source',
-      host: '192.168.1.25',
-      port: DiscoveryService.audioPort,
-      transport: RelayTransport.wifi,
-      platform: DevicePlatform.windows,
-      profile: AudioPreset.balanced.profile,
-      lastSeen: now.subtract(const Duration(seconds: 9)),
-    );
+  test(
+    'receiver keeps selected source while its advertisement is stale',
+    () async {
+      final discoveryService = _FakeDiscoveryService();
+      final engine = _FakeAudioRelayEngine();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: discoveryService,
+              sourceStaleTimeout: const Duration(seconds: 10),
+            )
+            ..role = RelayRole.receiver
+            ..capabilities = _supportedCapabilities;
+      final now = DateTime.now();
+      final device = RelayDevice(
+        id: 'source-1',
+        name: 'Windows source',
+        host: '192.168.1.25',
+        port: DiscoveryService.audioPort,
+        transport: RelayTransport.wifi,
+        platform: DevicePlatform.windows,
+        profile: AudioPreset.balanced.profile,
+        lastSeen: now.subtract(const Duration(seconds: 9)),
+      );
 
-    await controller.startDiscovery();
-    discoveryService.emit(device);
-    await controller.connectToDevice(device);
-    await controller.pruneStaleSourcesForTesting(
-      now: now.add(const Duration(seconds: 2)),
-    );
+      await controller.startDiscovery();
+      discoveryService.emit(device);
+      await controller.connectToDevice(device);
+      await controller.pruneStaleSourcesForTesting(
+        now: now.add(const Duration(seconds: 2)),
+      );
 
-    expect(controller.activity, RelayActivity.idle);
-    expect(controller.devices, isEmpty);
-    expect(controller.selectedDevice, isNull);
-    expect(discoveryService.scanningStarted, false);
-    expect(engine.calls, ['prepareReceiver', 'startStream', 'stopStream']);
-    expect(
-      controller.noticeMessage,
-      'Stopped receiver because the selected source disconnected.',
-    );
+      expect(controller.activity, RelayActivity.reconnecting);
+      expect(controller.devices, isEmpty);
+      expect(controller.selectedDevice?.id, 'source-1');
+      expect(discoveryService.scanningStarted, true);
+      expect(engine.calls, ['prepareReceiver', 'startStream']);
+      expect(
+        controller.noticeMessage,
+        'Source advertisement was lost. Reconnecting...',
+      );
 
-    controller.dispose();
-  });
+      controller.dispose();
+    },
+  );
 
-  test('receiver stays connected when source audio briefly pauses', () async {
+  test('receiver enters reconnecting when peer heartbeat is lost', () async {
     final discoveryService = _FakeDiscoveryService();
     final engine = _FakeAudioRelayEngine();
     final controller =
@@ -2330,15 +2402,200 @@ void main() {
     engine.metrics = const AudioRelayMetrics(peerConnected: false);
     await controller.pollMetricsForTesting();
 
-    expect(controller.activity, RelayActivity.streaming);
+    expect(controller.activity, RelayActivity.reconnecting);
     expect(controller.devices.map((device) => device.id), ['source-1']);
     expect(controller.selectedDevice?.id, 'source-1');
     expect(discoveryService.scanningStarted, true);
     expect(engine.calls, ['prepareReceiver', 'startStream']);
-    expect(controller.noticeMessage, isNull);
+    expect(controller.noticeMessage, 'Connection interrupted. Reconnecting...');
 
     controller.dispose();
   });
+
+  test('manual disconnect cancels pending reconnect attempts', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: _FakeDiscoveryService(),
+            reconnectDelays: const [Duration(hours: 1)],
+          )
+          ..role = RelayRole.receiver
+          ..capabilities = _supportedCapabilities;
+    final device = RelayDevice(
+      id: 'source-1',
+      name: 'Windows source',
+      host: '192.168.1.25',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.balanced.profile,
+      lastSeen: DateTime.now(),
+    );
+
+    await controller.connectToDevice(device);
+    engine.metrics = const AudioRelayMetrics(peerConnected: false);
+    await controller.pollMetricsForTesting();
+    await controller.stopStream();
+    await controller.reconnectNowForTesting();
+
+    expect(controller.activity, RelayActivity.idle);
+    expect(controller.noticeMessage, isNull);
+    expect(engine.calls, ['prepareReceiver', 'startStream', 'stopStream']);
+
+    controller.dispose();
+  });
+
+  test(
+    'receiver remains connected while heartbeat reports silent audio',
+    () async {
+      final engine = _FakeAudioRelayEngine();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: _FakeDiscoveryService(),
+            )
+            ..role = RelayRole.receiver
+            ..capabilities = _supportedCapabilities;
+      final device = RelayDevice(
+        id: 'source-1',
+        name: 'Windows source',
+        host: '192.168.1.25',
+        port: DiscoveryService.audioPort,
+        transport: RelayTransport.wifi,
+        platform: DevicePlatform.windows,
+        profile: AudioPreset.balanced.profile,
+        lastSeen: DateTime.now(),
+      );
+
+      await controller.connectToDevice(device);
+      engine.metrics = const AudioRelayMetrics(
+        peerConnected: true,
+        signalLevel: 0,
+      );
+      await controller.pollMetricsForTesting();
+
+      expect(controller.activity, RelayActivity.streaming);
+      expect(controller.signalLevel, 0);
+      expect(engine.calls, ['prepareReceiver', 'startStream']);
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'receiver reconnects to a rediscovered source after its IP changes',
+    () async {
+      final discoveryService = _FakeDiscoveryService();
+      final engine = _FakeAudioRelayEngine();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: discoveryService,
+              reconnectDelays: const [Duration(hours: 1)],
+            )
+            ..role = RelayRole.receiver
+            ..capabilities = _supportedCapabilities;
+      final oldDevice = RelayDevice(
+        id: 'source-old-address',
+        name: 'Windows source',
+        host: '192.168.1.25',
+        port: DiscoveryService.audioPort,
+        transport: RelayTransport.wifi,
+        platform: DevicePlatform.windows,
+        profile: AudioPreset.balanced.profile,
+        lastSeen: DateTime.now(),
+      );
+      final movedDevice = RelayDevice(
+        id: 'source-new-address',
+        name: 'Windows source',
+        host: '192.168.1.91',
+        port: DiscoveryService.audioPort,
+        transport: RelayTransport.wifi,
+        platform: DevicePlatform.windows,
+        profile: AudioPreset.balanced.profile,
+        lastSeen: DateTime.now(),
+      );
+
+      await controller.startDiscovery();
+      discoveryService.emit(oldDevice);
+      await controller.connectToDevice(oldDevice);
+      engine.metrics = const AudioRelayMetrics(peerConnected: true);
+      await controller.pollMetricsForTesting();
+
+      engine.metrics = const AudioRelayMetrics(peerConnected: false);
+      await controller.pollMetricsForTesting();
+      discoveryService.emit(movedDevice);
+      await controller.reconnectNowForTesting();
+
+      expect(controller.activity, RelayActivity.reconnecting);
+      expect(controller.selectedDevice?.host, '192.168.1.91');
+      expect(engine.connectedDevices.map((device) => device.host), [
+        '192.168.1.25',
+        '192.168.1.91',
+      ]);
+      expect(engine.calls, [
+        'prepareReceiver',
+        'startStream',
+        'stopStream',
+        'prepareReceiver',
+        'startStream',
+      ]);
+      expect(discoveryService.scanningScopes, [
+        DiscoveryNetworkScope.wifi,
+        DiscoveryNetworkScope.wifi,
+      ]);
+
+      engine.metrics = const AudioRelayMetrics(peerConnected: true);
+      await controller.pollMetricsForTesting();
+
+      expect(controller.activity, RelayActivity.streaming);
+      expect(controller.noticeMessage, 'Connection restored.');
+
+      controller.dispose();
+    },
+  );
+
+  test(
+    'sender refreshes its bind and advertisement while reconnecting',
+    () async {
+      final discoveryService = _FakeDiscoveryService();
+      final engine = _FakeAudioRelayEngine();
+      final controller =
+          AudioRelayController(
+              engine: engine,
+              discoveryService: discoveryService,
+              reconnectDelays: const [Duration(hours: 1)],
+            )
+            ..role = RelayRole.sender
+            ..capabilities = _supportedCapabilities;
+
+      await controller.startDiscovery();
+      await controller.startSenderStream();
+      engine.metrics = const AudioRelayMetrics(peerConnected: true);
+      await controller.pollMetricsForTesting();
+      engine.metrics = const AudioRelayMetrics(peerConnected: false);
+      await controller.pollMetricsForTesting();
+      await controller.reconnectNowForTesting();
+
+      expect(controller.activity, RelayActivity.reconnecting);
+      expect(engine.calls, [
+        'prepareSender',
+        'prepareSender',
+        'startStream',
+        'prepareSender',
+        'startStream',
+      ]);
+      expect(engine.senderBindAddresses, [
+        '192.168.1.130',
+        '192.168.1.130',
+        '192.168.1.130',
+      ]);
+      expect(discoveryService.advertisedDevices, hasLength(2));
+
+      controller.dispose();
+    },
+  );
 
   test('receiver stops after the no-audio timeout expires', () async {
     final discoveryService = _FakeDiscoveryService();
@@ -2374,7 +2631,7 @@ void main() {
     expect(engine.calls, ['prepareReceiver', 'startStream', 'stopStream']);
     expect(
       controller.noticeMessage,
-      'Stopped stream after a moment without source audio packets.',
+      'Stopped stream after a moment without reconnecting to the source.',
     );
 
     controller.dispose();
@@ -2713,6 +2970,7 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   final List<AudioProfile> profiles = [];
   final List<AudioProfile> startedProfiles = [];
   final List<AudioProfile> connectedProfiles = [];
+  final List<RelayDevice> connectedDevices = [];
   final List<String?> senderBindAddresses = [];
   final List<String> soundEffectPaths = [];
   final List<double> soundEffectVolumes = [];
@@ -2724,6 +2982,7 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
 
   @override
   Future<void> connectToSender(RelayDevice device, AudioProfile profile) async {
+    connectedDevices.add(device);
     connectedProfiles.add(profile);
   }
 
@@ -2940,6 +3199,9 @@ class _FakeUpdateService implements AppUpdateService {
 }
 
 class _FakeUpdateInstaller implements UpdateInstaller {
+  _FakeUpdateInstaller({this.installError});
+
+  final PlatformException? installError;
   final List<String> openedUrls = [];
   final List<String> installedPackages = [];
 
@@ -2951,5 +3213,9 @@ class _FakeUpdateInstaller implements UpdateInstaller {
   @override
   Future<void> installPackage(File packageFile) async {
     installedPackages.add(packageFile.path);
+    final error = installError;
+    if (error != null) {
+      throw error;
+    }
   }
 }

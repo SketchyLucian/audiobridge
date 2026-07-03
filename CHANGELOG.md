@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 - 2026-07-03
+
+- Added session-aware connection heartbeat so silence no longer looks like a disconnect.
+- Added automatic reconnect with backoff, discovery refresh, and network-interface refresh.
+- Preserved the selected receiver source while reconnecting and reattached when the source is rediscovered with a new address.
+- Rejected stale or wrong-session packets after the new transport handshake.
+- Fixed Android OTA permission flow so the APK installer opens after install permission is granted.
+
 ## 1.2.2 - 2026-07-03
 
 - Kept receiver sessions alive during silence with a 10-minute no-audio timeout.

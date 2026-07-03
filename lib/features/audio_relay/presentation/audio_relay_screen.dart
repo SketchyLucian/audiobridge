@@ -2207,7 +2207,8 @@ class _StatusPill extends StatelessWidget {
     final theme = Theme.of(context);
     final color = switch (activity) {
       RelayActivity.streaming => theme.colorScheme.primary,
-      RelayActivity.connecting => theme.colorScheme.tertiary,
+      RelayActivity.connecting ||
+      RelayActivity.reconnecting => theme.colorScheme.tertiary,
       RelayActivity.error => theme.colorScheme.error,
       RelayActivity.advertising ||
       RelayActivity.scanning => theme.colorScheme.secondary,

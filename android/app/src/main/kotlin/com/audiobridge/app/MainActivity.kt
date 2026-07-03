@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
@@ -26,6 +27,8 @@ class MainActivity : FlutterActivity() {
     private val audioEngine by lazy { AudioEngineHolder.receiverEngine(applicationContext) }
     private var pendingStartResult: MethodChannel.Result? = null
     private var pendingStartArguments: Any? = null
+    private var pendingUpdateInstallFile: File? = null
+    private var awaitingUpdateInstallPermission = false
     private var usbPermissionReceiverRegistered = false
     private val usbPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -47,6 +50,17 @@ class MainActivity : FlutterActivity() {
                     null
                 )
             }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val pendingInstallPath = savedInstanceState
+            ?.getString(PENDING_UPDATE_INSTALL_PATH_KEY)
+            ?.takeIf { it.isNotBlank() }
+        if (pendingInstallPath != null) {
+            pendingUpdateInstallFile = File(pendingInstallPath)
+            awaitingUpdateInstallPermission = true
         }
     }
 
@@ -154,6 +168,20 @@ class MainActivity : FlutterActivity() {
         handleUsbAccessoryIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        resumePendingUpdateInstall()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        if (awaitingUpdateInstallPermission) {
+            pendingUpdateInstallFile?.let { installFile ->
+                outState.putString(PENDING_UPDATE_INSTALL_PATH_KEY, installFile.path)
+            }
+        }
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -229,35 +257,86 @@ class MainActivity : FlutterActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             !packageManager.canRequestPackageInstalls()
         ) {
+            pendingUpdateInstallFile = installFile
+            awaitingUpdateInstallPermission = true
             val settingsIntent = Intent(
                 Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                 Uri.parse("package:$packageName")
             )
-            startActivity(settingsIntent)
+            try {
+                startActivity(settingsIntent)
+            } catch (_: Exception) {
+                pendingUpdateInstallFile = null
+                awaitingUpdateInstallPermission = false
+                result.error(
+                    "update_permission_screen",
+                    "Unable to open the install permission screen.",
+                    null
+                )
+                return
+            }
             result.error(
                 "update_install_permission",
-                "Allow AudioBridge to install updates, then try again.",
+                "Allow AudioBridge to install updates, then return to the app.",
                 null
             )
             return
         }
 
-        val packageUri = FileProvider.getUriForFile(
-            this,
-            "$packageName.update_file_provider",
-            installFile
-        )
-        val installIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(packageUri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try {
-            startActivity(installIntent)
+        if (openUpdatePackageInstaller(installFile)) {
             result.success(null)
-        } catch (_: Exception) {
+        } else {
             result.error("update_package", "Unable to open Android installer.", null)
         }
+    }
+
+    private fun resumePendingUpdateInstall() {
+        if (!awaitingUpdateInstallPermission) {
+            return
+        }
+
+        awaitingUpdateInstallPermission = false
+        val installFile = pendingUpdateInstallFile
+        pendingUpdateInstallFile = null
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !packageManager.canRequestPackageInstalls()
+        ) {
+            showUpdateInstallMessage(
+                "Install permission was not granted. Tap Install to try again."
+            )
+            return
+        }
+        if (installFile == null || !installFile.exists() || !isInAppStorage(installFile)) {
+            showUpdateInstallMessage("The downloaded Android package is missing.")
+            return
+        }
+        if (!openUpdatePackageInstaller(installFile)) {
+            showUpdateInstallMessage("Unable to open Android installer.")
+        }
+    }
+
+    private fun openUpdatePackageInstaller(installFile: File): Boolean {
+        return try {
+            val packageUri = FileProvider.getUriForFile(
+                this,
+                "$packageName.update_file_provider",
+                installFile
+            )
+            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(packageUri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(installIntent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun showUpdateInstallMessage(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     private fun isInAppStorage(file: File): Boolean {
@@ -534,6 +613,8 @@ class MainActivity : FlutterActivity() {
     }
 
     companion object {
+        private const val PENDING_UPDATE_INSTALL_PATH_KEY =
+            "audio_bridge_pending_update_install_path"
         private const val STREAM_PERMISSION_REQUEST_CODE = 47885
         private const val USB_PERMISSION_ACTION =
             "com.audiobridge.app.USB_PERMISSION"

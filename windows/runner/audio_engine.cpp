@@ -121,12 +121,15 @@ constexpr int kPacketHeaderBytes = 16;
 constexpr int kPacketV2HeaderBytes = 24;
 constexpr int kPacketV3HeaderBytes = 48;
 constexpr int kPacketV4HeaderBytes = 56;
+constexpr int kPacketV5HeaderBytes = 64;
 constexpr int kLowDelayTrafficClass = 0xB8;
 constexpr int kAudioSocketBufferBytes = 256 * 1024;
 constexpr int kMinBufferMs = 5;
 constexpr int kMaxBufferMs = 500;
 constexpr int kLowLatencyPerformanceMaxMs = 80;
 constexpr int64_t kSourceIdleTimeoutMs = 1200;
+constexpr int64_t kPeerHeartbeatTimeoutMs = 3000;
+constexpr int64_t kHeartbeatIntervalMs = 800;
 constexpr char kSubscribePrefix[] = "ABR_SUBSCRIBE";
 constexpr size_t kSubscribeMaxBytes = 2048;
 constexpr char kReceiverSupportedCodecs[] = "pcm";
@@ -154,6 +157,7 @@ constexpr uint32_t kPacketMagic = 0x31524241;  // ABR1, little-endian.
 constexpr uint32_t kPacketV2Magic = 0x32524241;  // ABR2, little-endian.
 constexpr uint32_t kPacketV3Magic = 0x33524241;  // ABR3, little-endian.
 constexpr uint32_t kPacketV4Magic = 0x34524241;  // ABR4, little-endian.
+constexpr uint32_t kPacketV5Magic = 0x35524241;  // ABR5, little-endian.
 constexpr uint16_t kCodecPcm = 0;
 constexpr uint16_t kCodecOpus = 1;
 constexpr uint16_t kCodecAac = 2;
@@ -161,6 +165,7 @@ constexpr uint16_t kCodecG711MuLaw = 8;
 constexpr uint16_t kCodecG711ALaw = 9;
 constexpr uint16_t kCodecImaAdpcm = 10;
 constexpr uint16_t kPacketKindAudio = 0;
+constexpr uint16_t kPacketKindHeartbeat = 1;
 constexpr uint16_t kPacketFlagMuted = 1;
 constexpr uint32_t kReceiverOptionAdaptiveBuffer = 1;
 constexpr int kReceiverOptionModeShift = 4;
@@ -266,6 +271,7 @@ struct AudioProfile {
 struct Endpoint {
   sockaddr_in address = {};
   bool available = false;
+  uint64_t session_id = 0;
 };
 
 struct ReceiverSource {
@@ -705,6 +711,15 @@ int64_t NowMillis() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+uint64_t GenerateSessionId() {
+  static std::atomic<uint64_t> counter{1};
+  const uint64_t clock = static_cast<uint64_t>(NowMillis());
+  const uint64_t process = static_cast<uint64_t>(GetCurrentProcessId());
+  const uint64_t value =
+      (clock << 21) ^ (process << 9) ^ counter.fetch_add(1);
+  return (value & static_cast<uint64_t>(INT64_MAX)) | 1u;
 }
 
 std::string WideToUtf8(const wchar_t* value) {
@@ -2041,11 +2056,11 @@ class WindowsAudioEngine::Impl {
     flutter::EncodableMap metrics;
     if (playback_running_.load()) {
       const int64_t last_packet_at =
-          local_last_audio_packet_received_at_ms_.load();
+          local_last_peer_packet_received_at_ms_.load();
       metrics[flutter::EncodableValue("peerConnected")] =
           flutter::EncodableValue(last_packet_at > 0 &&
                                   NowMillis() - last_packet_at <=
-                                      kSourceIdleTimeoutMs);
+                                      kPeerHeartbeatTimeoutMs);
 
       const double output_latency_ms = LocalOutputLatencyMs();
       if (output_latency_ms < 0) {
@@ -2411,6 +2426,11 @@ class WindowsAudioEngine::Impl {
       std::scoped_lock lock(receiver_source_mutex_);
       has_receiver_source = receiver_source_.available;
     }
+    if ((has_receiver_source || usb_receiver_mode_) && !playback_running_) {
+      receiver_session_id_ = GenerateSessionId();
+      session_protocol_active_ = false;
+      local_last_peer_packet_received_at_ms_ = 0;
+    }
     if (has_receiver_source) {
       if (profile_.codec != AudioCodec::kPcm) {
         return "Windows receiver playback currently supports PCM only. Select PCM on the sender.";
@@ -2510,6 +2530,9 @@ class WindowsAudioEngine::Impl {
     local_signal_peak_ = 0.0;
     local_last_playback_signal_level_ = 0.0;
     local_last_audio_packet_received_at_ms_ = 0;
+    local_last_peer_packet_received_at_ms_ = 0;
+    receiver_session_id_ = 0;
+    session_protocol_active_ = false;
     ResetLocalAdaptiveDelayTracker();
     opus_codec_.Shutdown();
     aac_codec_.Shutdown();
@@ -2630,6 +2653,8 @@ class WindowsAudioEngine::Impl {
     remote_lost_packet_count_ = 0;
     remote_trim_count_ = 0;
     remote_metrics_received_at_ms_ = 0;
+    remote_session_id_ = 0;
+    last_heartbeat_sent_at_ms_ = 0;
     {
       std::scoped_lock lock(remote_receiver_clock_mutex_);
       remote_receiver_clock_echo_ = {};
@@ -3557,10 +3582,52 @@ class WindowsAudioEngine::Impl {
 
       const std::string message(buffer.data(), received);
       UpdateRemoteMetrics(message);
+      const uint64_t session_id = remote_session_id_.load();
 
-      std::scoped_lock lock(endpoint_mutex_);
-      endpoint_.address = remote;
-      endpoint_.available = true;
+      {
+        std::scoped_lock lock(endpoint_mutex_);
+        endpoint_.address = remote;
+        endpoint_.available = true;
+        endpoint_.session_id = session_id;
+      }
+      MaybeSendHeartbeat(remote, session_id);
+    }
+  }
+
+  void MaybeSendHeartbeat(const sockaddr_in& address, uint64_t session_id) {
+    if (session_id == 0 || socket_ == INVALID_SOCKET) {
+      return;
+    }
+
+    const int64_t now = NowMillis();
+    const int64_t last_sent = last_heartbeat_sent_at_ms_.load();
+    if (now - last_sent < kHeartbeatIntervalMs) {
+      return;
+    }
+
+    std::vector<uint8_t> packet(kPacketV5HeaderBytes);
+    WriteU32(packet, 0, kPacketV5Magic);
+    WriteU32(packet, 4, sequence_.load());
+    WriteU32(packet, 8, 0);
+    WriteU16(packet, 12, 0);
+    WriteU16(packet, 14, 0);
+    WriteU16(packet, 16, kCodecPcm);
+    WriteU16(packet, 18, kPacketKindHeartbeat);
+    WriteU32(packet, 20, 0);
+    WriteU64(packet, 24, static_cast<uint64_t>(now));
+    WriteU64(packet, 32, 0);
+    WriteU64(packet, 40, 0);
+    WriteU32(packet, 48, static_cast<uint32_t>(std::clamp(
+                           profile_.playback_buffer_ms, kMinBufferMs,
+                           kMaxBufferMs)));
+    WriteU32(packet, 52, ReceiverOptionsFor(profile_));
+    WriteU64(packet, 56, session_id);
+
+    if (sendto(socket_, reinterpret_cast<const char*>(packet.data()),
+               static_cast<int>(packet.size()), 0,
+               reinterpret_cast<const sockaddr*>(&address),
+               sizeof(address)) != SOCKET_ERROR) {
+      last_heartbeat_sent_at_ms_ = now;
     }
   }
 
@@ -4100,6 +4167,13 @@ class WindowsAudioEngine::Impl {
 
   void UpdateRemoteMetrics(const std::string& message) {
     const int64_t received_at = NowMillis();
+    const auto protocol = ParseIntMetric(message, "protocol");
+    const auto session_id = ParseIntMetric(message, "sessionId");
+    remote_session_id_ =
+        protocol.has_value() && protocol.value() >= 5 &&
+                session_id.has_value() && session_id.value() > 0
+            ? static_cast<uint64_t>(session_id.value())
+            : 0;
     if (const auto receiver_time = ParseIntMetric(message, "receiverTimeMs")) {
       std::scoped_lock lock(remote_receiver_clock_mutex_);
       remote_receiver_clock_echo_ = {
@@ -4514,6 +4588,8 @@ class WindowsAudioEngine::Impl {
 
   std::string BuildSubscribeMessage() const {
     std::string message = std::string(kSubscribePrefix) +
+                          " protocol=5 sessionId=" +
+                          std::to_string(receiver_session_id_.load()) +
                           " platform=windows supportedCodecs=" +
                           kReceiverSupportedCodecs +
                           " receiverTimeMs=" +
@@ -4579,6 +4655,9 @@ class WindowsAudioEngine::Impl {
     }
 
     const uint32_t magic = ReadU32Le(data);
+    if (session_protocol_active_.load() && magic != kPacketV5Magic) {
+      return;
+    }
     if (magic == kPacketMagic) {
       const uint32_t sequence = ReadU32Le(data + 4);
       const int sample_rate = static_cast<int>(ReadU32Le(data + 8));
@@ -4591,13 +4670,14 @@ class WindowsAudioEngine::Impl {
     }
 
     if (magic != kPacketV2Magic && magic != kPacketV3Magic &&
-        magic != kPacketV4Magic) {
+        magic != kPacketV4Magic && magic != kPacketV5Magic) {
       return;
     }
     const int header_bytes = magic == kPacketV2Magic ? kPacketV2HeaderBytes
                            : magic == kPacketV3Magic ? kPacketV3HeaderBytes
-                                                     : kPacketV4HeaderBytes;
-    if (length <= header_bytes) {
+                           : magic == kPacketV4Magic ? kPacketV4HeaderBytes
+                                                     : kPacketV5HeaderBytes;
+    if (length < header_bytes) {
       return;
     }
 
@@ -4609,14 +4689,33 @@ class WindowsAudioEngine::Impl {
         magic == kPacketV2Magic ? kCodecPcm : ReadU16Le(data + 16);
     const uint16_t packet_kind =
         magic == kPacketV2Magic ? kPacketKindAudio : ReadU16Le(data + 18);
-    UpdateLocalPacketLoss(sequence);
+
+    if (magic == kPacketV5Magic) {
+      const uint64_t session_id = ReadU64Le(data + 56);
+      if (receiver_session_id_.load() == 0 ||
+          session_id != receiver_session_id_.load()) {
+        ++local_dropped_packet_count_;
+        return;
+      }
+      session_protocol_active_ = true;
+      local_last_peer_packet_received_at_ms_ = NowMillis();
+      if (packet_kind == kPacketKindHeartbeat) {
+        return;
+      }
+    }
+
+    if (length <= header_bytes) {
+      ++local_dropped_packet_count_;
+      return;
+    }
 
     if (packet_kind != kPacketKindAudio || codec_id != kCodecPcm) {
       ++local_dropped_packet_count_;
       return;
     }
+    UpdateLocalPacketLoss(sequence);
 
-    if (magic == kPacketV4Magic) {
+    if (magic == kPacketV4Magic || magic == kPacketV5Magic) {
       const int playback_buffer_ms = static_cast<int>(
           std::clamp<uint32_t>(ReadU32Le(data + 48), kMinBufferMs,
                                kMaxBufferMs));
@@ -4691,7 +4790,9 @@ class WindowsAudioEngine::Impl {
     local_input_sample_rate_ = sample_rate;
     local_input_channels_ = channels;
     local_codec_id_ = kCodecPcm;
-    local_last_audio_packet_received_at_ms_ = NowMillis();
+    const int64_t received_at = NowMillis();
+    local_last_audio_packet_received_at_ms_ = received_at;
+    local_last_peer_packet_received_at_ms_ = received_at;
 
     PcmPlaybackPacket packet;
     packet.sample_rate = sample_rate;
@@ -5387,6 +5488,10 @@ class WindowsAudioEngine::Impl {
         (!usb_mode && (!endpoint.available || socket_ == INVALID_SOCKET))) {
       return;
     }
+    const uint64_t session_id =
+        usb_mode ? remote_session_id_.load() : endpoint.session_id;
+    const int packet_header_bytes =
+        session_id == 0 ? kPacketV4HeaderBytes : kPacketV5HeaderBytes;
 
     const int packet_time_ms = std::clamp(profile_.packet_time_ms, 1, 12);
     if (packetizer_sample_rate_ != sample_rate ||
@@ -5402,7 +5507,7 @@ class WindowsAudioEngine::Impl {
     }
 
     const int bytes_per_frame = EncodedBytesPerFrame(profile_.codec, channels);
-    const int max_payload_bytes = kMaxPacketBytes - kPacketV4HeaderBytes -
+    const int max_payload_bytes = kMaxPacketBytes - kPacketV5HeaderBytes -
                                   EncodedPacketOverhead(profile_.codec,
                                                         channels);
     const int max_frames = profile_.codec == AudioCodec::kOpus
@@ -5441,7 +5546,7 @@ class WindowsAudioEngine::Impl {
         ++packetizer_packet_count_;
         continue;
       }
-      std::vector<uint8_t> packet(kPacketV4HeaderBytes + encoded.payload.size());
+      std::vector<uint8_t> packet(packet_header_bytes + encoded.payload.size());
       const int64_t send_time_ms = NowMillis();
       RemoteReceiverClockEcho receiver_clock_echo;
       {
@@ -5459,7 +5564,8 @@ class WindowsAudioEngine::Impl {
               ? receiver_clock_echo.received_at_sender_time_ms
               : 0;
 
-      WriteU32(packet, 0, kPacketV4Magic);
+      WriteU32(packet, 0,
+               session_id == 0 ? kPacketV4Magic : kPacketV5Magic);
       WriteU32(packet, 4, sequence_++);
       WriteU32(packet, 8, static_cast<uint32_t>(sample_rate));
       WriteU16(packet, 12, static_cast<uint16_t>(channels));
@@ -5475,8 +5581,11 @@ class WindowsAudioEngine::Impl {
                              profile_.playback_buffer_ms, kMinBufferMs,
                              kMaxBufferMs)));
       WriteU32(packet, 52, ReceiverOptionsFor(profile_));
+      if (session_id != 0) {
+        WriteU64(packet, 56, session_id);
+      }
       if (!encoded.payload.empty()) {
-        std::memcpy(packet.data() + kPacketV4HeaderBytes,
+        std::memcpy(packet.data() + packet_header_bytes,
                     encoded.payload.data(), encoded.payload.size());
       }
 
@@ -5685,6 +5794,8 @@ class WindowsAudioEngine::Impl {
   std::atomic<int64_t> remote_lost_packet_count_ = 0;
   std::atomic<int64_t> remote_trim_count_ = 0;
   std::atomic<int64_t> remote_metrics_received_at_ms_ = 0;
+  std::atomic<uint64_t> remote_session_id_ = 0;
+  std::atomic<int64_t> last_heartbeat_sent_at_ms_ = 0;
   std::mutex remote_receiver_clock_mutex_;
   RemoteReceiverClockEcho remote_receiver_clock_echo_;
   std::string remote_platform_;
@@ -5692,6 +5803,9 @@ class WindowsAudioEngine::Impl {
   mutable std::atomic<double> local_signal_peak_ = 0.0;
   std::atomic<double> local_last_playback_signal_level_ = 0.0;
   std::atomic<int64_t> local_last_audio_packet_received_at_ms_ = 0;
+  std::atomic<int64_t> local_last_peer_packet_received_at_ms_ = 0;
+  std::atomic<uint64_t> receiver_session_id_ = 0;
+  std::atomic_bool session_protocol_active_ = false;
   std::atomic<int64_t> local_buffer_size_frames_ = 0;
   std::atomic<int64_t> local_target_buffer_frames_ = 0;
   std::atomic<int64_t> local_adaptive_playback_buffer_ms_ = 0;

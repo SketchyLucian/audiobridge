@@ -13,6 +13,8 @@ audio engines.
 - Codeberg release checks with assisted APK and MSI installation
 - UDP LAN discovery on port `47884`
 - Audio streaming on port `47885`
+- Session-aware heartbeat, stale-packet rejection, and automatic reconnect with
+  discovery and network-interface refresh
 - USB tethering mode that uses the phone's USB network interface with UDP
   discovery/audio
 - Native USB cable audio streaming over Android Open Accessory bulk endpoints
