@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.2 - 2026-07-03
+
+- Kept receiver sessions alive during silence with a 10-minute no-audio timeout.
+- Removed stale advertised sources when senders stop broadcasting.
+- Stopped receiver playback cleanly when the selected source disappears.
+
 ## 1.2.1 - 2026-07-02
 
 - Fixed Windows update installs so AudioBridge relaunches after the MSI closes the running app.

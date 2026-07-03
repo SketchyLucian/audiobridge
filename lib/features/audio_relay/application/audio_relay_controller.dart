@@ -44,6 +44,9 @@ class AudioRelayController extends ChangeNotifier {
     @visibleForTesting
     Duration streamConnectionTimeout = const Duration(seconds: 45),
     @visibleForTesting
+    Duration receiverNoAudioTimeout = const Duration(minutes: 10),
+    @visibleForTesting Duration sourceStaleTimeout = const Duration(seconds: 4),
+    @visibleForTesting
     Duration preferencesSaveDelay = const Duration(milliseconds: 200),
   }) : _engine = engine ?? const MethodChannelAudioRelayEngine(),
        _discoveryService = discoveryService ?? DiscoveryService(),
@@ -63,6 +66,8 @@ class AudioRelayController extends ChangeNotifier {
        _autoCodecQuietHold = autoCodecQuietHold,
        _discoveryIdleTimeout = discoveryIdleTimeout,
        _streamConnectionTimeout = streamConnectionTimeout,
+       _receiverNoAudioTimeout = receiverNoAudioTimeout,
+       _sourceStaleTimeout = sourceStaleTimeout,
        _preferencesSaveDelay = preferencesSaveDelay,
        profile = AudioPreset.balanced.profile,
        role = _defaultRole(),
@@ -82,6 +87,8 @@ class AudioRelayController extends ChangeNotifier {
   final Duration _autoCodecQuietHold;
   final Duration _discoveryIdleTimeout;
   final Duration _streamConnectionTimeout;
+  final Duration _receiverNoAudioTimeout;
+  final Duration _sourceStaleTimeout;
   final Duration _preferencesSaveDelay;
   RelayRole role;
   RelayTransport transport = RelayTransport.wifi;
@@ -117,6 +124,7 @@ class AudioRelayController extends ChangeNotifier {
   Timer? _profileApplyTimer;
   Timer? _discoveryIdleTimer;
   Timer? _streamConnectionTimer;
+  Timer? _sourcePruneTimer;
   Timer? _preferencesSaveTimer;
   AudioProfile? _appliedSenderProfile;
   AudioCodec _autoResolvedCodec = AudioCodec.pcm;
@@ -132,6 +140,7 @@ class AudioRelayController extends ChangeNotifier {
   bool _profileApplyPending = false;
   bool _profileApplyInFlight = false;
   bool _virtualMicPassthroughEnabled = false;
+  bool _lostReceiverSourceStopInFlight = false;
   String? _virtualMicPassthroughOutputDeviceId;
   String? _downloadedUpdatePath;
   bool _isDisposed = false;
@@ -1045,7 +1054,9 @@ class AudioRelayController extends ChangeNotifier {
         if (isUsbTunnelTransport) {
           await _startNativeUsbReceiver();
         } else {
+          _cancelSourcePrune();
           devices = const [];
+          selectedDevice = null;
           await _discoveryService.startScanning(
             _upsertDevice,
             scope: _discoveryNetworkScope,
@@ -1135,6 +1146,7 @@ class AudioRelayController extends ChangeNotifier {
 
   Future<void> stopStream() async {
     _cancelStreamConnectionTimeout();
+    _cancelSourcePrune();
     await _engine.stopStream();
     _stopMeters();
     _resetAutoCodecSession();
@@ -1147,12 +1159,8 @@ class AudioRelayController extends ChangeNotifier {
       _cancelDiscoveryIdleTimeout();
       await _discoveryService.stopScanning();
       activity = RelayActivity.idle;
-      if (isUsbTunnelTransport) {
-        devices = const [];
-        selectedDevice = null;
-      } else {
-        selectedDevice = null;
-      }
+      devices = const [];
+      selectedDevice = null;
     }
 
     notifyListeners();
@@ -1161,6 +1169,7 @@ class AudioRelayController extends ChangeNotifier {
   Future<void> stopAll() async {
     _cancelDiscoveryIdleTimeout();
     _cancelStreamConnectionTimeout();
+    _cancelSourcePrune();
     _cancelPendingProfileApply();
     await _engine.disconnect();
     _virtualMicPassthroughEnabled = false;
@@ -1170,6 +1179,8 @@ class AudioRelayController extends ChangeNotifier {
     _appliedSenderProfile = null;
     _resetAutoCodecSession();
     activity = RelayActivity.idle;
+    devices = const [];
+    selectedDevice = null;
     signalLevel = 0;
     noticeMessage = null;
     notifyListeners();
@@ -1692,6 +1703,11 @@ class AudioRelayController extends ChangeNotifier {
     return _pollMetrics();
   }
 
+  @visibleForTesting
+  Future<void> pruneStaleSourcesForTesting({DateTime? now}) {
+    return _pruneStaleSources(now: now);
+  }
+
   @override
   void notifyListeners() {
     if (_isDisposed) {
@@ -1710,6 +1726,7 @@ class AudioRelayController extends ChangeNotifier {
     _profileApplyTimer?.cancel();
     _discoveryIdleTimer?.cancel();
     _streamConnectionTimer?.cancel();
+    _sourcePruneTimer?.cancel();
     _preferencesSaveTimer?.cancel();
     if (_preferencesReady && _preferencesDirty) {
       unawaited(_savePreferences());
@@ -1740,6 +1757,7 @@ class AudioRelayController extends ChangeNotifier {
       profile = _receiverProfileFor(device.profile);
       selectedPreset = profile.mode;
     }
+    _scheduleSourcePrune();
     notifyListeners();
   }
 
@@ -1775,6 +1793,82 @@ class AudioRelayController extends ChangeNotifier {
     _discoveryIdleTimer = null;
   }
 
+  void _scheduleSourcePrune() {
+    _sourcePruneTimer?.cancel();
+    if (_sourceStaleTimeout.isNegative ||
+        role != RelayRole.receiver ||
+        isUsbTunnelTransport ||
+        devices.isEmpty ||
+        activity == RelayActivity.idle ||
+        activity == RelayActivity.error) {
+      _sourcePruneTimer = null;
+      return;
+    }
+
+    final now = DateTime.now();
+    var nextDelay = _sourceStaleTimeout;
+    for (final device in devices) {
+      final expiresIn = device.lastSeen
+          .add(_sourceStaleTimeout)
+          .difference(now);
+      if (expiresIn <= Duration.zero) {
+        nextDelay = Duration.zero;
+        break;
+      }
+      if (expiresIn < nextDelay) {
+        nextDelay = expiresIn;
+      }
+    }
+
+    _sourcePruneTimer = Timer(nextDelay, () {
+      unawaited(_pruneStaleSources());
+    });
+  }
+
+  void _cancelSourcePrune() {
+    _sourcePruneTimer?.cancel();
+    _sourcePruneTimer = null;
+  }
+
+  Future<void> _pruneStaleSources({DateTime? now}) async {
+    if (_isDisposed ||
+        _sourceStaleTimeout.isNegative ||
+        role != RelayRole.receiver ||
+        isUsbTunnelTransport ||
+        devices.isEmpty) {
+      _cancelSourcePrune();
+      return;
+    }
+
+    final currentTime = now ?? DateTime.now();
+    final selectedId = selectedDevice?.id;
+    final freshDevices = [
+      for (final device in devices)
+        if (currentTime.difference(device.lastSeen) <= _sourceStaleTimeout)
+          device,
+    ];
+    final selectedExpired =
+        selectedId != null &&
+        freshDevices.every((device) => device.id != selectedId);
+
+    if (freshDevices.length == devices.length && !selectedExpired) {
+      _scheduleSourcePrune();
+      return;
+    }
+
+    devices = List.unmodifiable(freshDevices);
+    if (selectedExpired) {
+      selectedDevice = null;
+      if (activity == RelayActivity.streaming) {
+        await _stopLostReceiverSource();
+        return;
+      }
+    }
+
+    notifyListeners();
+    _scheduleSourcePrune();
+  }
+
   Future<void> _pauseInactiveDiscovery() async {
     if (_isDisposed || !isDiscovering) {
       return;
@@ -1783,12 +1877,15 @@ class AudioRelayController extends ChangeNotifier {
     _cancelDiscoveryIdleTimeout();
     if (activity == RelayActivity.scanning) {
       await _discoveryService.stopScanning();
+      devices = const [];
+      selectedDevice = null;
     } else {
       await _engine.disconnect();
       await _discoveryService.dispose();
       _appliedSenderProfile = null;
       _resetAutoCodecSession();
     }
+    _cancelSourcePrune();
 
     activity = RelayActivity.idle;
     signalLevel = 0;
@@ -1805,11 +1902,12 @@ class AudioRelayController extends ChangeNotifier {
 
   void _scheduleStreamConnectionTimeout() {
     _streamConnectionTimer?.cancel();
-    if (_streamConnectionTimeout.isNegative) {
+    final timeout = _activeStreamConnectionTimeout;
+    if (timeout.isNegative) {
       return;
     }
 
-    _streamConnectionTimer = Timer(_streamConnectionTimeout, () {
+    _streamConnectionTimer = Timer(timeout, () {
       unawaited(_stopUnconnectedStream());
     });
   }
@@ -1828,17 +1926,45 @@ class AudioRelayController extends ChangeNotifier {
       return;
     }
 
+    final timeout = _activeStreamConnectionTimeout;
     final message = role == RelayRole.sender
-        ? 'Stopped stream after ${_durationLabel(_streamConnectionTimeout)} '
+        ? 'Stopped stream after ${_durationLabel(timeout)} '
               'without a receiver.'
-        : 'Stopped stream after ${_durationLabel(_streamConnectionTimeout)} '
+        : 'Stopped stream after ${_durationLabel(timeout)} '
               'without source audio packets.';
     await stopStream();
     noticeMessage = message;
     notifyListeners();
   }
 
-  void _updateStreamConnectionFromMetrics(AudioRelayMetrics nextMetrics) {
+  Duration get _activeStreamConnectionTimeout {
+    return role == RelayRole.receiver
+        ? _receiverNoAudioTimeout
+        : _streamConnectionTimeout;
+  }
+
+  Future<void> _stopLostReceiverSource() async {
+    if (_isDisposed ||
+        _lostReceiverSourceStopInFlight ||
+        role != RelayRole.receiver ||
+        activity != RelayActivity.streaming) {
+      return;
+    }
+
+    _lostReceiverSourceStopInFlight = true;
+    try {
+      await stopStream();
+      noticeMessage =
+          'Stopped receiver because the selected source disconnected.';
+      notifyListeners();
+    } finally {
+      _lostReceiverSourceStopInFlight = false;
+    }
+  }
+
+  Future<void> _updateStreamConnectionFromMetrics(
+    AudioRelayMetrics nextMetrics,
+  ) async {
     if (activity != RelayActivity.streaming) {
       _cancelStreamConnectionTimeout();
       return;
@@ -1866,7 +1992,10 @@ class AudioRelayController extends ChangeNotifier {
     try {
       final nextMetrics = await _engine.getMetrics();
       metrics = nextMetrics;
-      _updateStreamConnectionFromMetrics(nextMetrics);
+      await _updateStreamConnectionFromMetrics(nextMetrics);
+      if (activity != RelayActivity.streaming) {
+        return;
+      }
       signalLevel = muted ? 0 : nextMetrics.signalLevel ?? 0;
       _updateAdaptiveFormatPressureFromMetrics(nextMetrics);
       _syncReceiverProfileFromMetrics(nextMetrics);
@@ -1884,6 +2013,7 @@ class AudioRelayController extends ChangeNotifier {
   void _fail(String message) {
     _cancelDiscoveryIdleTimeout();
     _cancelStreamConnectionTimeout();
+    _cancelSourcePrune();
     activity = RelayActivity.error;
     errorMessage = message;
     noticeMessage = null;

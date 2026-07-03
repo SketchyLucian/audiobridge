@@ -2210,6 +2210,176 @@ void main() {
     controller.dispose();
   });
 
+  test('receiver scan removes sources that stop advertising', () async {
+    final discoveryService = _FakeDiscoveryService();
+    final controller =
+        AudioRelayController(
+            engine: _FakeAudioRelayEngine(),
+            discoveryService: discoveryService,
+            sourceStaleTimeout: const Duration(seconds: 10),
+          )
+          ..role = RelayRole.receiver
+          ..capabilities = _supportedCapabilities;
+    final now = DateTime.now();
+    final staleDevice = RelayDevice(
+      id: 'source-1',
+      name: 'Old source',
+      host: '192.168.1.25',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.balanced.profile,
+      lastSeen: now.subtract(const Duration(seconds: 9)),
+    );
+    final freshDevice = RelayDevice(
+      id: 'source-2',
+      name: 'Fresh source',
+      host: '192.168.1.26',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.gaming.profile,
+      lastSeen: now,
+    );
+
+    await controller.startDiscovery();
+    discoveryService.emit(staleDevice);
+    discoveryService.emit(freshDevice);
+    await controller.pruneStaleSourcesForTesting(
+      now: now.add(const Duration(seconds: 2)),
+    );
+
+    expect(controller.activity, RelayActivity.scanning);
+    expect(discoveryService.scanningStarted, true);
+    expect(controller.devices.map((device) => device.id), ['source-2']);
+
+    controller.dispose();
+  });
+
+  test('receiver stops streaming when selected source expires', () async {
+    final discoveryService = _FakeDiscoveryService();
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: discoveryService,
+            sourceStaleTimeout: const Duration(seconds: 10),
+          )
+          ..role = RelayRole.receiver
+          ..capabilities = _supportedCapabilities;
+    final now = DateTime.now();
+    final device = RelayDevice(
+      id: 'source-1',
+      name: 'Windows source',
+      host: '192.168.1.25',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.balanced.profile,
+      lastSeen: now.subtract(const Duration(seconds: 9)),
+    );
+
+    await controller.startDiscovery();
+    discoveryService.emit(device);
+    await controller.connectToDevice(device);
+    await controller.pruneStaleSourcesForTesting(
+      now: now.add(const Duration(seconds: 2)),
+    );
+
+    expect(controller.activity, RelayActivity.idle);
+    expect(controller.devices, isEmpty);
+    expect(controller.selectedDevice, isNull);
+    expect(discoveryService.scanningStarted, false);
+    expect(engine.calls, ['prepareReceiver', 'startStream', 'stopStream']);
+    expect(
+      controller.noticeMessage,
+      'Stopped receiver because the selected source disconnected.',
+    );
+
+    controller.dispose();
+  });
+
+  test('receiver stays connected when source audio briefly pauses', () async {
+    final discoveryService = _FakeDiscoveryService();
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: discoveryService,
+            receiverNoAudioTimeout: const Duration(minutes: 10),
+          )
+          ..role = RelayRole.receiver
+          ..capabilities = _supportedCapabilities;
+    final device = RelayDevice(
+      id: 'source-1',
+      name: 'Windows source',
+      host: '192.168.1.25',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.balanced.profile,
+      lastSeen: DateTime.now(),
+    );
+
+    await controller.startDiscovery();
+    discoveryService.emit(device);
+    await controller.connectToDevice(device);
+    engine.metrics = const AudioRelayMetrics(peerConnected: true);
+    await controller.pollMetricsForTesting();
+
+    engine.metrics = const AudioRelayMetrics(peerConnected: false);
+    await controller.pollMetricsForTesting();
+
+    expect(controller.activity, RelayActivity.streaming);
+    expect(controller.devices.map((device) => device.id), ['source-1']);
+    expect(controller.selectedDevice?.id, 'source-1');
+    expect(discoveryService.scanningStarted, true);
+    expect(engine.calls, ['prepareReceiver', 'startStream']);
+    expect(controller.noticeMessage, isNull);
+
+    controller.dispose();
+  });
+
+  test('receiver stops after the no-audio timeout expires', () async {
+    final discoveryService = _FakeDiscoveryService();
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: discoveryService,
+            receiverNoAudioTimeout: Duration.zero,
+          )
+          ..role = RelayRole.receiver
+          ..capabilities = _supportedCapabilities;
+    final device = RelayDevice(
+      id: 'source-1',
+      name: 'Windows source',
+      host: '192.168.1.25',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.balanced.profile,
+      lastSeen: DateTime.now(),
+    );
+
+    await controller.startDiscovery();
+    discoveryService.emit(device);
+    await controller.connectToDevice(device);
+    await _pumpEventQueue();
+
+    expect(controller.activity, RelayActivity.idle);
+    expect(controller.devices, isEmpty);
+    expect(controller.selectedDevice, isNull);
+    expect(discoveryService.scanningStarted, false);
+    expect(engine.calls, ['prepareReceiver', 'startStream', 'stopStream']);
+    expect(
+      controller.noticeMessage,
+      'Stopped stream after a moment without source audio packets.',
+    );
+
+    controller.dispose();
+  });
+
   test('sender cannot change receiver output backend', () {
     final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
       ..role = RelayRole.sender
