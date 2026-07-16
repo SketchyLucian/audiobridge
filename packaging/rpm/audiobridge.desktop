@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AudioBridge
+Comment=LAN audio relay
+Exec=audiobridge
+Terminal=false
+Categories=AudioVideo;Audio;Network;
+Keywords=audio;relay;network;wifi;
