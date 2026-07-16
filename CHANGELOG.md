@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.0 - 2026-07-16
+
+- Added a Linux desktop target for Wi-Fi PCM relay using default ALSA
+  capture/playback endpoints, including PipeWire and PulseAudio ALSA
+  compatibility support.
+- Added Linux UDP receiver subscriptions, session heartbeats, live queue and
+  signal metrics, and a Wi-Fi-only transport capability.
+- Added Linux build coverage in CI and a portable Linux bundle packaging script.
+
 ## 1.3.0 - 2026-07-03
 
 - Added session-aware connection heartbeat so silence no longer looks like a disconnect.

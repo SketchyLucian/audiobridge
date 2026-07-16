@@ -362,22 +362,24 @@ class _Header extends StatelessWidget {
                   },
           ),
           SegmentedButton<RelayTransport>(
-            segments: const [
-              ButtonSegment(
+            segments: [
+              const ButtonSegment(
                 value: RelayTransport.wifi,
                 icon: Icon(Icons.wifi_rounded),
                 label: Text('Wi-Fi'),
               ),
-              ButtonSegment(
-                value: RelayTransport.usbTethering,
-                icon: Icon(Icons.settings_ethernet_rounded),
-                label: Text('USB tether'),
-              ),
-              ButtonSegment(
-                value: RelayTransport.usb,
-                icon: Icon(Icons.usb_rounded),
-                label: Text('Native USB'),
-              ),
+              if (controller.supportsTransport(RelayTransport.usbTethering))
+                const ButtonSegment(
+                  value: RelayTransport.usbTethering,
+                  icon: Icon(Icons.settings_ethernet_rounded),
+                  label: Text('USB tether'),
+                ),
+              if (controller.supportsTransport(RelayTransport.usb))
+                const ButtonSegment(
+                  value: RelayTransport.usb,
+                  icon: Icon(Icons.usb_rounded),
+                  label: Text('Native USB'),
+                ),
             ],
             selected: {controller.transport},
             onSelectionChanged: controller.isBusy

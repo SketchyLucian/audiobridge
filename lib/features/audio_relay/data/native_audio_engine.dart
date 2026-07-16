@@ -13,6 +13,11 @@ class PlatformAudioCapabilities {
     required this.supportedCodecs,
     required this.supportedOutputBackends,
     required this.codecBitrateRanges,
+    this.supportedTransports = const {
+      RelayTransport.wifi,
+      RelayTransport.usbTethering,
+      RelayTransport.usb,
+    },
     this.soundboardOutputDevices = const [],
     this.canPlaySoundEffects = false,
     this.detail,
@@ -25,6 +30,7 @@ class PlatformAudioCapabilities {
   final Set<AudioCodec> supportedCodecs;
   final Set<OutputAudioBackend> supportedOutputBackends;
   final Map<AudioCodec, CodecBitrateRange> codecBitrateRanges;
+  final Set<RelayTransport> supportedTransports;
   final List<SoundboardOutputDevice> soundboardOutputDevices;
   final bool canPlaySoundEffects;
   final String? detail;
@@ -33,6 +39,7 @@ class PlatformAudioCapabilities {
     final codecNames = payload['supportedCodecs'];
     final outputBackendNames = payload['supportedOutputBackends'];
     final bitrateRanges = payload['codecBitrateRanges'];
+    final transportNames = payload['supportedTransports'];
     final soundboardOutputDevices = payload['soundboardOutputDevices'];
 
     return PlatformAudioCapabilities(
@@ -43,6 +50,7 @@ class PlatformAudioCapabilities {
       supportedCodecs: _readSupportedCodecs(codecNames),
       supportedOutputBackends: _readSupportedOutputBackends(outputBackendNames),
       codecBitrateRanges: _readBitrateRanges(bitrateRanges),
+      supportedTransports: _readSupportedTransports(transportNames),
       soundboardOutputDevices: _readSoundboardOutputDevices(
         soundboardOutputDevices,
       ),
@@ -54,6 +62,7 @@ class PlatformAudioCapabilities {
   factory PlatformAudioCapabilities.fallback({String? detail}) {
     final isWindows = Platform.isWindows;
     final isAndroid = Platform.isAndroid;
+    final isLinux = Platform.isLinux;
 
     return PlatformAudioCapabilities(
       platform: _platformName(),
@@ -67,6 +76,9 @@ class PlatformAudioCapabilities {
         if (isAndroid) OutputAudioBackend.audioTrack,
       },
       codecBitrateRanges: const {},
+      supportedTransports: isLinux
+          ? const {RelayTransport.wifi}
+          : Set<RelayTransport>.unmodifiable(RelayTransport.values),
       soundboardOutputDevices: const [],
       canPlaySoundEffects: false,
       detail: detail ?? 'Native audio backend is not installed yet.',
@@ -112,6 +124,19 @@ class PlatformAudioCapabilities {
           entry.value,
         ),
     };
+  }
+
+  static Set<RelayTransport> _readSupportedTransports(Object? value) {
+    if (value is! List) {
+      return Set<RelayTransport>.unmodifiable(RelayTransport.values);
+    }
+    final transports = value
+        .map((item) => RelayTransport.tryParse(item?.toString()))
+        .whereType<RelayTransport>()
+        .toSet();
+    return transports.isEmpty
+        ? Set<RelayTransport>.unmodifiable(RelayTransport.values)
+        : Set<RelayTransport>.unmodifiable(transports);
   }
 
   static List<SoundboardOutputDevice> _readSoundboardOutputDevices(

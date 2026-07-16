@@ -173,7 +173,7 @@ class AudioRelayController extends ChangeNotifier {
     Duration(seconds: 8),
     Duration(seconds: 30),
   ];
-  static const _fallbackAppVersion = '1.3.0';
+  static const _fallbackAppVersion = '1.4.0';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -201,6 +201,10 @@ class AudioRelayController extends ChangeNotifier {
 
   bool get canEditReceiverOutputBackend =>
       role == RelayRole.receiver && !isBusy && !isStreaming;
+
+  bool supportsTransport(RelayTransport value) {
+    return capabilities.supportedTransports.contains(value);
+  }
 
   bool get isUpdateBusy {
     return updateStatus == AppUpdateStatus.checking ||
@@ -1023,6 +1027,10 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   Future<void> setTransport(RelayTransport value) async {
+    if (!supportsTransport(value)) {
+      _fail('${value.label} is not available on ${capabilities.platform}.');
+      return;
+    }
     if (transport == value) {
       return;
     }
@@ -2418,7 +2426,9 @@ class AudioRelayController extends ChangeNotifier {
     }
 
     role = savedPreferences.role;
-    transport = savedPreferences.transport;
+    transport = supportsTransport(savedPreferences.transport)
+        ? savedPreferences.transport
+        : RelayTransport.wifi;
     profile = _normalizeProfile(savedPreferences.profile);
     receiverOutputBackend = savedPreferences.receiverOutputBackend;
     volume = savedPreferences.volume;

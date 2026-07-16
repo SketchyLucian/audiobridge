@@ -1,7 +1,7 @@
 # AudioBridge
 
-AudioBridge is a Flutter frontend for a LAN audio relay app targeting Windows
-and Android. The current build includes the product UI, connection state,
+AudioBridge is a Flutter frontend for a LAN audio relay app targeting Windows,
+Android, and Linux. The current build includes the product UI, connection state,
 UDP source discovery, USB tethering, USB cable mode, Simple/Advanced audio
 settings, live latency metrics, and native method-channel seams for platform
 audio engines.
@@ -10,6 +10,8 @@ audio engines.
 
 - Windows sender and receiver mode UI
 - Android Wi-Fi sender and receiver mode UI
+- Linux Wi-Fi sender and receiver mode with default ALSA capture/playback and
+  PCM audio
 - Codeberg release checks with assisted APK and MSI installation
 - UDP LAN discovery on port `47884`
 - Audio streaming on port `47885`
@@ -54,6 +56,7 @@ until native encoder/decoder integration is added.
 - `lib/features/audio_relay/presentation`: Flutter dashboard UI
 - `android/app/src/main/kotlin`: Android method-channel entry point
 - `windows/runner`: Windows method-channel entry point
+- `linux/runner`: Linux method-channel entry point
 
 ## Run
 
@@ -68,6 +71,20 @@ For Android, connect a device or start an emulator:
 flutter devices
 flutter run -d <android-device-id>
 ```
+
+For Linux Wi-Fi relay, install the standard Flutter Linux desktop build
+dependencies and ensure `libasound.so.2` is available. AudioBridge opens the
+default ALSA capture and playback endpoints; PipeWire and PulseAudio work when
+they provide the ALSA default device.
+
+```bash
+flutter pub get
+flutter run -d linux
+```
+
+The Linux port supports Wi-Fi UDP relay with PCM only. USB tethering, native
+USB accessory mode, virtual microphone routing, soundboard output, and
+in-app update installation are not available on Linux.
 
 ## Dev Workflow
 
@@ -190,6 +207,10 @@ Implemented behind that channel:
   adaptive buffering that raises only after underrun bursts or sustained low
   queue pressure, with low-latency profiles capped before they drift into
   high-delay playback.
+- Linux: default ALSA microphone capture and speaker playback, PCM over Wi-Fi
+  UDP, receiver subscription/heartbeat support, and live queue, signal, and
+  drop metrics. PipeWire and PulseAudio are used through their ALSA
+  compatibility layer when configured as the default device.
 
 Remaining production work:
 

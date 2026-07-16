@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:audiorelay_clone/app/audio_bridge_app.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -11,8 +13,14 @@ void main() {
     expect(find.text('Sender'), findsWidgets);
     expect(find.text('Receiver'), findsOneWidget);
     expect(find.text('Wi-Fi'), findsWidgets);
-    expect(find.text('USB tether'), findsOneWidget);
-    expect(find.text('Native USB'), findsOneWidget);
+    expect(
+      find.text('USB tether'),
+      Platform.isLinux ? findsNothing : findsOneWidget,
+    );
+    expect(
+      find.text('Native USB'),
+      Platform.isLinux ? findsNothing : findsOneWidget,
+    );
     expect(find.text('Soundboard'), findsOneWidget);
     expect(find.text('Audio settings'), findsOneWidget);
     expect(find.text('Simple'), findsNothing);

@@ -31,6 +31,15 @@ enum RelayTransport {
       _ => RelayTransport.wifi,
     };
   }
+
+  static RelayTransport? tryParse(String? value) {
+    return switch (value?.toLowerCase().replaceAll(RegExp(r'[-_\\s]'), '')) {
+      'wifi' || 'wireless' || 'lan' => RelayTransport.wifi,
+      'usbtethering' || 'tethering' => RelayTransport.usbTethering,
+      'usb' || 'nativeusb' => RelayTransport.usb,
+      _ => null,
+    };
+  }
 }
 
 enum RelayActivity {

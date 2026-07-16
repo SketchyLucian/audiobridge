@@ -1368,6 +1368,40 @@ void main() {
     expect(RelayTransport.fromName('tethering'), RelayTransport.usbTethering);
   });
 
+  test('native capabilities can restrict transport to Wi-Fi', () {
+    final capabilities = PlatformAudioCapabilities.fromMap({
+      'platform': 'linux',
+      'canSend': true,
+      'canReceive': true,
+      'backend': 'linux-alsa-pcm-udp',
+      'supportedCodecs': ['pcm'],
+      'supportedOutputBackends': ['auto'],
+      'supportedTransports': ['wifi'],
+    });
+
+    expect(capabilities.supportedTransports, {RelayTransport.wifi});
+  });
+
+  test('controller rejects an unsupported transport', () async {
+    final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
+      ..capabilities = const PlatformAudioCapabilities(
+        platform: 'linux',
+        canSend: true,
+        canReceive: true,
+        backend: 'fake',
+        supportedCodecs: {AudioCodec.pcm},
+        supportedOutputBackends: {OutputAudioBackend.auto},
+        codecBitrateRanges: {},
+        supportedTransports: {RelayTransport.wifi},
+      );
+
+    await controller.setTransport(RelayTransport.usb);
+
+    expect(controller.transport, RelayTransport.wifi);
+    expect(controller.errorMessage, 'Native USB is not available on linux.');
+    controller.dispose();
+  });
+
   test('usb tethering discovery uses datagram source host', () {
     final device = RelayDevice.fromDiscoveryMap({
       'type': 'audiobridge.source',
