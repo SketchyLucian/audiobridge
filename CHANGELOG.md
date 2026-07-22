@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.1 - 2026-07-22
+
+- Kept native USB sessions connected during silent Windows playback by sending
+  heartbeat frames independently of captured audio.
+
 ## 1.4.0 - 2026-07-16
 
 - Added a Linux desktop target for Wi-Fi PCM relay using default ALSA

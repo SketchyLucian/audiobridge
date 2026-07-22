@@ -3594,17 +3594,8 @@ class WindowsAudioEngine::Impl {
     }
   }
 
-  void MaybeSendHeartbeat(const sockaddr_in& address, uint64_t session_id) {
-    if (session_id == 0 || socket_ == INVALID_SOCKET) {
-      return;
-    }
-
-    const int64_t now = NowMillis();
-    const int64_t last_sent = last_heartbeat_sent_at_ms_.load();
-    if (now - last_sent < kHeartbeatIntervalMs) {
-      return;
-    }
-
+  std::vector<uint8_t> BuildHeartbeatPacket(uint64_t session_id,
+                                            int64_t now) const {
     std::vector<uint8_t> packet(kPacketV5HeaderBytes);
     WriteU32(packet, 0, kPacketV5Magic);
     WriteU32(packet, 4, sequence_.load());
@@ -3622,7 +3613,22 @@ class WindowsAudioEngine::Impl {
                            kMaxBufferMs)));
     WriteU32(packet, 52, ReceiverOptionsFor(profile_));
     WriteU64(packet, 56, session_id);
+    return packet;
+  }
 
+  void MaybeSendHeartbeat(const sockaddr_in& address, uint64_t session_id) {
+    if (session_id == 0 || socket_ == INVALID_SOCKET) {
+      return;
+    }
+
+    const int64_t now = NowMillis();
+    const int64_t last_sent = last_heartbeat_sent_at_ms_.load();
+    if (now - last_sent < kHeartbeatIntervalMs) {
+      return;
+    }
+
+    const std::vector<uint8_t> packet =
+        BuildHeartbeatPacket(session_id, now);
     if (sendto(socket_, reinterpret_cast<const char*>(packet.data()),
                static_cast<int>(packet.size()), 0,
                reinterpret_cast<const sockaddr*>(&address),
@@ -4099,6 +4105,7 @@ class WindowsAudioEngine::Impl {
                                                 payload.size()));
         }
         UpdateRemoteMetrics(std::string(payload.data(), payload.size()));
+        MaybeSendUsbHeartbeat(remote_session_id_.load());
       }
     }
     UsbDebugLog("UsbControlLoop stopped");
@@ -4163,6 +4170,35 @@ class WindowsAudioEngine::Impl {
       offset += transferred;
     }
     return true;
+  }
+
+  bool WriteUsbFrame(const uint8_t* data, size_t size) {
+    std::vector<uint8_t> header(kUsbFrameHeaderBytes);
+    WriteU32(header, 0, static_cast<uint32_t>(size));
+
+    // Audio and heartbeat frames are written by different threads. Keep each
+    // length-prefixed frame contiguous on the shared USB bulk endpoint.
+    std::scoped_lock lock(usb_write_mutex_);
+    return WriteUsbAll(header.data(), header.size()) &&
+           WriteUsbAll(data, size);
+  }
+
+  void MaybeSendUsbHeartbeat(uint64_t session_id) {
+    if (session_id == 0 || usb_winusb_ == nullptr || usb_bulk_out_pipe_ == 0) {
+      return;
+    }
+
+    const int64_t now = NowMillis();
+    const int64_t last_sent = last_heartbeat_sent_at_ms_.load();
+    if (now - last_sent < kHeartbeatIntervalMs) {
+      return;
+    }
+
+    const std::vector<uint8_t> packet =
+        BuildHeartbeatPacket(session_id, now);
+    if (WriteUsbFrame(packet.data(), packet.size())) {
+      last_heartbeat_sent_at_ms_ = now;
+    }
   }
 
   void UpdateRemoteMetrics(const std::string& message) {
@@ -4642,11 +4678,8 @@ class WindowsAudioEngine::Impl {
 
   void SendUsbSubscribe() {
     const std::string message = BuildSubscribeMessage();
-    std::vector<uint8_t> header(kUsbFrameHeaderBytes);
-    WriteU32(header, 0, static_cast<uint32_t>(message.size()));
-    WriteUsbAll(header.data(), header.size());
-    WriteUsbAll(reinterpret_cast<const uint8_t*>(message.data()),
-                message.size());
+    WriteUsbFrame(reinterpret_cast<const uint8_t*>(message.data()),
+                  message.size());
   }
 
   void HandlePlaybackPacket(const uint8_t* data, int length) {
@@ -5590,10 +5623,7 @@ class WindowsAudioEngine::Impl {
       }
 
       if (usb_mode) {
-        std::vector<uint8_t> frame_header(kUsbFrameHeaderBytes);
-        WriteU32(frame_header, 0, static_cast<uint32_t>(packet.size()));
-        if (!WriteUsbAll(frame_header.data(), frame_header.size()) ||
-            !WriteUsbAll(packet.data(), packet.size())) {
+        if (!WriteUsbFrame(packet.data(), packet.size())) {
           UsbDebugLog("USB audio write failed; stopping capture");
           capture_running_ = false;
           usb_control_running_ = false;
@@ -5603,11 +5633,11 @@ class WindowsAudioEngine::Impl {
           break;
         }
         const uint64_t count = ++usb_audio_packets_sent_;
-        usb_audio_bytes_sent_.fetch_add(frame_header.size() + packet.size());
+        usb_audio_bytes_sent_.fetch_add(kUsbFrameHeaderBytes + packet.size());
         if (count <= 5 || count % 1000 == 0) {
           UsbDebugLog("sent USB audio packet #" + std::to_string(count) +
                       " bytes=" +
-                      std::to_string(frame_header.size() + packet.size()) +
+                      std::to_string(kUsbFrameHeaderBytes + packet.size()) +
                       " frames=" + std::to_string(frames) +
                       " sampleRate=" + std::to_string(sample_rate) +
                       " channels=" + std::to_string(channels) +
@@ -5761,6 +5791,7 @@ class WindowsAudioEngine::Impl {
   std::atomic<uint64_t> usb_subscribe_packets_received_ = 0;
   std::atomic<uint64_t> usb_read_failures_ = 0;
   std::atomic<uint64_t> usb_write_failures_ = 0;
+  std::mutex usb_write_mutex_;
   bool winsock_started_ = false;
   bool media_foundation_started_ = false;
   std::thread control_thread_;

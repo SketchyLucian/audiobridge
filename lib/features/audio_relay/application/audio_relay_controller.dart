@@ -173,7 +173,7 @@ class AudioRelayController extends ChangeNotifier {
     Duration(seconds: 8),
     Duration(seconds: 30),
   ];
-  static const _fallbackAppVersion = '1.4.0';
+  static const _fallbackAppVersion = '1.4.1';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,

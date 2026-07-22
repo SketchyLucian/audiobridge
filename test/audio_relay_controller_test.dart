@@ -2481,13 +2481,14 @@ void main() {
   });
 
   test(
-    'receiver remains connected while heartbeat reports silent audio',
+    'receiver remains connected past the timeout while heartbeat reports silence',
     () async {
       final engine = _FakeAudioRelayEngine();
       final controller =
           AudioRelayController(
               engine: engine,
               discoveryService: _FakeDiscoveryService(),
+              receiverNoAudioTimeout: const Duration(milliseconds: 20),
             )
             ..role = RelayRole.receiver
             ..capabilities = _supportedCapabilities;
@@ -2508,6 +2509,7 @@ void main() {
         signalLevel: 0,
       );
       await controller.pollMetricsForTesting();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
 
       expect(controller.activity, RelayActivity.streaming);
       expect(controller.signalLevel, 0);
