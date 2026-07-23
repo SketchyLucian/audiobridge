@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.2 - 2026-07-23
+
+- Moved update checks to the public `audiobridge-releases` repository so
+  Windows clients can discover and download releases without authentication.
+
 ## 1.4.1 - 2026-07-22
 
 - Kept native USB sessions connected during silent Windows playback by sending

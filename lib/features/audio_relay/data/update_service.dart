@@ -31,7 +31,7 @@ class AppUpdateException implements Exception {
 class CodebergUpdateService implements AppUpdateService {
   CodebergUpdateService({
     this.owner = 'SketchyLucian',
-    this.repo = 'audiobridge',
+    this.repo = 'audiobridge-releases',
     HttpClient Function()? httpClientFactory,
     Directory? downloadDirectory,
   }) : _httpClientFactory = httpClientFactory ?? HttpClient.new,
