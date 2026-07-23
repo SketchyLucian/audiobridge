@@ -83,9 +83,16 @@ jobs:
         shell: pwsh
         run: .\scripts\package_windows_msi.ps1 -SkipFlutterBuild
 
-      - name: Upload MSI to GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            build/installer/AudioBridge-*-x64.msi
-            build/release/AudioBridge-*-android.apk
+      - name: Publish complete public release
+        shell: pwsh
+        env:
+          CODEBERG_RELEASE_TOKEN: ${{ secrets.CODEBERG_RELEASE_TOKEN }}
+        run: |
+          $version = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag $env:GITHUB_REF_NAME does not match pubspec version v$version."
+          }
+          .\scripts\publish_codeberg_release.ps1 `
+            -Tag $env:GITHUB_REF_NAME `
+            -WindowsMsi "build/installer/AudioBridge-$version-x64.msi" `
+            -AndroidApk "build/release/AudioBridge-$version-android.apk"

@@ -121,6 +121,20 @@ restored and built.
 
 The MSI is written to `build/installer/AudioBridge-<version>-x64.msi`.
 
+## Publishing releases
+
+Public releases are published to the `audiobridge-releases` Codeberg
+repository. A release is kept as a draft unless both of these signed artifacts
+exist and pass validation:
+
+- `AudioBridge-<version>-x64.msi`
+- `AudioBridge-<version>-android.apk`
+
+The tag-triggered release workflow builds both platforms and calls
+`scripts/publish_codeberg_release.ps1`. Configure its Android signing secrets
+and `CODEBERG_RELEASE_TOKEN`; missing credentials or either missing artifact
+fails the workflow without publishing a partial release.
+
 The MSI also installs an `AudioBridge Virtual Mic Setup` Start menu shortcut.
 Run it after installation to check for a supported virtual cable driver and, if
 needed, open the official VB-CABLE setup page. Install the VB-CABLE driver as

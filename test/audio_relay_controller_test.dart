@@ -2822,6 +2822,23 @@ void main() {
     expect(devWorkflow, contains('testDebugUnitTest'));
   });
 
+  test('release workflow requires Windows and Android artifacts', () {
+    final releaseWorkflow = File(
+      '.github/workflows/release.yml',
+    ).readAsStringSync();
+    final publisher = File(
+      'scripts/publish_codeberg_release.ps1',
+    ).readAsStringSync();
+
+    expect(releaseWorkflow, contains('publish_codeberg_release.ps1'));
+    expect(releaseWorkflow, contains('AudioBridge-\$version-x64.msi'));
+    expect(releaseWorkflow, contains('AudioBridge-\$version-android.apk'));
+    expect(publisher, contains('ExpectedName \$expectedMsiName'));
+    expect(publisher, contains('ExpectedName \$expectedApkName'));
+    expect(publisher, contains("draft = \$true"));
+    expect(publisher, contains("draft = \$false"));
+  });
+
   test('usb sender reports native usb setup failures', () async {
     final engine = _FakeAudioRelayEngine(
       prepareUsbError: PlatformException(
