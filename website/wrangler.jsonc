@@ -1,0 +1,26 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "audiobridge-site",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "rules": [
+    {
+      "type": "Text",
+      "globs": [
+        "**/*.html",
+        "**/*.css",
+        "**/*.client.js",
+        "**/*.svg",
+        "**/*.txt",
+        "**/*.xml",
+        "**/*.webmanifest"
+      ],
+      "fallthrough": true
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

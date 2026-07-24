@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://audiobridge-site.nguyendaiquang-dev.workers.dev/sitemap.xml

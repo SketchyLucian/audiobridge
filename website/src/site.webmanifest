@@ -1,0 +1,12 @@
+{
+  "name": "AudioBridge",
+  "short_name": "AudioBridge",
+  "description": "Low-latency audio between Windows and Android.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f0e8",
+  "theme_color": "#111714",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
