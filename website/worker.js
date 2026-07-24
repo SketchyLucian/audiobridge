@@ -1,5 +1,6 @@
 import page from './src/index.html';
 import clientScript from './src/app.client.js';
+import themeScript from './src/theme-init.client.js';
 import stylesheet from './src/styles.css';
 import favicon from './src/favicon.svg';
 import socialCard from './src/og-card.svg';
@@ -12,6 +13,7 @@ const assets = new Map([
   ['/index.html', { body: page, contentType: 'text/html; charset=utf-8' }],
   ['/styles.css', { body: stylesheet, contentType: 'text/css; charset=utf-8' }],
   ['/app.js', { body: clientScript, contentType: 'text/javascript; charset=utf-8' }],
+  ['/theme.js', { body: themeScript, contentType: 'text/javascript; charset=utf-8' }],
   ['/favicon.svg', { body: favicon, contentType: 'image/svg+xml; charset=utf-8' }],
   ['/og-card.svg', { body: socialCard, contentType: 'image/svg+xml; charset=utf-8' }],
   ['/site.webmanifest', { body: webManifest, contentType: 'application/manifest+json; charset=utf-8' }],

@@ -1,21 +1,77 @@
 const navToggle = document.querySelector('[data-nav-toggle]');
 const nav = document.querySelector('[data-nav]');
+const navLabel = document.querySelector('[data-nav-label]');
+const navScrim = document.querySelector('[data-nav-scrim]');
+
+function setNavigationOpen(isOpen) {
+  if (!navToggle || !nav) return;
+  navToggle.setAttribute('aria-expanded', String(isOpen));
+  nav.classList.toggle('is-open', isOpen);
+  navScrim?.classList.toggle('is-open', isOpen);
+  document.body.classList.toggle('nav-open', isOpen);
+  if (navLabel) navLabel.textContent = isOpen ? 'Close navigation' : 'Open navigation';
+}
 
 function closeNavigation() {
-  if (!navToggle || !nav) return;
-  navToggle.setAttribute('aria-expanded', 'false');
-  nav.classList.remove('is-open');
+  setNavigationOpen(false);
 }
 
 navToggle?.addEventListener('click', () => {
   const nextOpen = navToggle.getAttribute('aria-expanded') !== 'true';
-  navToggle.setAttribute('aria-expanded', String(nextOpen));
-  nav?.classList.toggle('is-open', nextOpen);
+  setNavigationOpen(nextOpen);
 });
 
+navScrim?.addEventListener('click', closeNavigation);
 nav?.querySelectorAll('a').forEach((link) => link.addEventListener('click', closeNavigation));
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') closeNavigation();
+  if (event.key !== 'Escape' || navToggle?.getAttribute('aria-expanded') !== 'true') return;
+  closeNavigation();
+  navToggle?.focus();
+});
+
+const desktopNavigation = window.matchMedia('(min-width: 721px)');
+desktopNavigation.addEventListener('change', (event) => {
+  if (event.matches) closeNavigation();
+});
+
+const root = document.documentElement;
+const themeToggle = document.querySelector('[data-theme-toggle]');
+const themeLabel = document.querySelector('[data-theme-label]');
+const themeColor = document.querySelector('[data-theme-color]');
+const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
+
+function savedTheme() {
+  try {
+    const saved = localStorage.getItem('audiobridge-theme');
+    return saved === 'dark' || saved === 'light' ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+function applyTheme(theme, persist = false) {
+  const dark = theme === 'dark';
+  root.dataset.theme = dark ? 'dark' : 'light';
+  themeToggle?.setAttribute('aria-pressed', String(dark));
+  if (themeLabel) themeLabel.textContent = dark ? 'Switch to light mode' : 'Switch to dark mode';
+  if (themeColor) themeColor.setAttribute('content', dark ? '#0b100e' : '#f4f0e8');
+
+  if (!persist) return;
+  try {
+    localStorage.setItem('audiobridge-theme', dark ? 'dark' : 'light');
+  } catch {
+    // The selected theme still applies for this page view when storage is unavailable.
+  }
+}
+
+applyTheme(root.dataset.theme || (systemTheme.matches ? 'dark' : 'light'));
+
+themeToggle?.addEventListener('click', () => {
+  applyTheme(root.dataset.theme === 'dark' ? 'light' : 'dark', true);
+});
+
+systemTheme.addEventListener('change', (event) => {
+  if (!savedTheme()) applyTheme(event.matches ? 'dark' : 'light');
 });
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
