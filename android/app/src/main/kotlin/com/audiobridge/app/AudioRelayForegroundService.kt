@@ -7,15 +7,18 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 
 private const val NOTIFICATION_CHANNEL_ID = "audio_bridge_active_stream"
 private const val NOTIFICATION_ID = 47885
 
 class AudioRelayForegroundService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -30,12 +33,14 @@ class AudioRelayForegroundService : Service() {
 
         startForegroundForCurrentRole()
         acquireWakeLock()
+        updateWifiLock()
         return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        releaseWifiLock()
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()
@@ -43,6 +48,45 @@ class AudioRelayForegroundService : Service() {
         }
         wakeLock = null
         super.onDestroy()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun updateWifiLock() {
+        if (!AudioEngineHolder.receiverEngine(applicationContext).needsWifiLockForStream()) {
+            releaseWifiLock()
+            return
+        }
+        if (wifiLock?.isHeld == true) {
+            return
+        }
+
+        val wifiManager = applicationContext
+            .getSystemService(WIFI_SERVICE) as? WifiManager ?: return
+        try {
+            wifiLock = wifiManager.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "AudioBridge:NetworkStream"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (error: RuntimeException) {
+            wifiLock = null
+            Log.w(LOG_TAG, "Unable to keep Wi-Fi awake for the active stream", error)
+        }
+    }
+
+    private fun releaseWifiLock() {
+        wifiLock?.let {
+            if (it.isHeld) {
+                try {
+                    it.release()
+                } catch (error: RuntimeException) {
+                    Log.w(LOG_TAG, "Unable to release the stream Wi-Fi lock", error)
+                }
+            }
+        }
+        wifiLock = null
     }
 
     private fun createNotificationChannel() {
@@ -127,5 +171,6 @@ class AudioRelayForegroundService : Service() {
 
     companion object {
         const val ACTION_START_STREAM = "com.audiobridge.app.action.START_STREAM"
+        private const val LOG_TAG = "AudioBridgeService"
     }
 }

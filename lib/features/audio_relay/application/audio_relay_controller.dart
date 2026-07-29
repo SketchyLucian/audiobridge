@@ -1074,6 +1074,7 @@ class AudioRelayController extends ChangeNotifier {
           await _engine.prepareSender(
             senderProfile,
             networkBindAddress: _networkBindAddress,
+            transport: transport,
           );
           _appliedSenderProfile = senderProfile;
           await _startAdvertisingCurrentProfile(senderProfile);
@@ -1128,6 +1129,7 @@ class AudioRelayController extends ChangeNotifier {
         await _engine.prepareSender(
           senderProfile,
           networkBindAddress: _networkBindAddress,
+          transport: transport,
         );
       }
       await _engine.startStream(senderProfile);
@@ -2127,6 +2129,7 @@ class AudioRelayController extends ChangeNotifier {
       await _engine.prepareSender(
         senderProfile,
         networkBindAddress: _networkBindAddress,
+        transport: transport,
       );
       if (!_isReconnectCurrent(generation)) {
         return;
@@ -2733,6 +2736,7 @@ class AudioRelayController extends ChangeNotifier {
         await _engine.prepareSender(
           senderProfile,
           networkBindAddress: _networkBindAddress,
+          transport: transport,
         );
         _appliedSenderProfile = senderProfile;
         _rememberAutoResolvedCodec(senderProfile);
@@ -2768,6 +2772,7 @@ class AudioRelayController extends ChangeNotifier {
         await _engine.prepareSender(
           senderProfile,
           networkBindAddress: _networkBindAddress,
+          transport: transport,
         );
       }
       _appliedSenderProfile = senderProfile;
@@ -3304,6 +3309,7 @@ class AudioRelayController extends ChangeNotifier {
         await _engine.prepareSender(
           nextProfile,
           networkBindAddress: _networkBindAddress,
+          transport: transport,
         );
       }
       _appliedSenderProfile = nextProfile;

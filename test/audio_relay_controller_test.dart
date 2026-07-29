@@ -2195,6 +2195,7 @@ void main() {
 
     expect(engine.calls, ['prepareSender']);
     expect(engine.senderBindAddresses.single, '192.168.11.87');
+    expect(engine.senderTransports.single, RelayTransport.usbTethering);
     expect(
       engine.profiles.single.hasSameSettings(
         AudioProfile.usbTetheringLowLatency.copyWith(codec: AudioCodec.pcm),
@@ -3025,6 +3026,7 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   final List<AudioProfile> connectedProfiles = [];
   final List<RelayDevice> connectedDevices = [];
   final List<String?> senderBindAddresses = [];
+  final List<RelayTransport> senderTransports = [];
   final List<String> soundEffectPaths = [];
   final List<double> soundEffectVolumes = [];
   final List<SoundboardPlaybackTarget> soundEffectTargets = [];
@@ -3063,10 +3065,12 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   Future<void> prepareSender(
     AudioProfile profile, {
     String? networkBindAddress,
+    RelayTransport transport = RelayTransport.wifi,
   }) async {
     calls.add('prepareSender');
     profiles.add(profile);
     senderBindAddresses.add(networkBindAddress);
+    senderTransports.add(transport);
   }
 
   @override

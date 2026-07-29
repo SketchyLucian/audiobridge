@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.3 - 2026-07-29
+
+- Kept the Android Wi-Fi radio awake for active network audio streams so
+  playback and reconnection continue when the screen is off or the app is in
+  the background.
+
 ## 1.4.2 - 2026-07-23
 
 - Moved update checks to the public `audiobridge-releases` repository so

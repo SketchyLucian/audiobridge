@@ -216,10 +216,25 @@ internal fun acceptsLegacyPacket(sessionProtocolActive: Boolean): Boolean {
     return !sessionProtocolActive
 }
 
-private enum class TransportMode {
+internal enum class TransportMode {
     WIFI,
     USB_TETHERING,
     USB
+}
+
+internal fun transportModeFromName(value: String?): TransportMode {
+    val normalized = value
+        ?.lowercase(Locale.US)
+        ?.replace(Regex("[-_\\s]"), "")
+    return when (normalized) {
+        "usb" -> TransportMode.USB
+        "usbtethering", "tethering" -> TransportMode.USB_TETHERING
+        else -> TransportMode.WIFI
+    }
+}
+
+internal fun requiresWifiLock(transportMode: TransportMode): Boolean {
+    return transportMode == TransportMode.WIFI
 }
 
 private enum class OutputAudioBackend {
@@ -686,6 +701,10 @@ class AudioReceiverEngine(private val context: Context) {
         return transportMode == TransportMode.USB
     }
 
+    fun needsWifiLockForStream(): Boolean {
+        return requiresWifiLock(transportMode)
+    }
+
     fun prepareReceiver(arguments: Any?) {
         if (engineRole == EngineRole.SENDER) {
             stopSenderCapture()
@@ -718,7 +737,9 @@ class AudioReceiverEngine(private val context: Context) {
         }
         engineRole = EngineRole.SENDER
         profile = AudioProfile.from(arguments)
-        transportMode = TransportMode.WIFI
+        transportMode = transportModeFromName(
+            (arguments as? Map<*, *>)?.get("transport")?.toString()
+        )
         networkBindAddress = null
         source = null
         adaptiveLinkMemoryKey = null
@@ -763,14 +784,7 @@ class AudioReceiverEngine(private val context: Context) {
         val host = device["host"]?.toString()?.takeIf { it.isNotBlank() }
             ?: error("Missing sender host.")
         val port = (device["port"] as? Number)?.toInt() ?: AUDIO_PORT
-        val transport = device["transport"]?.toString()
-            ?.lowercase(Locale.US)
-            ?.replace(Regex("[-_\\s]"), "")
-        transportMode = when (transport) {
-            "usb" -> TransportMode.USB
-            "usbtethering", "tethering" -> TransportMode.USB_TETHERING
-            else -> TransportMode.WIFI
-        }
+        transportMode = transportModeFromName(device["transport"]?.toString())
 
         val hostAddress = InetAddress.getByName(host)
         source = InetSocketAddress(hostAddress, port)

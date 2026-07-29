@@ -320,6 +320,7 @@ abstract interface class AudioRelayEngine {
   Future<void> prepareSender(
     AudioProfile profile, {
     String? networkBindAddress,
+    RelayTransport transport = RelayTransport.wifi,
   });
 
   Future<void> prepareUsbSender(AudioProfile profile);
@@ -394,11 +395,16 @@ class MethodChannelAudioRelayEngine implements AudioRelayEngine {
   Future<void> prepareSender(
     AudioProfile profile, {
     String? networkBindAddress,
+    RelayTransport transport = RelayTransport.wifi,
   }) {
     final networkBindKey = networkBindAddress == null
         ? null
         : 'networkBindAddress';
-    final payload = {...profile.toMap(), ?networkBindKey: networkBindAddress};
+    final payload = {
+      ...profile.toMap(),
+      'transport': transport.name,
+      ?networkBindKey: networkBindAddress,
+    };
     return _invoke('prepareSender', payload);
   }
 

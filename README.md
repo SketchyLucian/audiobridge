@@ -230,5 +230,5 @@ Remaining production work:
 
 - Jitter buffer and packet-loss handling.
 - Native encoders/decoders for FLAC, MP3, Vorbis, ALAC, and LC3.
-- Android audio focus and foreground-service handling.
+- Android audio focus handling.
 - Windows firewall guidance and explicit output-device selection.
