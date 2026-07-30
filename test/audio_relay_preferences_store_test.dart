@@ -29,6 +29,7 @@ void main() {
       soundboardTarget: SoundboardPlaybackTarget.stream,
       selectedSoundboardOutputDeviceId: 'cable-1',
       soundboardVolume: 0.31,
+      silentConnectionTimeoutSeconds: 300,
     );
 
     final restored = AudioRelayPreferences.fromMap(preferences.toMap());
@@ -47,6 +48,10 @@ void main() {
       preferences.selectedSoundboardOutputDeviceId,
     );
     expect(restored.soundboardVolume, preferences.soundboardVolume);
+    expect(
+      restored.silentConnectionTimeoutSeconds,
+      preferences.silentConnectionTimeoutSeconds,
+    );
   });
 
   test('preferences parser clamps values and ignores invalid paths', () {
@@ -54,10 +59,12 @@ void main() {
       'volume': 4,
       'soundboardVolume': -2,
       'soundboardPaths': ['one.wav', '', 'one.wav', null],
+      'silentConnectionTimeoutSeconds': -1,
     });
 
     expect(restored.volume, 1);
     expect(restored.soundboardVolume, 0);
     expect(restored.soundboardPaths, ['one.wav']);
+    expect(restored.silentConnectionTimeoutSeconds, isNull);
   });
 }

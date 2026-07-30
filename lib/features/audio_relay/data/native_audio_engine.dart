@@ -212,6 +212,7 @@ class AudioRelayMetrics {
     this.remotePlatform,
     this.remoteSupportedCodecs = const {},
     this.peerConnected,
+    this.sourceAudioActive,
   });
 
   final double? audioLatencyMs;
@@ -236,6 +237,7 @@ class AudioRelayMetrics {
   final String? remotePlatform;
   final Set<AudioCodec> remoteSupportedCodecs;
   final bool? peerConnected;
+  final bool? sourceAudioActive;
 
   double? get effectiveLatencyMs => audioLatencyMs ?? outputLatencyMs;
 
@@ -270,6 +272,7 @@ class AudioRelayMetrics {
       remotePlatform: payload['remotePlatform']?.toString(),
       remoteSupportedCodecs: _readCodecSet(payload['remoteSupportedCodecs']),
       peerConnected: _readBool(payload['peerConnected']),
+      sourceAudioActive: _readBool(payload['sourceAudioActive']),
     );
   }
 

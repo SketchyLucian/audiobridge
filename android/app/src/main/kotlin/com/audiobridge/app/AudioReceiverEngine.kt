@@ -237,6 +237,10 @@ internal fun requiresWifiLock(transportMode: TransportMode): Boolean {
     return transportMode == TransportMode.WIFI
 }
 
+internal fun shouldParkIdlePlayback(sourceIdle: Boolean, peerConnected: Boolean): Boolean {
+    return sourceIdle && !peerConnected
+}
+
 private enum class OutputAudioBackend {
     AUTO,
     AUDIO_TRACK,
@@ -564,8 +568,11 @@ class AudioReceiverEngine(private val context: Context) {
         } else {
             0
         }
-        if (isSourceIdle(now)) {
-            parkIdlePlayback(track, underruns)
+        val sourceIdle = isSourceIdle(now)
+        if (sourceIdle) {
+            if (shouldParkIdlePlayback(sourceIdle, peerConnected)) {
+                parkIdlePlayback(track, underruns)
+            }
             return idleReceiverMetrics(sampleRate, peerConnected)
         }
 
@@ -597,6 +604,7 @@ class AudioReceiverEngine(private val context: Context) {
             "trimCount" to trimCount.get(),
             "signalLevel" to signalLevel,
             "peerConnected" to peerConnected,
+            "sourceAudioActive" to true,
             "activeProfile" to activeProfileForMetrics()
         )
         if (!audioLatencyMs.isNaN()) {
@@ -659,6 +667,7 @@ class AudioReceiverEngine(private val context: Context) {
             "trimCount" to trimCount.get(),
             "signalLevel" to 0.0,
             "peerConnected" to peerConnected,
+            "sourceAudioActive" to false,
             "activeProfile" to activeProfileForMetrics()
         )
     }
@@ -703,6 +712,10 @@ class AudioReceiverEngine(private val context: Context) {
 
     fun needsWifiLockForStream(): Boolean {
         return requiresWifiLock(transportMode)
+    }
+
+    fun isStreamActive(): Boolean {
+        return running
     }
 
     fun prepareReceiver(arguments: Any?) {

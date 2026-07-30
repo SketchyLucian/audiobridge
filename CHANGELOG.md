@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.4 - 2026-07-30
+
+- Kept Android receiver playback active while the source is silent and its
+  heartbeat remains connected.
+- Added a persistent Silent connection timeout setting. It defaults to Never,
+  with optional limits from 30 seconds to 30 minutes.
+- Improved Android foreground-service handling and added a warning when Low
+  Power Standby can block screen-off network access.
+
 ## 1.4.3 - 2026-07-29
 
 - Kept the Android Wi-Fi radio awake for active network audio streams so

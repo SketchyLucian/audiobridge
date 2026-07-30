@@ -31,6 +31,26 @@ class ConnectionSessionPolicyTest {
     }
 
     @Test
+    fun silenceKeepsPlaybackActiveWhilePeerHeartbeatIsFresh() {
+        assertFalse(
+            shouldParkIdlePlayback(
+                sourceIdle = true,
+                peerConnected = true
+            )
+        )
+    }
+
+    @Test
+    fun silenceParksPlaybackAfterPeerDisconnects() {
+        assertTrue(
+            shouldParkIdlePlayback(
+                sourceIdle = true,
+                peerConnected = false
+            )
+        )
+    }
+
+    @Test
     fun relayTransportNamesMapToNativeTransportPolicy() {
         assertEquals(TransportMode.WIFI, transportModeFromName("wifi"))
         assertEquals(

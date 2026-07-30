@@ -1136,17 +1136,34 @@ class _ReceiverAudioSettingsSummary extends StatelessWidget {
         const SizedBox(height: 14),
         ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 420),
-          child: _SettingBlock(
-            compact: true,
-            title: 'Output backend',
-            description:
-                'This only affects playback on this receiver. Sender stream settings stay with the source.',
-            child: _OutputBackendPicker(
-              backend: controller.receiverOutputBackend,
-              enabled: controller.canEditReceiverOutputBackend,
-              onChanged: controller.updateOutputBackend,
-              isSupported: controller.isOutputBackendSupported,
-            ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _SettingBlock(
+                compact: true,
+                title: 'Output backend',
+                description:
+                    'This only affects playback on this receiver. Sender stream settings stay with the source.',
+                child: _OutputBackendPicker(
+                  backend: controller.receiverOutputBackend,
+                  enabled: controller.canEditReceiverOutputBackend,
+                  onChanged: controller.updateOutputBackend,
+                  isSupported: controller.isOutputBackendSupported,
+                ),
+              ),
+              const SizedBox(height: 14),
+              _SettingBlock(
+                compact: true,
+                title: 'Silent connection timeout',
+                description:
+                    'Never keeps this receiver connected through silence and screen lock. Choose a time to disconnect after audio packets stop.',
+                child: _SilentConnectionTimeoutPicker(
+                  timeout: controller.silentConnectionTimeout,
+                  enabled: !controller.isBusy,
+                  onChanged: controller.updateSilentConnectionTimeout,
+                ),
+              ),
+            ],
           ),
         ),
       ],
@@ -1912,6 +1929,59 @@ class _OutputBackendPicker extends StatelessWidget {
       OutputAudioBackend.wasapiShared ||
       OutputAudioBackend.wasapiExclusive => Icons.desktop_windows_rounded,
     };
+  }
+}
+
+class _SilentConnectionTimeoutPicker extends StatelessWidget {
+  const _SilentConnectionTimeoutPicker({
+    required this.timeout,
+    required this.enabled,
+    required this.onChanged,
+  });
+
+  final Duration? timeout;
+  final bool enabled;
+  final ValueChanged<Duration?> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return DropdownMenu<int>(
+      key: const ValueKey('silent-connection-timeout-picker'),
+      width: double.infinity,
+      enabled: enabled,
+      initialSelection: timeout?.inSeconds ?? 0,
+      leadingIcon: const Icon(Icons.timer_off_outlined),
+      requestFocusOnTap: false,
+      onSelected: (seconds) {
+        if (seconds == null) {
+          return;
+        }
+        onChanged(seconds == 0 ? null : Duration(seconds: seconds));
+      },
+      dropdownMenuEntries: [
+        for (final option
+            in AudioRelayController.silentConnectionTimeoutOptions)
+          DropdownMenuEntry(
+            value: option?.inSeconds ?? 0,
+            label: _timeoutLabel(option),
+            leadingIcon: Icon(
+              option == null
+                  ? Icons.all_inclusive_rounded
+                  : Icons.timer_outlined,
+            ),
+          ),
+      ],
+    );
+  }
+
+  static String _timeoutLabel(Duration? timeout) {
+    if (timeout == null) {
+      return 'Never';
+    }
+    if (timeout.inMinutes >= 1 && timeout.inSeconds % 60 == 0) {
+      return '${timeout.inMinutes} min';
+    }
+    return '${timeout.inSeconds} sec';
   }
 }
 

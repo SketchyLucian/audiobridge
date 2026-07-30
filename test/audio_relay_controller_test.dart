@@ -256,6 +256,7 @@ void main() {
         soundboardTarget: SoundboardPlaybackTarget.stream,
         selectedSoundboardOutputDeviceId: 'route-1',
         soundboardVolume: 0.36,
+        silentConnectionTimeoutSeconds: 300,
       ),
     );
     final controller = AudioRelayController(
@@ -284,6 +285,7 @@ void main() {
     expect(controller.soundboardTarget, SoundboardPlaybackTarget.stream);
     expect(controller.selectedSoundboardOutputDeviceId, 'route-1');
     expect(controller.soundboardVolume, 0.36);
+    expect(controller.silentConnectionTimeout, const Duration(minutes: 5));
 
     controller.dispose();
   });
@@ -309,6 +311,7 @@ void main() {
     controller.addSoundboardFiles([soundPath]);
     controller.updateSoundboardTarget(SoundboardPlaybackTarget.stream);
     controller.updateSoundboardVolume(0.28);
+    controller.updateSilentConnectionTimeout(const Duration(minutes: 10));
     await controller.flushPreferences();
 
     final saved = preferencesStore.savedPreferences;
@@ -319,6 +322,7 @@ void main() {
     expect(saved?.selectedSoundboardPath, soundPath);
     expect(saved?.soundboardTarget, SoundboardPlaybackTarget.stream);
     expect(saved?.soundboardVolume, 0.28);
+    expect(saved?.silentConnectionTimeoutSeconds, 600);
 
     controller.dispose();
   });
@@ -560,6 +564,7 @@ void main() {
       'adaptiveLowQueueSamples': 3,
       'playbackQueueFillPercent': 72,
       'peerConnected': 'true',
+      'sourceAudioActive': 'false',
     });
 
     expect(metrics.audioLatencyMs, 51);
@@ -576,6 +581,7 @@ void main() {
     expect(metrics.adaptiveLowQueueSamples, 3);
     expect(metrics.playbackQueueFillPercent, 72);
     expect(metrics.peerConnected, true);
+    expect(metrics.sourceAudioActive, false);
     expect(metrics.effectiveLatencyMs, 51);
   });
 
@@ -2413,7 +2419,7 @@ void main() {
         AudioRelayController(
             engine: engine,
             discoveryService: discoveryService,
-            receiverNoAudioTimeout: const Duration(minutes: 10),
+            receiverReconnectTimeout: const Duration(minutes: 10),
           )
           ..role = RelayRole.receiver
           ..capabilities = _supportedCapabilities;
@@ -2489,7 +2495,7 @@ void main() {
           AudioRelayController(
               engine: engine,
               discoveryService: _FakeDiscoveryService(),
-              receiverNoAudioTimeout: const Duration(milliseconds: 20),
+              receiverReconnectTimeout: const Duration(milliseconds: 20),
             )
             ..role = RelayRole.receiver
             ..capabilities = _supportedCapabilities;
@@ -2508,6 +2514,7 @@ void main() {
       engine.metrics = const AudioRelayMetrics(
         peerConnected: true,
         signalLevel: 0,
+        sourceAudioActive: false,
       );
       await controller.pollMetricsForTesting();
       await Future<void>.delayed(const Duration(milliseconds: 30));
@@ -2519,6 +2526,85 @@ void main() {
       controller.dispose();
     },
   );
+
+  test('receiver disconnects after the selected silent timeout', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: _FakeDiscoveryService(),
+          )
+          ..role = RelayRole.receiver
+          ..capabilities = _supportedCapabilities
+          ..updateSilentConnectionTimeout(const Duration(milliseconds: 15));
+    final device = RelayDevice(
+      id: 'source-1',
+      name: 'Windows source',
+      host: '192.168.1.25',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.balanced.profile,
+      lastSeen: DateTime.now(),
+    );
+
+    await controller.connectToDevice(device);
+    engine.metrics = const AudioRelayMetrics(
+      peerConnected: true,
+      sourceAudioActive: false,
+    );
+    await controller.pollMetricsForTesting();
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+
+    expect(controller.activity, RelayActivity.idle);
+    expect(engine.calls, ['prepareReceiver', 'startStream', 'stopStream']);
+    expect(
+      controller.noticeMessage,
+      'Disconnected after a moment without audio.',
+    );
+
+    controller.dispose();
+  });
+
+  test('audio activity cancels the selected silent timeout', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: _FakeDiscoveryService(),
+          )
+          ..role = RelayRole.receiver
+          ..capabilities = _supportedCapabilities
+          ..updateSilentConnectionTimeout(const Duration(milliseconds: 20));
+    final device = RelayDevice(
+      id: 'source-1',
+      name: 'Windows source',
+      host: '192.168.1.25',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.balanced.profile,
+      lastSeen: DateTime.now(),
+    );
+
+    await controller.connectToDevice(device);
+    engine.metrics = const AudioRelayMetrics(
+      peerConnected: true,
+      sourceAudioActive: false,
+    );
+    await controller.pollMetricsForTesting();
+    engine.metrics = const AudioRelayMetrics(
+      peerConnected: true,
+      sourceAudioActive: true,
+    );
+    await controller.pollMetricsForTesting();
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+
+    expect(controller.activity, RelayActivity.streaming);
+    expect(engine.calls, ['prepareReceiver', 'startStream']);
+
+    controller.dispose();
+  });
 
   test(
     'receiver reconnects to a rediscovered source after its IP changes',
@@ -2634,14 +2720,14 @@ void main() {
     },
   );
 
-  test('receiver stops after the no-audio timeout expires', () async {
+  test('receiver stops after the reconnect timeout expires', () async {
     final discoveryService = _FakeDiscoveryService();
     final engine = _FakeAudioRelayEngine();
     final controller =
         AudioRelayController(
             engine: engine,
             discoveryService: discoveryService,
-            receiverNoAudioTimeout: Duration.zero,
+            receiverReconnectTimeout: Duration.zero,
           )
           ..role = RelayRole.receiver
           ..capabilities = _supportedCapabilities;

@@ -26,7 +26,9 @@ class AudioRelayForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action != ACTION_START_STREAM) {
+        val engine = AudioEngineHolder.receiverEngine(applicationContext)
+        val startingStream = intent?.action == ACTION_START_STREAM
+        if (!startingStream && !(intent == null && engine.isStreamActive())) {
             stopSelf(startId)
             return START_NOT_STICKY
         }
@@ -34,7 +36,8 @@ class AudioRelayForegroundService : Service() {
         startForegroundForCurrentRole()
         acquireWakeLock()
         updateWifiLock()
-        return START_NOT_STICKY
+        logLowPowerStandbyRisk()
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -136,7 +139,7 @@ class AudioRelayForegroundService : Service() {
 
         return builder
             .setContentTitle("AudioBridge is running")
-            .setContentText("Audio streaming continues in the background.")
+            .setContentText(notificationText())
             .setSmallIcon(R.drawable.ic_stat_audiobridge)
             .setContentIntent(pendingIntent)
             .setCategory(Notification.CATEGORY_SERVICE)
@@ -155,18 +158,55 @@ class AudioRelayForegroundService : Service() {
     private fun startForegroundForCurrentRole() {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val serviceType = if (
+            val roleType = if (
                 AudioEngineHolder.receiverEngine(applicationContext).needsMicrophonePermissionForStream()
             ) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             } else {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
             }
+            val serviceType = roleType or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             startForeground(NOTIFICATION_ID, notification, serviceType)
             return
         }
 
         startForeground(NOTIFICATION_ID, notification)
+    }
+
+    private fun notificationText(): String {
+        return if (hasLowPowerStandbyRisk()) {
+            "Low Power Standby can pause screen-off network audio."
+        } else {
+            "Audio streaming continues in the background."
+        }
+    }
+
+    private fun logLowPowerStandbyRisk() {
+        if (hasLowPowerStandbyRisk()) {
+            Log.w(
+                LOG_TAG,
+                "Low Power Standby is enabled and may block network access while the screen is off"
+            )
+        }
+    }
+
+    private fun hasLowPowerStandbyRisk(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return false
+        }
+
+        val powerManager = getSystemService(PowerManager::class.java)
+        return try {
+            if (!powerManager.isLowPowerStandbyEnabled) {
+                false
+            } else {
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
+                    !powerManager.isExemptFromLowPowerStandby
+            }
+        } catch (error: RuntimeException) {
+            Log.w(LOG_TAG, "Unable to read Low Power Standby state", error)
+            false
+        }
     }
 
     companion object {

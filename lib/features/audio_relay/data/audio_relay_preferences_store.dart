@@ -15,6 +15,7 @@ class AudioRelayPreferences {
     required this.soundboardPaths,
     required this.soundboardTarget,
     required this.soundboardVolume,
+    this.silentConnectionTimeoutSeconds,
     this.selectedSoundboardPath,
     this.selectedSoundboardOutputDeviceId,
   });
@@ -30,10 +31,11 @@ class AudioRelayPreferences {
   final SoundboardPlaybackTarget soundboardTarget;
   final String? selectedSoundboardOutputDeviceId;
   final double soundboardVolume;
+  final int? silentConnectionTimeoutSeconds;
 
   Map<String, Object?> toMap() {
     return {
-      'version': 1,
+      'version': 2,
       'role': role.name,
       'transport': transport.name,
       'profile': profile.toMap(),
@@ -45,6 +47,7 @@ class AudioRelayPreferences {
       'soundboardTarget': soundboardTarget.name,
       'selectedSoundboardOutputDeviceId': selectedSoundboardOutputDeviceId,
       'soundboardVolume': soundboardVolume,
+      'silentConnectionTimeoutSeconds': silentConnectionTimeoutSeconds,
     };
   }
 
@@ -86,6 +89,9 @@ class AudioRelayPreferences {
         map['selectedSoundboardOutputDeviceId'],
       ),
       soundboardVolume: _readUnitValue(map['soundboardVolume'], fallback: 0.82),
+      silentConnectionTimeoutSeconds: _readPositiveInt(
+        map['silentConnectionTimeoutSeconds'],
+      ),
     );
   }
 
@@ -120,6 +126,11 @@ class AudioRelayPreferences {
   static String? _readOptionalString(Object? value) {
     final text = value?.toString().trim();
     return text == null || text.isEmpty ? null : text;
+  }
+
+  static int? _readPositiveInt(Object? value) {
+    final parsed = value is int ? value : int.tryParse(value?.toString() ?? '');
+    return parsed != null && parsed > 0 ? parsed : null;
   }
 }
 

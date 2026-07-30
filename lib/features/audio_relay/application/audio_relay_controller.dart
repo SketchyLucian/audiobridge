@@ -44,7 +44,7 @@ class AudioRelayController extends ChangeNotifier {
     @visibleForTesting
     Duration streamConnectionTimeout = const Duration(minutes: 10),
     @visibleForTesting
-    Duration receiverNoAudioTimeout = const Duration(minutes: 10),
+    Duration receiverReconnectTimeout = const Duration(minutes: 10),
     @visibleForTesting Duration sourceStaleTimeout = const Duration(seconds: 4),
     @visibleForTesting List<Duration> reconnectDelays = _defaultReconnectDelays,
     @visibleForTesting
@@ -67,7 +67,7 @@ class AudioRelayController extends ChangeNotifier {
        _autoCodecQuietHold = autoCodecQuietHold,
        _discoveryIdleTimeout = discoveryIdleTimeout,
        _streamConnectionTimeout = streamConnectionTimeout,
-       _receiverNoAudioTimeout = receiverNoAudioTimeout,
+       _receiverReconnectTimeout = receiverReconnectTimeout,
        _sourceStaleTimeout = sourceStaleTimeout,
        _reconnectDelays = List<Duration>.unmodifiable(
          reconnectDelays.isEmpty ? _defaultReconnectDelays : reconnectDelays,
@@ -91,7 +91,7 @@ class AudioRelayController extends ChangeNotifier {
   final Duration _autoCodecQuietHold;
   final Duration _discoveryIdleTimeout;
   final Duration _streamConnectionTimeout;
-  final Duration _receiverNoAudioTimeout;
+  final Duration _receiverReconnectTimeout;
   final Duration _sourceStaleTimeout;
   final List<Duration> _reconnectDelays;
   final Duration _preferencesSaveDelay;
@@ -100,6 +100,7 @@ class AudioRelayController extends ChangeNotifier {
   RelayActivity activity = RelayActivity.idle;
   AudioProfile profile;
   OutputAudioBackend receiverOutputBackend = OutputAudioBackend.auto;
+  Duration? silentConnectionTimeout;
   AudioPreset selectedPreset = AudioPreset.balanced;
   PlatformAudioCapabilities capabilities = PlatformAudioCapabilities.fallback();
   AudioRelayMetrics metrics = AudioRelayMetrics.empty;
@@ -129,6 +130,7 @@ class AudioRelayController extends ChangeNotifier {
   Timer? _profileApplyTimer;
   Timer? _discoveryIdleTimer;
   Timer? _streamConnectionTimer;
+  Timer? _silentConnectionTimer;
   Timer? _reconnectTimer;
   Timer? _sourcePruneTimer;
   Timer? _preferencesSaveTimer;
@@ -173,7 +175,15 @@ class AudioRelayController extends ChangeNotifier {
     Duration(seconds: 8),
     Duration(seconds: 30),
   ];
-  static const _fallbackAppVersion = '1.4.2';
+  static const silentConnectionTimeoutOptions = <Duration?>[
+    null,
+    Duration(seconds: 30),
+    Duration(minutes: 1),
+    Duration(minutes: 5),
+    Duration(minutes: 10),
+    Duration(minutes: 30),
+  ];
+  static const _fallbackAppVersion = '1.4.4';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -557,6 +567,11 @@ class AudioRelayController extends ChangeNotifier {
 
   String get outputBackendLabel {
     return receiverOutputBackend.label;
+  }
+
+  String get silentConnectionTimeoutLabel {
+    final timeout = silentConnectionTimeout;
+    return timeout == null ? 'Never' : _durationLabel(timeout);
   }
 
   String get bufferTargetLabel {
@@ -1178,6 +1193,7 @@ class AudioRelayController extends ChangeNotifier {
   Future<void> stopStream() async {
     _cancelReconnect();
     _cancelStreamConnectionTimeout();
+    _cancelSilentConnectionTimeout();
     _cancelSourcePrune();
     await _engine.stopStream();
     _stopMeters();
@@ -1203,6 +1219,7 @@ class AudioRelayController extends ChangeNotifier {
     _cancelReconnect();
     _cancelDiscoveryIdleTimeout();
     _cancelStreamConnectionTimeout();
+    _cancelSilentConnectionTimeout();
     _cancelSourcePrune();
     _cancelPendingProfileApply();
     await _engine.disconnect();
@@ -1452,6 +1469,19 @@ class AudioRelayController extends ChangeNotifier {
     notifyListeners();
     _schedulePreferencesSave();
     unawaited(_refreshActiveReceiverProfile());
+  }
+
+  void updateSilentConnectionTimeout(Duration? value) {
+    final nextValue = value == null || value <= Duration.zero ? null : value;
+    if (silentConnectionTimeout == nextValue) {
+      return;
+    }
+
+    silentConnectionTimeout = nextValue;
+    _cancelSilentConnectionTimeout();
+    _updateSilentConnectionFromMetrics(metrics);
+    notifyListeners();
+    _schedulePreferencesSave();
   }
 
   void updateSampleRate(int value) {
@@ -1777,6 +1807,7 @@ class AudioRelayController extends ChangeNotifier {
     _profileApplyTimer?.cancel();
     _discoveryIdleTimer?.cancel();
     _streamConnectionTimer?.cancel();
+    _silentConnectionTimer?.cancel();
     _reconnectTimer?.cancel();
     _sourcePruneTimer?.cancel();
     _preferencesSaveTimer?.cancel();
@@ -1959,6 +1990,7 @@ class AudioRelayController extends ChangeNotifier {
 
   void _startStreamConnectionWatch() {
     _cancelReconnect();
+    _cancelSilentConnectionTimeout();
     _streamPeerConnected = false;
     _hasConnectedThisSession = false;
     _scheduleStreamConnectionTimeout();
@@ -2004,8 +2036,55 @@ class AudioRelayController extends ChangeNotifier {
 
   Duration get _activeStreamConnectionTimeout {
     return role == RelayRole.receiver
-        ? _receiverNoAudioTimeout
+        ? _receiverReconnectTimeout
         : _streamConnectionTimeout;
+  }
+
+  void _updateSilentConnectionFromMetrics(AudioRelayMetrics nextMetrics) {
+    final timeout = silentConnectionTimeout;
+    final shouldWaitForSilenceTimeout =
+        timeout != null &&
+        role == RelayRole.receiver &&
+        isStreaming &&
+        !isReconnecting &&
+        nextMetrics.peerConnected == true &&
+        nextMetrics.sourceAudioActive == false;
+    if (!shouldWaitForSilenceTimeout) {
+      _cancelSilentConnectionTimeout();
+      return;
+    }
+    if (_silentConnectionTimer != null) {
+      return;
+    }
+
+    _silentConnectionTimer = Timer(timeout, () {
+      _silentConnectionTimer = null;
+      unawaited(_stopSilentReceiver());
+    });
+  }
+
+  void _cancelSilentConnectionTimeout() {
+    _silentConnectionTimer?.cancel();
+    _silentConnectionTimer = null;
+  }
+
+  Future<void> _stopSilentReceiver() async {
+    final timeout = silentConnectionTimeout;
+    if (_isDisposed ||
+        timeout == null ||
+        role != RelayRole.receiver ||
+        !isStreaming ||
+        isReconnecting ||
+        metrics.peerConnected != true ||
+        metrics.sourceAudioActive != false) {
+      return;
+    }
+
+    final message =
+        'Disconnected after ${_durationLabel(timeout)} without audio.';
+    await stopStream();
+    noticeMessage = message;
+    notifyListeners();
   }
 
   void _enterReconnecting(String message) {
@@ -2013,6 +2092,7 @@ class AudioRelayController extends ChangeNotifier {
       return;
     }
 
+    _cancelSilentConnectionTimeout();
     _streamPeerConnected = false;
     if (!isReconnecting) {
       activity = RelayActivity.reconnecting;
@@ -2161,6 +2241,7 @@ class AudioRelayController extends ChangeNotifier {
   ) async {
     if (!isStreaming) {
       _cancelStreamConnectionTimeout();
+      _cancelSilentConnectionTimeout();
       _cancelReconnect();
       return;
     }
@@ -2201,6 +2282,7 @@ class AudioRelayController extends ChangeNotifier {
       final nextMetrics = await _engine.getMetrics();
       metrics = nextMetrics;
       await _updateStreamConnectionFromMetrics(nextMetrics);
+      _updateSilentConnectionFromMetrics(nextMetrics);
       if (!isStreaming || isReconnecting) {
         return;
       }
@@ -2222,6 +2304,7 @@ class AudioRelayController extends ChangeNotifier {
     _cancelReconnect();
     _cancelDiscoveryIdleTimeout();
     _cancelStreamConnectionTimeout();
+    _cancelSilentConnectionTimeout();
     _cancelSourcePrune();
     activity = RelayActivity.error;
     errorMessage = message;
@@ -2434,6 +2517,11 @@ class AudioRelayController extends ChangeNotifier {
         : RelayTransport.wifi;
     profile = _normalizeProfile(savedPreferences.profile);
     receiverOutputBackend = savedPreferences.receiverOutputBackend;
+    final silentTimeoutSeconds =
+        savedPreferences.silentConnectionTimeoutSeconds;
+    silentConnectionTimeout = silentTimeoutSeconds == null
+        ? null
+        : Duration(seconds: silentTimeoutSeconds);
     volume = savedPreferences.volume;
     muted = savedPreferences.muted;
     soundboardItems = List.unmodifiable(
@@ -2465,6 +2553,7 @@ class AudioRelayController extends ChangeNotifier {
       transport: transport,
       profile: profile,
       receiverOutputBackend: receiverOutputBackend,
+      silentConnectionTimeoutSeconds: silentConnectionTimeout?.inSeconds,
       volume: volume,
       muted: muted,
       soundboardPaths: soundboardItems
