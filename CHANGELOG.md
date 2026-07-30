@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.5 - 2026-07-30
+
+- Kept Android media playback active with local silent frames when the Windows
+  source stops producing audio.
+- Marked receiver output as background media so screen-off power handling does
+  not suspend it during silence.
+- Added foreground-service lock diagnostics and a clearer Low Power Standby
+  warning.
+
 ## 1.4.4 - 2026-07-30
 
 - Kept Android receiver playback active while the source is silent and its

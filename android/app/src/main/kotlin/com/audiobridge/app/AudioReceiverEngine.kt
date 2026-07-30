@@ -90,6 +90,8 @@ private const val UDP_BUFFER_BYTES = 256 * 1024
 private const val SUBSCRIBE_INTERVAL_MS = 300L
 private const val SUBSCRIBE_MAX_BYTES = 2048
 private const val SOURCE_IDLE_TIMEOUT_MS = 1200L
+private const val SILENT_PLAYBACK_KEEPALIVE_START_MS = 80L
+private const val SILENT_PLAYBACK_KEEPALIVE_INTERVAL_MS = 20
 private const val PEER_HEARTBEAT_TIMEOUT_MS = 3000L
 private const val HEARTBEAT_INTERVAL_MS = 800L
 private const val START_BUFFER_PACKETS = 4
@@ -237,8 +239,19 @@ internal fun requiresWifiLock(transportMode: TransportMode): Boolean {
     return transportMode == TransportMode.WIFI
 }
 
-internal fun shouldParkIdlePlayback(sourceIdle: Boolean, peerConnected: Boolean): Boolean {
-    return sourceIdle && !peerConnected
+internal fun silentPlaybackFramesToWrite(
+    sourceQuiet: Boolean,
+    streamWasConnected: Boolean,
+    queuedFrames: Long,
+    targetFrames: Int,
+    maxChunkFrames: Int
+): Int {
+    if (!sourceQuiet || !streamWasConnected || targetFrames <= 0 || maxChunkFrames <= 0) {
+        return 0
+    }
+
+    val missingFrames = targetFrames.toLong() - max(0L, queuedFrames)
+    return min(maxChunkFrames.toLong(), max(0L, missingFrames)).toInt()
 }
 
 private enum class OutputAudioBackend {
@@ -363,6 +376,7 @@ class AudioReceiverEngine(private val context: Context) {
     private var currentBufferSizeFrames = 0
     private var currentTargetBufferFrames = 0
     private var currentUseBlockingWrites = false
+    private var silentPlaybackBuffer = ByteArray(0)
     private var adaptivePlaybackBufferMs = 35
     private var lastAdaptiveBufferIncreaseAtMs = 0L
     private var lastAdaptiveBufferRelaxAtMs = 0L
@@ -570,9 +584,6 @@ class AudioReceiverEngine(private val context: Context) {
         }
         val sourceIdle = isSourceIdle(now)
         if (sourceIdle) {
-            if (shouldParkIdlePlayback(sourceIdle, peerConnected)) {
-                parkIdlePlayback(track, underruns)
-            }
             return idleReceiverMetrics(sampleRate, peerConnected)
         }
 
@@ -670,26 +681,6 @@ class AudioReceiverEngine(private val context: Context) {
             "sourceAudioActive" to false,
             "activeProfile" to activeProfileForMetrics()
         )
-    }
-
-    private fun parkIdlePlayback(track: AudioTrack, underruns: Int) {
-        try {
-            if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                track.pause()
-            }
-            track.flush()
-        } catch (_: IllegalStateException) {
-        }
-        writtenFrames.set(playbackFrames(track))
-        lastKnownUnderrunCount = underruns
-        adaptiveUnderrunWindowStartAtMs = 0L
-        adaptiveUnderrunsInWindow = 0
-        adaptiveUnderrunBurstStartAtMs = 0L
-        adaptiveUnderrunsInBurst = 0
-        adaptiveLowQueueSamples = 0
-        resetAdaptiveDelayTracker()
-        lastAdaptiveBufferRelaxAtMs = SystemClock.elapsedRealtime()
-        signalLevel = 0.0
     }
 
     private fun activeProfileForMetrics(): Map<String, Any> {
@@ -940,7 +931,7 @@ class AudioReceiverEngine(private val context: Context) {
     private fun openAudioSocket(bindAddress: InetAddress? = null): DatagramSocket {
         return DatagramSocket(null).apply {
             reuseAddress = true
-            soTimeout = 60
+            soTimeout = SILENT_PLAYBACK_KEEPALIVE_INTERVAL_MS
             applyLowDelaySocketOptions()
             bind(InetSocketAddress(bindAddress, 0))
         }
@@ -2388,6 +2379,7 @@ class AudioReceiverEngine(private val context: Context) {
                     continue
                 }
             }
+            maintainSilentPlayback(now)
 
             try {
                 val packet = DatagramPacket(buffer, buffer.size)
@@ -3600,6 +3592,68 @@ class AudioReceiverEngine(private val context: Context) {
         return writePcmToTrack(track, output, 0, output.size)
     }
 
+    private fun maintainSilentPlayback(now: Long) {
+        val streamWasConnected = lastPeerPacketReceivedAtMs > 0L
+        if (!streamWasConnected) {
+            return
+        }
+
+        val lastAudioAt = lastAudioPacketReceivedAtMs
+        val sourceQuiet = lastAudioAt <= 0L ||
+            now - lastAudioAt >= SILENT_PLAYBACK_KEEPALIVE_START_MS
+        if (!sourceQuiet) {
+            return
+        }
+
+        val inputSampleRate = currentInputSampleRate.takeIf { it > 0 } ?: profile.sampleRate
+        val sampleRate = currentSampleRate.takeIf { it > 0 }
+            ?: outputSampleRateForPlayback(inputSampleRate)
+        val channels = currentChannels.takeIf { it > 0 } ?: profile.channels.coerceIn(1, 2)
+        val track = audioTrack ?: ensureAudioTrack(sampleRate, channels) ?: return
+        currentInputSampleRate = inputSampleRate
+
+        val playedFrames = playbackFrames(track)
+        val queuedFrames = max(0L, writtenFrames.get() - playedFrames)
+        val maxChunkFrames = latencyFrames(sampleRate, SILENT_PLAYBACK_KEEPALIVE_INTERVAL_MS)
+        val targetFrames = max(currentTargetBufferFrames, maxChunkFrames)
+            .coerceAtMost(currentBufferSizeFrames)
+        val framesToWrite = silentPlaybackFramesToWrite(
+            sourceQuiet = true,
+            streamWasConnected = true,
+            queuedFrames = queuedFrames,
+            targetFrames = targetFrames,
+            maxChunkFrames = maxChunkFrames
+        )
+        if (framesToWrite <= 0) {
+            return
+        }
+
+        val bytesPerFrame = channels * 2
+        val bytesToWrite = framesToWrite * bytesPerFrame
+        if (silentPlaybackBuffer.size < bytesToWrite) {
+            silentPlaybackBuffer = ByteArray(bytesToWrite)
+        }
+        val writtenBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            track.write(
+                silentPlaybackBuffer,
+                0,
+                bytesToWrite,
+                AudioTrack.WRITE_NON_BLOCKING
+            )
+        } else {
+            track.write(silentPlaybackBuffer, 0, bytesToWrite)
+        }
+        logAudioTrackWrite(writtenBytes, bytesToWrite)
+        if (writtenBytes <= 0) {
+            return
+        }
+
+        val queuedAfterWrite = writtenFrames.addAndGet(
+            (writtenBytes / bytesPerFrame).toLong()
+        )
+        startPlaybackIfReady(track, queuedAfterWrite)
+    }
+
     private fun pcmPeakLevel(data: ByteArray, offset: Int, size: Int): Double {
         val end = min(data.size, offset + size)
         var cursor = offset
@@ -4419,13 +4473,8 @@ class AudioReceiverEngine(private val context: Context) {
             minBufferSize,
             capacityBufferFrames * max(1, channels) * 2
         )
-        val usage = if (requestedLatencyMs > LOW_LATENCY_PERFORMANCE_MAX_MS) {
-            AudioAttributes.USAGE_MEDIA
-        } else {
-            AudioAttributes.USAGE_GAME
-        }
         val attributes = AudioAttributes.Builder()
-            .setUsage(usage)
+            .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
             .build()
         val format = AudioFormat.Builder()
@@ -4518,6 +4567,7 @@ class AudioReceiverEngine(private val context: Context) {
         currentBufferSizeFrames = 0
         currentTargetBufferFrames = 0
         currentUseBlockingWrites = false
+        silentPlaybackBuffer = ByteArray(0)
         lastSequence = -1L
         lastCodecId = CODEC_PCM
         lastKnownUnderrunCount = 0

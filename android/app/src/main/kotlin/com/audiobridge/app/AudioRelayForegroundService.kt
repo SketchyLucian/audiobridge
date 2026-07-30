@@ -73,6 +73,7 @@ class AudioRelayForegroundService : Service() {
                 setReferenceCounted(false)
                 acquire()
             }
+            Log.i(LOG_TAG, "Wi-Fi stream lock acquired held=${wifiLock?.isHeld == true}")
         } catch (error: RuntimeException) {
             wifiLock = null
             Log.w(LOG_TAG, "Unable to keep Wi-Fi awake for the active stream", error)
@@ -114,12 +115,18 @@ class AudioRelayForegroundService : Service() {
         }
 
         val powerManager = getSystemService(PowerManager::class.java)
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "AudioBridge:ReceiverStream"
-        ).apply {
-            setReferenceCounted(false)
-            acquire()
+        try {
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "AudioBridge:ReceiverStream"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.i(LOG_TAG, "CPU stream lock acquired held=${wakeLock?.isHeld == true}")
+        } catch (error: RuntimeException) {
+            wakeLock = null
+            Log.w(LOG_TAG, "Unable to keep the CPU awake for the active stream", error)
         }
     }
 
@@ -175,7 +182,7 @@ class AudioRelayForegroundService : Service() {
 
     private fun notificationText(): String {
         return if (hasLowPowerStandbyRisk()) {
-            "Low Power Standby can pause screen-off network audio."
+            "Turn off Low Power Standby for screen-off network audio."
         } else {
             "Audio streaming continues in the background."
         }

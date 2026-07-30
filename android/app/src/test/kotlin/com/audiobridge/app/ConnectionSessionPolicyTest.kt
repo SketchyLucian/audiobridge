@@ -31,21 +31,63 @@ class ConnectionSessionPolicyTest {
     }
 
     @Test
-    fun silenceKeepsPlaybackActiveWhilePeerHeartbeatIsFresh() {
-        assertFalse(
-            shouldParkIdlePlayback(
-                sourceIdle = true,
-                peerConnected = true
+    fun silenceFillsMissingPlaybackFramesAfterAConnection() {
+        assertEquals(
+            480,
+            silentPlaybackFramesToWrite(
+                sourceQuiet = true,
+                streamWasConnected = true,
+                queuedFrames = 480,
+                targetFrames = 1440,
+                maxChunkFrames = 480
             )
         )
     }
 
     @Test
-    fun silenceParksPlaybackAfterPeerDisconnects() {
-        assertTrue(
-            shouldParkIdlePlayback(
-                sourceIdle = true,
-                peerConnected = false
+    fun silenceDoesNotOverfillPlaybackTarget() {
+        assertEquals(
+            120,
+            silentPlaybackFramesToWrite(
+                sourceQuiet = true,
+                streamWasConnected = true,
+                queuedFrames = 1320,
+                targetFrames = 1440,
+                maxChunkFrames = 480
+            )
+        )
+        assertEquals(
+            0,
+            silentPlaybackFramesToWrite(
+                sourceQuiet = true,
+                streamWasConnected = true,
+                queuedFrames = 1440,
+                targetFrames = 1440,
+                maxChunkFrames = 480
+            )
+        )
+    }
+
+    @Test
+    fun silenceWaitsForAConnectedQuietStream() {
+        assertEquals(
+            0,
+            silentPlaybackFramesToWrite(
+                sourceQuiet = false,
+                streamWasConnected = true,
+                queuedFrames = 0,
+                targetFrames = 1440,
+                maxChunkFrames = 480
+            )
+        )
+        assertEquals(
+            0,
+            silentPlaybackFramesToWrite(
+                sourceQuiet = true,
+                streamWasConnected = false,
+                queuedFrames = 0,
+                targetFrames = 1440,
+                maxChunkFrames = 480
             )
         )
     }
