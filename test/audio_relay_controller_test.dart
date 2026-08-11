@@ -2957,12 +2957,14 @@ void main() {
     ).readAsStringSync();
 
     expect(releaseWorkflow, contains('publish_github_release.ps1'));
+    expect(releaseWorkflow, contains('-AndroidSigningKeyReset'));
     expect(releaseWorkflow, contains('AudioBridge-\$version-x64.msi'));
     expect(releaseWorkflow, contains('AudioBridge-\$version-android.apk'));
     expect(publisher, contains('ExpectedName \$expectedMsiName'));
     expect(publisher, contains('ExpectedName \$expectedApkName'));
     expect(publisher, contains("draft = \$true"));
     expect(publisher, contains("draft = \$false"));
+    expect(publisher, contains('Android installation notice'));
   });
 
   test('usb sender reports native usb setup failures', () async {

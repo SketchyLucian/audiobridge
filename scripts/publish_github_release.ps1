@@ -18,6 +18,8 @@ param(
 
     [string] $ReleaseNotes,
 
+    [switch] $AndroidSigningKeyReset,
+
     [switch] $ValidateOnly
 )
 
@@ -190,7 +192,17 @@ foreach ($required in $requiredAssets) {
 $msiSha = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $apkSha = (Get-FileHash -LiteralPath $apk.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($ReleaseNotes)) {
-    $ReleaseNotes = @(
+    $releaseNoteLines = @()
+    if ($AndroidSigningKeyReset) {
+        $releaseNoteLines += @(
+            '## Android installation notice',
+            '',
+            'The Android signing key changed for this release because the previous release key was unavailable.',
+            '**Uninstall an earlier AudioBridge Android version before installing this APK.** Android will reject an in-place update signed with the new key.',
+            ''
+        )
+    }
+    $releaseNoteLines += @(
         '## Downloads',
         '',
         "- Windows: $expectedMsiName",
@@ -200,7 +212,8 @@ if ([string]::IsNullOrWhiteSpace($ReleaseNotes)) {
         '',
         "- ${expectedMsiName}: $msiSha",
         "- ${expectedApkName}: $apkSha"
-    ) -join "`n"
+    )
+    $ReleaseNotes = $releaseNoteLines -join "`n"
 }
 
 $publishPayload = @{

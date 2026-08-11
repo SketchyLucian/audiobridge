@@ -9,6 +9,8 @@
 - Fixed the bundled virtual microphone setup helper when no compatible driver
   is installed.
 - Moved the private source repository and public update release feed to GitHub.
+- Replaced the unavailable Android signing key. Existing Android users must
+  uninstall an earlier AudioBridge version before installing 1.4.6.
 
 ## 1.4.5 - 2026-07-30
 

@@ -136,6 +136,10 @@ The tag-triggered release workflow builds both platforms and calls
 the `RELEASE_REPO_TOKEN` GitHub Actions secret; missing credentials or either
 missing artifact fails the workflow without publishing a partial release.
 
+Android 1.4.6 starts a new signing-key lineage because the previous release key
+was unavailable. Users with an earlier Android version must uninstall it before
+installing 1.4.6. Later releases signed with the new key can update normally.
+
 After a new interactive MSI installation, AudioBridge asks whether to install
 the bundled VB-CABLE driver when no supported virtual audio cable is present.
 VB-CABLE is third-party donationware from VB-Audio Software; the prompt links

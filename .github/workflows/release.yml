@@ -95,4 +95,5 @@ jobs:
           .\scripts\publish_github_release.ps1 `
             -Tag $env:GITHUB_REF_NAME `
             -WindowsMsi "build/installer/AudioBridge-$version-x64.msi" `
-            -AndroidApk "build/release/AudioBridge-$version-android.apk"
+            -AndroidApk "build/release/AudioBridge-$version-android.apk" `
+            -AndroidSigningKeyReset
