@@ -700,7 +700,7 @@ void main() {
     controller.dispose();
   });
 
-  test('initialize checks Codeberg releases automatically', () async {
+  test('initialize checks GitHub releases automatically', () async {
     final updateService = _FakeUpdateService();
     final controller = AudioRelayController(
       engine: _FakeAudioRelayEngine(),
@@ -2953,10 +2953,10 @@ void main() {
       '.github/workflows/release.yml',
     ).readAsStringSync();
     final publisher = File(
-      'scripts/publish_codeberg_release.ps1',
+      'scripts/publish_github_release.ps1',
     ).readAsStringSync();
 
-    expect(releaseWorkflow, contains('publish_codeberg_release.ps1'));
+    expect(releaseWorkflow, contains('publish_github_release.ps1'));
     expect(releaseWorkflow, contains('AudioBridge-\$version-x64.msi'));
     expect(releaseWorkflow, contains('AudioBridge-\$version-android.apk'));
     expect(publisher, contains('ExpectedName \$expectedMsiName'));
@@ -3117,12 +3117,12 @@ AppUpdateRelease _updateRelease({
     tagName: tagName,
     version: tagName.replaceFirst('v', ''),
     pageUrl: Uri.parse(
-      'https://codeberg.org/SketchyLucian/audiobridge/releases/tag/$tagName',
+      'https://github.com/SketchyLucian/audiobridge-releases/releases/tag/$tagName',
     ),
     asset: AppUpdateAsset(
       name: assetName,
       downloadUrl: Uri.parse(
-        'https://codeberg.org/SketchyLucian/audiobridge/releases/download/$tagName/$assetName',
+        'https://github.com/SketchyLucian/audiobridge-releases/releases/download/$tagName/$assetName',
       ),
       sizeBytes: 3,
       target: target,

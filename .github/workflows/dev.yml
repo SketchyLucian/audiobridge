@@ -13,10 +13,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: https://data.forgejo.org/actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up Flutter
-        uses: https://github.com/subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
 
@@ -51,10 +51,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: https://data.forgejo.org/actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up Flutter
-        uses: https://github.com/subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
 

@@ -56,7 +56,7 @@ class AudioRelayController extends ChangeNotifier {
        _preferencesStore =
            preferencesStore ??
            const SharedPreferencesAudioRelayPreferencesStore(),
-       _updateService = updateService ?? CodebergUpdateService(),
+       _updateService = updateService ?? GitHubUpdateService(),
        _updateInstaller =
            updateInstaller ?? const MethodChannelUpdateInstaller(),
        _appVersionProvider = appVersionProvider ?? _defaultAppVersion,
@@ -248,7 +248,7 @@ class AudioRelayController extends ChangeNotifier {
     }
     return switch (updateStatus) {
       AppUpdateStatus.idle => 'Installed v$appVersion',
-      AppUpdateStatus.checking => 'Contacting Codeberg',
+      AppUpdateStatus.checking => 'Contacting GitHub',
       AppUpdateStatus.current => 'Installed v$appVersion',
       AppUpdateStatus.available =>
         release == null

@@ -3,7 +3,7 @@ Version:        %{_app_version}
 Release:        1
 Summary:        Wi-Fi LAN audio relay
 License:        Proprietary
-URL:            https://codeberg.org/SketchyLucian/audiobridge
+URL:            https://github.com/SketchyLucian/audiobridge-releases
 BuildArch:      x86_64
 Requires:       alsa-lib
 

@@ -15,15 +15,15 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: https://data.forgejo.org/actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up Flutter
-        uses: https://github.com/subosito/flutter-action@v2
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
 
       - name: Set up .NET SDK
-        uses: https://github.com/actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
 
@@ -86,13 +86,13 @@ jobs:
       - name: Publish complete public release
         shell: pwsh
         env:
-          CODEBERG_RELEASE_TOKEN: ${{ secrets.CODEBERG_RELEASE_TOKEN }}
+          GH_RELEASE_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
         run: |
           $version = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
           if ($env:GITHUB_REF_NAME -ne "v$version") {
             throw "Release tag $env:GITHUB_REF_NAME does not match pubspec version v$version."
           }
-          .\scripts\publish_codeberg_release.ps1 `
+          .\scripts\publish_github_release.ps1 `
             -Tag $env:GITHUB_REF_NAME `
             -WindowsMsi "build/installer/AudioBridge-$version-x64.msi" `
             -AndroidApk "build/release/AudioBridge-$version-android.apk"

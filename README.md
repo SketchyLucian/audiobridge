@@ -12,7 +12,7 @@ audio engines.
 - Android Wi-Fi sender and receiver mode UI
 - Linux Wi-Fi sender and receiver mode with default ALSA capture/playback and
   PCM audio
-- Codeberg release checks with assisted APK and MSI installation
+- GitHub release checks with assisted APK and MSI installation
 - UDP LAN discovery on port `47884`
 - Audio streaming on port `47885`
 - Session-aware heartbeat, stale-packet rejection, and automatic reconnect with
@@ -123,17 +123,18 @@ The MSI is written to `build/installer/AudioBridge-<version>-x64.msi`.
 
 ## Publishing releases
 
-Public releases are published to the `audiobridge-releases` Codeberg
-repository. A release is kept as a draft unless both of these signed artifacts
+Public releases are published to the public GitHub
+`SketchyLucian/audiobridge-releases` repository. The source repository remains
+private. A release is kept as a draft unless both of these signed artifacts
 exist and pass validation:
 
 - `AudioBridge-<version>-x64.msi`
 - `AudioBridge-<version>-android.apk`
 
 The tag-triggered release workflow builds both platforms and calls
-`scripts/publish_codeberg_release.ps1`. Configure its Android signing secrets
-and `CODEBERG_RELEASE_TOKEN`; missing credentials or either missing artifact
-fails the workflow without publishing a partial release.
+`scripts/publish_github_release.ps1`. Configure its Android signing secrets and
+the `RELEASE_REPO_TOKEN` GitHub Actions secret; missing credentials or either
+missing artifact fails the workflow without publishing a partial release.
 
 After a new interactive MSI installation, AudioBridge asks whether to install
 the bundled VB-CABLE driver when no supported virtual audio cable is present.

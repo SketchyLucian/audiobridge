@@ -28,8 +28,8 @@ class AppUpdateException implements Exception {
   String toString() => message;
 }
 
-class CodebergUpdateService implements AppUpdateService {
-  CodebergUpdateService({
+class GitHubUpdateService implements AppUpdateService {
+  GitHubUpdateService({
     this.owner = 'SketchyLucian',
     this.repo = 'audiobridge-releases',
     HttpClient Function()? httpClientFactory,
@@ -177,10 +177,7 @@ class CodebergUpdateService implements AppUpdateService {
   }
 
   Uri get _latestReleaseUri {
-    return Uri.https(
-      'codeberg.org',
-      '/api/v1/repos/$owner/$repo/releases/latest',
-    );
+    return Uri.https('api.github.com', '/repos/$owner/$repo/releases/latest');
   }
 
   HttpClient _newClient() {
@@ -193,31 +190,36 @@ class CodebergUpdateService implements AppUpdateService {
     final client = _newClient();
     try {
       final request = await client.getUrl(uri).timeout(_requestTimeout);
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      request.headers.set(
+        HttpHeaders.acceptHeader,
+        'application/vnd.github+json',
+      );
+      request.headers.set(HttpHeaders.userAgentHeader, 'AudioBridge updater');
+      request.headers.set('X-GitHub-Api-Version', '2022-11-28');
       final response = await request.close().timeout(_requestTimeout);
       if (response.statusCode == HttpStatus.notFound) {
         throw const AppUpdateException(
-          'No public Codeberg release feed is available.',
+          'No public GitHub release feed is available.',
         );
       }
       if (response.statusCode != HttpStatus.ok) {
         throw AppUpdateException(
-          'Unable to check Codeberg releases (${response.statusCode}).',
+          'Unable to check GitHub releases (${response.statusCode}).',
         );
       }
 
       final body = await utf8.decodeStream(response).timeout(_requestTimeout);
       final decoded = jsonDecode(body);
       if (decoded is! Map) {
-        throw const AppUpdateException('Codeberg returned an invalid release.');
+        throw const AppUpdateException('GitHub returned an invalid release.');
       }
       return decoded.cast<String, Object?>();
     } on TimeoutException {
       throw const AppUpdateException('The update check timed out.');
     } on SocketException {
-      throw const AppUpdateException('Unable to reach Codeberg.');
+      throw const AppUpdateException('Unable to reach GitHub.');
     } on FormatException {
-      throw const AppUpdateException('Codeberg returned an invalid release.');
+      throw const AppUpdateException('GitHub returned an invalid release.');
     } finally {
       client.close(force: true);
     }
@@ -254,20 +256,18 @@ class CodebergUpdateService implements AppUpdateService {
   void _validateDownloadUri(Uri uri) {
     final expectedPrefix = '/$owner/$repo/releases/download/';
     if (uri.scheme != 'https' ||
-        uri.host != 'codeberg.org' ||
+        uri.host != 'github.com' ||
         !uri.path.startsWith(expectedPrefix)) {
-      throw const AppUpdateException('Codeberg returned an unsafe update URL.');
+      throw const AppUpdateException('GitHub returned an unsafe update URL.');
     }
   }
 
   void _validateReleasePageUri(Uri uri) {
     final expectedPrefix = '/$owner/$repo/releases/tag/';
     if (uri.scheme != 'https' ||
-        uri.host != 'codeberg.org' ||
+        uri.host != 'github.com' ||
         !uri.path.startsWith(expectedPrefix)) {
-      throw const AppUpdateException(
-        'Codeberg returned an unsafe release page.',
-      );
+      throw const AppUpdateException('GitHub returned an unsafe release page.');
     }
   }
 
@@ -280,9 +280,7 @@ class CodebergUpdateService implements AppUpdateService {
         ? '.msi'
         : '';
     if (extension.isEmpty) {
-      throw const AppUpdateException(
-        'Codeberg returned an unsafe update file.',
-      );
+      throw const AppUpdateException('GitHub returned an unsafe update file.');
     }
     if (sanitized.length <= 96) {
       return sanitized;

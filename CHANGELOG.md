@@ -8,6 +8,7 @@
   cannot find a virtual audio cable.
 - Fixed the bundled virtual microphone setup helper when no compatible driver
   is installed.
+- Moved the private source repository and public update release feed to GitHub.
 
 ## 1.4.5 - 2026-07-30
 

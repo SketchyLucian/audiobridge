@@ -14,7 +14,7 @@ param(
 
     [string] $Repository = 'audiobridge-releases',
 
-    [string] $Token = $env:CODEBERG_RELEASE_TOKEN,
+    [string] $Token = $env:GH_RELEASE_TOKEN,
 
     [string] $ReleaseNotes,
 
@@ -47,17 +47,19 @@ function Resolve-ReleaseArtifact {
     return $artifact
 }
 
-function Get-CodebergCredentialHeaders {
+function Get-GitHubCredentialHeaders {
     if ([string]::IsNullOrWhiteSpace($Token)) {
-        throw 'CODEBERG_RELEASE_TOKEN is required to publish a release.'
+        throw 'GH_RELEASE_TOKEN is required to publish a release.'
     }
     return @{
-        Authorization = "token $Token"
-        Accept = 'application/json'
+        Authorization = "Bearer $Token"
+        Accept = 'application/vnd.github+json'
+        'X-GitHub-Api-Version' = '2022-11-28'
+        'User-Agent' = 'AudioBridge-release-publisher'
     }
 }
 
-function Get-CodebergResourceOrNull {
+function Get-GitHubResourceOrNull {
     param(
         [Parameter(Mandatory)]
         [string] $Uri,
@@ -79,9 +81,6 @@ function Get-CodebergResourceOrNull {
 function Add-ReleaseAsset {
     param(
         [Parameter(Mandatory)]
-        [string] $RepoApi,
-
-        [Parameter(Mandatory)]
         [long] $ReleaseId,
 
         [Parameter(Mandatory)]
@@ -102,14 +101,14 @@ function Add-ReleaseAsset {
         }
         Invoke-RestMethod `
             -Method Delete `
-            -Uri "$RepoApi/releases/$ReleaseId/assets/$($existing.id)" `
+            -Uri "https://api.github.com/repos/$Owner/$Repository/releases/assets/$($existing.id)" `
             -Headers $Headers | Out-Null
     }
 
     $encodedName = [Uri]::EscapeDataString($Artifact.Name)
     return Invoke-RestMethod `
         -Method Post `
-        -Uri "$RepoApi/releases/$ReleaseId/assets?name=$encodedName" `
+        -Uri "https://uploads.github.com/repos/$Owner/$Repository/releases/$ReleaseId/assets?name=$encodedName" `
         -Headers $Headers `
         -ContentType 'application/octet-stream' `
         -InFile $Artifact.FullName
@@ -128,34 +127,17 @@ if ($ValidateOnly) {
     return
 }
 
-$headers = Get-CodebergCredentialHeaders
-$repoApi = "https://codeberg.org/api/v1/repos/$Owner/$Repository"
+$headers = Get-GitHubCredentialHeaders
+$repoApi = "https://api.github.com/repos/$Owner/$Repository"
 $repo = Invoke-RestMethod -Uri $repoApi -Headers $headers
-if ($repo.private) {
+if ($repo.private -or $repo.visibility -ne 'public') {
     throw "$Owner/$Repository must be public before publishing releases."
 }
-if (-not $repo.has_releases) {
+if (-not $repo.has_downloads) {
     throw "Releases are disabled for $Owner/$Repository."
 }
 
-$tagResource = Get-CodebergResourceOrNull `
-    -Uri "$repoApi/tags/$Tag" `
-    -Headers $headers
-if ($null -eq $tagResource) {
-    $tagPayload = @{
-        tag_name = $Tag
-        target = $repo.default_branch
-        message = "AudioBridge $version"
-    } | ConvertTo-Json
-    $tagResource = Invoke-RestMethod `
-        -Method Post `
-        -Uri "$repoApi/tags" `
-        -Headers $headers `
-        -ContentType 'application/json' `
-        -Body $tagPayload
-}
-
-$release = Get-CodebergResourceOrNull `
+$release = Get-GitHubResourceOrNull `
     -Uri "$repoApi/releases/tags/$Tag" `
     -Headers $headers
 if ($null -ne $release -and -not $release.draft) {
@@ -165,11 +147,11 @@ if ($null -ne $release -and -not $release.draft) {
 if ($null -eq $release) {
     $createPayload = @{
         tag_name = $Tag
+        target_commitish = $repo.default_branch
         name = "AudioBridge $version"
         body = 'Release artifacts are being verified.'
         draft = $true
         prerelease = $false
-        hide_archive_links = $true
     } | ConvertTo-Json
     $release = Invoke-RestMethod `
         -Method Post `
@@ -181,13 +163,11 @@ if ($null -eq $release) {
 
 $existingAssets = @($release.assets)
 $uploadedMsi = Add-ReleaseAsset `
-    -RepoApi $repoApi `
     -ReleaseId $release.id `
     -Artifact $msi `
     -Headers $headers `
     -ExistingAssets $existingAssets
 $uploadedApk = Add-ReleaseAsset `
-    -RepoApi $repoApi `
     -ReleaseId $release.id `
     -Artifact $apk `
     -Headers $headers `
@@ -211,7 +191,7 @@ $msiSha = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLow
 $apkSha = (Get-FileHash -LiteralPath $apk.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($ReleaseNotes)) {
     $ReleaseNotes = @(
-        "## Downloads",
+        '## Downloads',
         '',
         "- Windows: $expectedMsiName",
         "- Android: $expectedApkName",
@@ -229,7 +209,7 @@ $publishPayload = @{
     body = $ReleaseNotes
     draft = $false
     prerelease = $false
-    hide_archive_links = $true
+    make_latest = 'true'
 } | ConvertTo-Json
 $published = Invoke-RestMethod `
     -Method Patch `
