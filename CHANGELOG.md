@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.6 - 2026-08-11
+
+- Added an opt-in post-install prompt that verifies and installs the bundled
+  VB-CABLE donationware package for the Windows soundboard.
+- Added an in-app call microphone setup action when the Windows soundboard
+  cannot find a virtual audio cable.
+- Fixed the bundled virtual microphone setup helper when no compatible driver
+  is installed.
+
 ## 1.4.5 - 2026-07-30
 
 - Kept Android media playback active with local silent frames when the Windows

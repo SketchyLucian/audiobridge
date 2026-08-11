@@ -23,9 +23,7 @@
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)">
-        <Directory Id="VIRTUALMICFOLDER" Name="VirtualMic" />
-      </Directory>
+      <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)" />
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
@@ -40,7 +38,7 @@
               Id="VirtualMicSetupShortcut"
               Name="$(var.ProductName) Virtual Mic Setup"
               Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
-              Arguments="-NoExit -NoProfile -ExecutionPolicy Bypass -File &quot;[VIRTUALMICFOLDER]setup_windows_virtual_mic.ps1&quot; -OpenDownloadPage"
+              Arguments="-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]VirtualMic\setup_windows_virtual_mic.ps1&quot; -PromptInstallDriver"
               WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
           <RegistryValue
@@ -56,23 +54,28 @@
 
     <Feature Id="MainFeature" Title="$(var.ProductName)" Level="1">
       <ComponentGroupRef Id="ApplicationFiles" />
-      <ComponentGroupRef Id="VirtualMicSetupFiles" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
+
+    <CustomAction
+        Id="PromptVirtualMicSetupAfterInstall"
+        Directory="System64Folder"
+        ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]VirtualMic\setup_windows_virtual_mic.ps1&quot; -PromptInstallDriver"
+        Execute="immediate"
+        Impersonate="yes"
+        Return="asyncNoWait" />
+
+    <InstallExecuteSequence>
+      <Custom
+          Action="PromptVirtualMicSetupAfterInstall"
+          After="InstallFinalize"
+          Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED AND UILevel &gt;= 4" />
+    </InstallExecuteSequence>
   </Package>
 
   <Fragment>
     <ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
       <Files Include="$(var.BundleDir)\**" />
-    </ComponentGroup>
-
-    <ComponentGroup Id="VirtualMicSetupFiles" Directory="VIRTUALMICFOLDER">
-      <Component Id="VirtualMicSetupScript" Guid="*">
-        <File
-            Id="VirtualMicSetupScriptFile"
-            Source="$(var.RepoRoot)\scripts\setup_windows_virtual_mic.ps1"
-            KeyPath="yes" />
-      </Component>
     </ComponentGroup>
   </Fragment>
 </Wix>

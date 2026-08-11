@@ -119,6 +119,7 @@ class AudioRelayController extends ChangeNotifier {
   String? selectedSoundboardOutputDeviceId;
   double soundboardVolume = 0.82;
   bool soundboardBusy = false;
+  bool soundboardSetupBusy = false;
   String? soundboardMessage;
   String appVersion = _fallbackAppVersion;
   AppUpdateStatus updateStatus = AppUpdateStatus.idle;
@@ -183,7 +184,7 @@ class AudioRelayController extends ChangeNotifier {
     Duration(minutes: 10),
     Duration(minutes: 30),
   ];
-  static const _fallbackAppVersion = '1.4.4';
+  static const _fallbackAppVersion = '1.4.6';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -408,7 +409,14 @@ class AudioRelayController extends ChangeNotifier {
         soundboardOutputDevices.isNotEmpty) {
       return null;
     }
-    return 'No virtual microphone driver found. Install or enable VB-CABLE, then select its microphone in the call app.';
+    return 'A Windows virtual microphone driver is required. Set up the call mic, then select it in the call app.';
+  }
+
+  bool get canSetUpSoundboardCallMicrophone {
+    return canUseSoundboard &&
+        capabilities.platform == 'windows' &&
+        soundboardOutputDevices.isEmpty &&
+        !soundboardSetupBusy;
   }
 
   bool get isNativeUsbTransport => transport == RelayTransport.usb;
@@ -1703,6 +1711,27 @@ class AudioRelayController extends ChangeNotifier {
     selectedSoundboardItem = item;
     _schedulePreferencesSave();
     await playSelectedSoundboardItem();
+  }
+
+  Future<void> setUpSoundboardCallMicrophone() async {
+    if (!canSetUpSoundboardCallMicrophone) {
+      return;
+    }
+
+    soundboardSetupBusy = true;
+    soundboardMessage = 'Opening call microphone setup';
+    notifyListeners();
+    try {
+      await _engine.launchVirtualMicSetup();
+      soundboardMessage =
+          'Setup opened. Install the driver, reboot Windows, then reopen AudioBridge.';
+    } on PlatformException catch (error) {
+      soundboardMessage =
+          error.message ?? 'Unable to open call microphone setup.';
+    } finally {
+      soundboardSetupBusy = false;
+      notifyListeners();
+    }
   }
 
   Future<void> playSelectedSoundboardItem() async {

@@ -18,6 +18,24 @@ $pubspecPath = Join-Path $repoRoot 'pubspec.yaml'
 $wixProjectPath = Join-Path $repoRoot 'installer\windows\AudioBridge.Installer.wixproj'
 $bundleDir = Join-Path $repoRoot "build\windows\x64\runner\$Configuration"
 $executablePath = Join-Path $bundleDir 'AudioBridge.exe'
+$vbCableSourcePath = Join-Path $repoRoot 'third_party\vb-cable\VBCABLE_Driver_Pack45.zip'
+$vbCableBundlePath = Join-Path $bundleDir 'VirtualMic\VBCABLE_Driver_Pack45.zip'
+$vbCableExpectedSha256 = 'B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB'
+
+function Assert-VbCablePackage {
+    param([string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Bundled VB-CABLE package not found at $Path."
+    }
+
+    $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+    if ($actualHash -ne $vbCableExpectedSha256) {
+        throw "Bundled VB-CABLE package failed its integrity check at $Path."
+    }
+}
+
+Assert-VbCablePackage -Path $vbCableSourcePath
 
 if (-not $ProductVersion) {
     $versionLine = Get-Content $pubspecPath | Where-Object { $_ -match '^\s*version:\s*([0-9]+\.[0-9]+\.[0-9]+)(?:\+[0-9]+)?\s*$' } | Select-Object -First 1
@@ -49,6 +67,8 @@ if (-not $SkipFlutterBuild) {
 if (-not (Test-Path $executablePath)) {
     throw "Windows release bundle not found at $bundleDir. Run flutter build windows --release first, or omit -SkipFlutterBuild."
 }
+
+Assert-VbCablePackage -Path $vbCableBundlePath
 
 $dotnetCommand = Get-Command dotnet -ErrorAction SilentlyContinue
 if (-not $dotnetCommand) {

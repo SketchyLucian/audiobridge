@@ -354,6 +354,8 @@ abstract interface class AudioRelayEngine {
     String? outputDeviceId,
   });
 
+  Future<void> launchVirtualMicSetup();
+
   Future<void> stopSoundEffects();
 
   Future<void> disconnect();
@@ -485,6 +487,11 @@ class MethodChannelAudioRelayEngine implements AudioRelayEngine {
       'enabled': enabled,
       'outputDeviceId': ?outputDeviceId,
     });
+  }
+
+  @override
+  Future<void> launchVirtualMicSetup() {
+    return _invoke('launchVirtualMicSetup');
   }
 
   @override

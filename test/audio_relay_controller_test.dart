@@ -2004,6 +2004,45 @@ void main() {
     controller.dispose();
   });
 
+  test('soundboard opens bundled call microphone setup', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..capabilities = _soundboardPhysicalOnlyCapabilities;
+
+    expect(controller.canSetUpSoundboardCallMicrophone, true);
+
+    await controller.setUpSoundboardCallMicrophone();
+
+    expect(engine.calls, ['launchVirtualMicSetup']);
+    expect(
+      controller.soundboardMessage,
+      'Setup opened. Install the driver, reboot Windows, then reopen AudioBridge.',
+    );
+    expect(controller.soundboardSetupBusy, false);
+
+    controller.dispose();
+  });
+
+  test('soundboard exposes call microphone setup failures', () async {
+    final engine = _FakeAudioRelayEngine(
+      virtualMicSetupError: PlatformException(
+        code: 'virtual_mic_setup',
+        message: 'Call microphone setup is missing.',
+      ),
+    );
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..capabilities = _soundboardPhysicalOnlyCapabilities;
+
+    await controller.setUpSoundboardCallMicrophone();
+
+    expect(controller.soundboardMessage, 'Call microphone setup is missing.');
+    expect(controller.soundboardSetupBusy, false);
+
+    controller.dispose();
+  });
+
   test('soundboard virtual mic prefers direct cable routes', () {
     final controller = AudioRelayController(engine: _FakeAudioRelayEngine())
       ..role = RelayRole.sender
@@ -3099,11 +3138,13 @@ Future<void> _pumpEventQueue() async {
 class _FakeAudioRelayEngine implements AudioRelayEngine {
   _FakeAudioRelayEngine({
     this.prepareUsbError,
+    this.virtualMicSetupError,
     PlatformAudioCapabilities? capabilities,
     this.capabilitiesGate,
   }) : capabilities = capabilities ?? PlatformAudioCapabilities.fallback();
 
   final PlatformException? prepareUsbError;
+  final PlatformException? virtualMicSetupError;
   final PlatformAudioCapabilities capabilities;
   final Completer<void>? capabilitiesGate;
   final List<String> calls = [];
@@ -3202,6 +3243,15 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   }) async {
     virtualMicPassthroughEnabled.add(enabled);
     virtualMicPassthroughOutputDeviceIds.add(outputDeviceId);
+  }
+
+  @override
+  Future<void> launchVirtualMicSetup() async {
+    calls.add('launchVirtualMicSetup');
+    final error = virtualMicSetupError;
+    if (error != null) {
+      throw error;
+    }
   }
 
   @override

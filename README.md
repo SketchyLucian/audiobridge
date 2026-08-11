@@ -135,11 +135,16 @@ The tag-triggered release workflow builds both platforms and calls
 and `CODEBERG_RELEASE_TOKEN`; missing credentials or either missing artifact
 fails the workflow without publishing a partial release.
 
-The MSI also installs an `AudioBridge Virtual Mic Setup` Start menu shortcut.
-Run it after installation to check for a supported virtual cable driver and, if
-needed, open the official VB-CABLE setup page. Install the VB-CABLE driver as
-Administrator and reboot Windows before selecting `CABLE Input` in AudioBridge
-and `CABLE Output` in the call app.
+After a new interactive MSI installation, AudioBridge asks whether to install
+the bundled VB-CABLE driver when no supported virtual audio cable is present.
+VB-CABLE is third-party donationware from VB-Audio Software; the prompt links
+to its origin and licensing page. If accepted, Windows requests administrator
+approval, verifies the bundled vendor package and driver signatures, and runs
+the vendor installer. Reboot Windows before selecting `CABLE Input` in
+AudioBridge and `CABLE Output` in the call app.
+
+The same setup remains available from the Soundboard's `Set up call mic`
+button and the `AudioBridge Virtual Mic Setup` Start menu shortcut.
 
 For USB tethering, enable USB tethering on Android, keep the device attached,
 and select `USB tether` in both apps. The sender and receiver still use UDP

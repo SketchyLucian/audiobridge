@@ -713,6 +713,24 @@ class _SoundboardPanel extends StatelessWidget {
                   ),
                   child: _CallMicrophonePicker(controller: controller),
                 ),
+              if (controller.soundboardTarget ==
+                      SoundboardPlaybackTarget.micRoute &&
+                  controller.soundboardOutputDevices.isEmpty)
+                OutlinedButton.icon(
+                  onPressed: controller.canSetUpSoundboardCallMicrophone
+                      ? controller.setUpSoundboardCallMicrophone
+                      : null,
+                  icon: Icon(
+                    controller.soundboardSetupBusy
+                        ? Icons.hourglass_top_rounded
+                        : Icons.settings_rounded,
+                  ),
+                  label: Text(
+                    controller.soundboardSetupBusy
+                        ? 'Opening setup'
+                        : 'Set up call mic',
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 12),

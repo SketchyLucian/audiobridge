@@ -10,11 +10,13 @@ app can already send soundboard audio to a render endpoint. A call app can only
 select that audio as a microphone when Windows has a matching capture endpoint.
 Creating that capture endpoint requires a Windows audio driver.
 
-End-user setup is included in the Windows MSI as an `AudioBridge Virtual Mic
-Setup` Start menu shortcut. That setup helper detects supported virtual cable
-drivers such as VB-CABLE or Voicemeeter and opens the official VB-CABLE setup
-page when no compatible cable is present. The app-owned AudioBridge driver work
-below remains separate until it is complete and production-signed.
+End-user setup is included in the Windows MSI. A new interactive installation
+offers to install the bundled, unchanged VB-CABLE vendor package when no
+compatible cable is present. The prompt identifies VB-CABLE as third-party
+donationware, and the helper verifies the pinned package hash and vendor/driver
+signatures before requesting elevation. Setup is also available from the
+Soundboard and Start menu. The app-owned AudioBridge driver work below remains
+separate until it is complete and production-signed.
 
 ## Target Design
 

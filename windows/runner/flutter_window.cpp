@@ -188,6 +188,34 @@ bool LaunchWindowsInstallerAndRestart(const std::string& installer_path) {
   return reinterpret_cast<intptr_t>(outcome) > 32;
 }
 
+std::optional<std::string> LaunchVirtualMicSetup() {
+  const std::wstring executable_path = CurrentExecutablePath();
+  const size_t separator = executable_path.find_last_of(L"\\/");
+  if (executable_path.empty() || separator == std::wstring::npos) {
+    return "Unable to locate the AudioBridge installation.";
+  }
+
+  const std::wstring setup_path =
+      executable_path.substr(0, separator + 1) +
+      L"VirtualMic\\setup_windows_virtual_mic.ps1";
+  const DWORD attributes = GetFileAttributesW(setup_path.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES ||
+      (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    return "Call microphone setup is missing. Repair or reinstall AudioBridge.";
+  }
+
+  const std::wstring parameters =
+      L"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" +
+      setup_path + L"\" -PromptInstallDriver";
+  const HINSTANCE outcome = ShellExecuteW(
+      nullptr, L"open", L"powershell.exe", parameters.c_str(), nullptr,
+      SW_SHOWNORMAL);
+  if (reinterpret_cast<intptr_t>(outcome) <= 32) {
+    return "Unable to open call microphone setup.";
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
@@ -302,6 +330,11 @@ bool FlutterWindow::OnCreate() {
         if (method == "configureVirtualMicPassthrough") {
           ReturnError(result, native_audio_engine_->ConfigureVirtualMicPassthrough(
                                   call.arguments()));
+          return;
+        }
+
+        if (method == "launchVirtualMicSetup") {
+          ReturnError(result, LaunchVirtualMicSetup());
           return;
         }
 
