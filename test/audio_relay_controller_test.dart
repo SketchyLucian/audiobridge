@@ -2965,6 +2965,7 @@ void main() {
     expect(publisher, contains("draft = \$true"));
     expect(publisher, contains("draft = \$false"));
     expect(publisher, contains('Android installation notice'));
+    expect(publisher, isNot(contains('has_downloads')));
   });
 
   test('usb sender reports native usb setup failures', () async {

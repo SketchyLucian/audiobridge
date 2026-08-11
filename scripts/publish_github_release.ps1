@@ -135,8 +135,8 @@ $repo = Invoke-RestMethod -Uri $repoApi -Headers $headers
 if ($repo.private -or $repo.visibility -ne 'public') {
     throw "$Owner/$Repository must be public before publishing releases."
 }
-if (-not $repo.has_downloads) {
-    throw "Releases are disabled for $Owner/$Repository."
+if ($repo.archived -or $repo.disabled) {
+    throw "$Owner/$Repository must be active before publishing releases."
 }
 
 $release = Get-GitHubResourceOrNull `
