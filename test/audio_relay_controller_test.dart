@@ -2141,6 +2141,31 @@ void main() {
     },
   );
 
+  test('receiver ignores a new connection while already streaming', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.receiver
+      ..activity = RelayActivity.streaming;
+    final device = RelayDevice(
+      id: 'source-1',
+      name: 'Windows source',
+      host: '192.168.1.25',
+      port: DiscoveryService.audioPort,
+      transport: RelayTransport.wifi,
+      platform: DevicePlatform.windows,
+      profile: AudioPreset.balanced.profile,
+      lastSeen: DateTime(2026),
+    );
+
+    await controller.connectToDevice(device);
+
+    expect(engine.calls, isEmpty);
+    expect(controller.selectedDevice, isNull);
+    expect(controller.activity, RelayActivity.streaming);
+
+    controller.dispose();
+  });
+
   test('usb sender prepares the usb native transport', () async {
     final engine = _FakeAudioRelayEngine();
     final controller =

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.7 - 2026-08-12
+
+- Connected to an available receiver source as soon as its device row is
+  selected, without requiring a separate Connect action.
+
 ## 1.4.6 - 2026-08-11
 
 - Added an opt-in post-install prompt that verifies and installs the bundled

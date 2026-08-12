@@ -40,7 +40,9 @@ const _soundboardAudioTypeGroup = XTypeGroup(
 );
 
 class AudioRelayScreen extends StatefulWidget {
-  const AudioRelayScreen({super.key});
+  const AudioRelayScreen({super.key, this.controller});
+
+  final AudioRelayController? controller;
 
   @override
   State<AudioRelayScreen> createState() => _AudioRelayScreenState();
@@ -49,11 +51,13 @@ class AudioRelayScreen extends StatefulWidget {
 class _AudioRelayScreenState extends State<AudioRelayScreen> {
   late final AudioRelayController controller;
   late final AppLifecycleListener _lifecycleListener;
+  late final bool _ownsController;
 
   @override
   void initState() {
     super.initState();
-    controller = AudioRelayController();
+    controller = widget.controller ?? AudioRelayController();
+    _ownsController = widget.controller == null;
     _lifecycleListener = AppLifecycleListener(
       onStateChange: (state) {
         if (state == AppLifecycleState.inactive ||
@@ -68,14 +72,18 @@ class _AudioRelayScreenState extends State<AudioRelayScreen> {
         return AppExitResponse.exit;
       },
     );
-    controller.initialize();
+    if (_ownsController) {
+      controller.initialize();
+    }
   }
 
   @override
   void dispose() {
     _lifecycleListener.dispose();
-    unawaited(controller.flushPreferences());
-    controller.dispose();
+    if (_ownsController) {
+      unawaited(controller.flushPreferences());
+      controller.dispose();
+    }
     super.dispose();
   }
 
@@ -583,11 +591,21 @@ class _PrimaryControls extends StatelessWidget {
           )
         else if (connectionTarget != null)
           FilledButton.icon(
-            onPressed: () {
-              controller.connectToDevice(connectionTarget);
-            },
-            icon: const Icon(Icons.cable_rounded),
-            label: const Text('Connect'),
+            onPressed: controller.isBusy
+                ? null
+                : () {
+                    unawaited(controller.connectToDevice(connectionTarget));
+                  },
+            icon: Icon(
+              controller.activity == RelayActivity.connecting
+                  ? Icons.hourglass_top_rounded
+                  : Icons.cable_rounded,
+            ),
+            label: Text(
+              controller.activity == RelayActivity.connecting
+                  ? 'Connecting'
+                  : 'Connect',
+            ),
           )
         else
           FilledButton.icon(
@@ -644,9 +662,11 @@ class _DevicesPanel extends StatelessWidget {
                   _DeviceRow(
                     device: device,
                     selected: controller.isDeviceSelected(device),
-                    onTap: () {
-                      controller.selectDevice(device);
-                    },
+                    onTap: controller.isBusy || controller.isStreaming
+                        ? null
+                        : () {
+                            unawaited(controller.connectToDevice(device));
+                          },
                   ),
               ],
             ),
@@ -2477,7 +2497,7 @@ class _DeviceRow extends StatelessWidget {
 
   final RelayDevice device;
   final bool selected;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -2489,6 +2509,7 @@ class _DeviceRow extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: InkWell(
+        key: ValueKey('available-source-${device.id}'),
         borderRadius: BorderRadius.circular(8),
         onTap: onTap,
         child: Ink(

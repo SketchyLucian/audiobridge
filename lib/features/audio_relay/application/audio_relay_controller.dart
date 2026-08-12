@@ -184,7 +184,7 @@ class AudioRelayController extends ChangeNotifier {
     Duration(minutes: 10),
     Duration(minutes: 30),
   ];
-  static const _fallbackAppVersion = '1.4.6';
+  static const _fallbackAppVersion = '1.4.7';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -1168,7 +1168,7 @@ class AudioRelayController extends ChangeNotifier {
   }
 
   Future<void> connectToDevice(RelayDevice device) async {
-    if (role != RelayRole.receiver || isBusy) {
+    if (role != RelayRole.receiver || isBusy || isStreaming) {
       return;
     }
 
@@ -1387,13 +1387,6 @@ class AudioRelayController extends ChangeNotifier {
       updateMessage = error.message ?? 'Unable to open release page.';
       notifyListeners();
     }
-  }
-
-  void selectDevice(RelayDevice device) {
-    selectedDevice = device;
-    profile = _receiverProfileFor(device.profile);
-    selectedPreset = profile.mode;
-    notifyListeners();
   }
 
   bool isCodecSupported(AudioCodec codec) {
