@@ -119,6 +119,7 @@ class AudioRelayController extends ChangeNotifier {
   String? selectedSoundboardOutputDeviceId;
   double soundboardVolume = 0.82;
   bool soundboardBusy = false;
+  bool soundboardMicBridgeEnabled = false;
   bool soundboardSetupBusy = false;
   String? soundboardMessage;
   String appVersion = _fallbackAppVersion;
@@ -184,7 +185,7 @@ class AudioRelayController extends ChangeNotifier {
     Duration(minutes: 10),
     Duration(minutes: 30),
   ];
-  static const _fallbackAppVersion = '1.4.7';
+  static const _fallbackAppVersion = '1.4.8';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -342,14 +343,15 @@ class AudioRelayController extends ChangeNotifier {
         soundboardOutputDevices.isEmpty) {
       return 'Needs call mic';
     }
-    if (!isStreaming) {
-      return soundboardTarget == SoundboardPlaybackTarget.stream
-          ? 'Start stream'
-          : 'Mic + speaker';
+    if (soundboardTarget == SoundboardPlaybackTarget.micRoute) {
+      return soundboardMicBridgeEnabled
+          ? 'Microphone included'
+          : 'Soundboard only';
     }
-    return soundboardTarget == SoundboardPlaybackTarget.stream
-        ? 'Stream mix'
-        : 'Mic + speaker';
+    if (!isStreaming) {
+      return 'Start stream';
+    }
+    return 'Stream mix';
   }
 
   List<SoundboardOutputDevice> get soundboardOutputDevices {
@@ -1698,6 +1700,24 @@ class AudioRelayController extends ChangeNotifier {
     _syncVirtualMicPassthrough();
     notifyListeners();
     _schedulePreferencesSave();
+  }
+
+  void updateSoundboardMicBridgeEnabled(bool value) {
+    if (value && selectedSoundboardOutputDevice == null) {
+      soundboardMessage = 'Select the call app microphone first.';
+      notifyListeners();
+      return;
+    }
+    if (soundboardMicBridgeEnabled == value) {
+      return;
+    }
+
+    soundboardMicBridgeEnabled = value;
+    soundboardMessage = value
+        ? 'Physical microphone included. Use headphones to prevent echo.'
+        : 'Physical microphone bridge off.';
+    _syncVirtualMicPassthrough();
+    notifyListeners();
   }
 
   Future<void> playSoundboardItem(SoundPlaybackItem item) async {
@@ -3632,6 +3652,7 @@ class AudioRelayController extends ChangeNotifier {
     final shouldEnable =
         canUseSoundboard &&
         soundboardTarget == SoundboardPlaybackTarget.micRoute &&
+        soundboardMicBridgeEnabled &&
         device != null;
     final nextDeviceId = shouldEnable ? device.id : null;
 

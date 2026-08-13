@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.8 - 2026-08-13
+
+- Prevented idle VB-CABLE soundboard routing from continuously forwarding the
+  physical microphone and causing speaker echo.
+- Added an explicit, session-only physical microphone bridge control with a
+  headphone warning. The bridge is off by default.
+
 ## 1.4.7 - 2026-08-12
 
 - Connected to an available receiver source as soon as its device row is

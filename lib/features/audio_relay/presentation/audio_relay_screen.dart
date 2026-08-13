@@ -753,6 +753,26 @@ class _SoundboardPanel extends StatelessWidget {
                 ),
             ],
           ),
+          if (controller.soundboardTarget ==
+                  SoundboardPlaybackTarget.micRoute &&
+              controller.soundboardOutputDevices.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: SwitchListTile.adaptive(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Include physical microphone'),
+                subtitle: const Text(
+                  'Off by default to prevent speaker audio from echoing into '
+                  'VB-CABLE. Use headphones when this is on.',
+                ),
+                value: controller.soundboardMicBridgeEnabled,
+                onChanged: controller.canUseSoundboard
+                    ? controller.updateSoundboardMicBridgeEnabled
+                    : null,
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           Wrap(
             spacing: 10,

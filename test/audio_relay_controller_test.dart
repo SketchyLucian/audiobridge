@@ -1954,8 +1954,8 @@ void main() {
     controller.addSoundboardFiles([soundPath]);
     await controller.playSelectedSoundboardItem();
 
-    expect(engine.virtualMicPassthroughEnabled, [true]);
-    expect(engine.virtualMicPassthroughOutputDeviceIds, ['route-1']);
+    expect(engine.virtualMicPassthroughEnabled, isEmpty);
+    expect(engine.virtualMicPassthroughOutputDeviceIds, isEmpty);
     expect(engine.calls, ['playSoundEffect']);
     expect(engine.soundEffectTargets, [SoundboardPlaybackTarget.micRoute]);
     expect(engine.soundEffectOutputDeviceIds, ['route-1']);
@@ -1963,22 +1963,46 @@ void main() {
     controller.dispose();
   });
 
-  test('soundboard virtual mic bridges the real microphone into the route', () {
+  test(
+    'soundboard physical microphone bridge is explicit and session-only',
+    () {
+      final engine = _FakeAudioRelayEngine();
+      final controller = AudioRelayController(engine: engine)
+        ..role = RelayRole.sender
+        ..capabilities = _soundboardCapabilities;
+
+      controller.selectSoundboardOutputDevice('route-1');
+      expect(engine.virtualMicPassthroughEnabled, isEmpty);
+
+      controller.updateSoundboardMicBridgeEnabled(true);
+      controller.updateSoundboardTarget(SoundboardPlaybackTarget.stream);
+      controller.updateSoundboardTarget(SoundboardPlaybackTarget.micRoute);
+
+      expect(engine.virtualMicPassthroughEnabled, [true, false, true]);
+      expect(engine.virtualMicPassthroughOutputDeviceIds, [
+        'route-1',
+        null,
+        'route-1',
+      ]);
+      expect(controller.soundboardMicBridgeEnabled, true);
+
+      controller.dispose();
+    },
+  );
+
+  test('soundboard physical microphone bridge can be turned off', () {
     final engine = _FakeAudioRelayEngine();
     final controller = AudioRelayController(engine: engine)
       ..role = RelayRole.sender
       ..capabilities = _soundboardCapabilities;
 
     controller.selectSoundboardOutputDevice('route-1');
-    controller.updateSoundboardTarget(SoundboardPlaybackTarget.stream);
-    controller.updateSoundboardTarget(SoundboardPlaybackTarget.micRoute);
+    controller.updateSoundboardMicBridgeEnabled(true);
+    controller.updateSoundboardMicBridgeEnabled(false);
 
-    expect(engine.virtualMicPassthroughEnabled, [true, false, true]);
-    expect(engine.virtualMicPassthroughOutputDeviceIds, [
-      'route-1',
-      null,
-      'route-1',
-    ]);
+    expect(engine.virtualMicPassthroughEnabled, [true, false]);
+    expect(engine.virtualMicPassthroughOutputDeviceIds, ['route-1', null]);
+    expect(controller.soundboardMicBridgeEnabled, false);
 
     controller.dispose();
   });
