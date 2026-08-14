@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.9 - 2026-08-14
+
+- Prevented steady sender and receiver clock differences from being mistaken
+  for worsening network jitter in the Balanced adaptive buffer.
+- Smoothed Android and Windows playback queue recovery so excess latency drains
+  gradually instead of causing periodic whole-packet drops and audio stutter.
+
 ## 1.4.8 - 2026-08-13
 
 - Prevented idle VB-CABLE soundboard routing from continuously forwarding the
