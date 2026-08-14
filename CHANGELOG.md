@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.10 - 2026-08-14
+
+- Rolled back the 1.4.9 playback drift correction because its packet-level
+  timing adjustments could introduce audible jitter across all presets.
+- Restored the known-good 1.4.8 adaptive buffering behavior while a
+  continuous-stream replacement is validated separately.
+
 ## 1.4.9 - 2026-08-14
 
 - Prevented steady sender and receiver clock differences from being mistaken
