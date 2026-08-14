@@ -213,6 +213,8 @@ constexpr int64_t kAdaptiveSequenceResetGap = 50;
 constexpr int kAdaptiveNetworkTargetHysteresisMs = 3;
 constexpr int kAdaptiveFastRelaxMarginMs = 8;
 constexpr double kAdaptiveAudibleSignalFloor = 0.001;
+constexpr int kPlaybackCatchUpGuardMs = 4;
+constexpr int kPlaybackCatchUpMaxReductionDivisor = 50;
 
 DEFINE_GUID(kAndroidWinUsbInterfaceGuid, 0xf72fe0d4, 0xcbcb, 0x407d, 0x88,
             0x14, 0x9e, 0xd6, 0x73, 0xd0, 0xdd, 0x6b);
@@ -247,6 +249,46 @@ int AdaptiveBufferIncreaseTargetMs(int current_ms, int step_ms,
   return pressure_increase || network_floor_increase
              ? std::max(step_target_ms, network_floor_ms)
              : step_target_ms;
+}
+
+int PlaybackCatchUpFrameCount(int packet_frames, int64_t queued_frames,
+                              int64_t target_frames, int sample_rate) {
+  if (packet_frames <= 0) {
+    return 0;
+  }
+  if (sample_rate <= 0 || target_frames <= 0) {
+    return packet_frames;
+  }
+
+  const int64_t guard_frames =
+      std::max<int64_t>(packet_frames,
+                        static_cast<int64_t>(sample_rate) *
+                            kPlaybackCatchUpGuardMs / 1000);
+  const int64_t excess_frames =
+      queued_frames - target_frames - guard_frames;
+  if (excess_frames <= 0) {
+    return packet_frames;
+  }
+
+  const int64_t correction_range_frames =
+      std::max<int64_t>(target_frames,
+                        static_cast<int64_t>(sample_rate) * 20 / 1000);
+  const int64_t proportional_reduction =
+      (excess_frames * packet_frames + correction_range_frames - 1) /
+      correction_range_frames;
+  const int max_reduction =
+      std::max(1, (packet_frames + kPlaybackCatchUpMaxReductionDivisor - 1) /
+                      kPlaybackCatchUpMaxReductionDivisor);
+  const int frames_to_remove = static_cast<int>(
+      std::clamp<int64_t>(proportional_reduction, 1, max_reduction));
+  return std::max(1, packet_frames - frames_to_remove);
+}
+
+double PacketArrivalDelaySampleMs(double elapsed_ms, double expected_ms) {
+  if (!std::isfinite(elapsed_ms) || !std::isfinite(expected_ms)) {
+    return 0.0;
+  }
+  return std::clamp(elapsed_ms - expected_ms, 0.0, kAdaptiveDelayMaxMs);
 }
 
 enum class TransportMode {
@@ -4849,9 +4891,11 @@ class WindowsAudioEngine::Impl {
       playback_queue_frames_ += frames;
       AdaptLocalPlaybackBuffer(sample_rate, playback_queue_frames_.load());
       const int target_frames = LocalAdaptiveTargetFrames(sample_rate);
-      const int soft_limit = std::max(target_frames * 2, target_frames + frames);
+      const int hard_limit =
+          std::max(target_frames * 3,
+                   target_frames + sample_rate * 50 / 1000);
       while (!playback_queue_.empty() &&
-             playback_queue_frames_.load() > soft_limit) {
+             playback_queue_frames_.load() > hard_limit) {
         playback_queue_frames_ -=
             static_cast<int64_t>(playback_queue_.front().pcm.size()) /
             std::max(1, playback_queue_.front().channels);
@@ -4996,8 +5040,7 @@ class WindowsAudioEngine::Impl {
     const double expected_ms =
         local_adaptive_last_packet_duration_ms_ * sequence_delta;
     local_adaptive_relative_delay_ms_ =
-        std::clamp(local_adaptive_relative_delay_ms_ + elapsed_ms - expected_ms,
-                   0.0, kAdaptiveDelayMaxMs);
+        PacketArrivalDelaySampleMs(elapsed_ms, expected_ms);
     if (local_adaptive_delay_window_start_at_ms_ <= 0) {
       local_adaptive_delay_window_start_at_ms_ =
           local_adaptive_last_arrival_at_ms_;
@@ -5381,6 +5424,7 @@ class WindowsAudioEngine::Impl {
     bool needs_prebuffer = true;
     while (playback_running_) {
       PcmPlaybackPacket packet;
+      int64_t queued_frames_before_render = 0;
       {
         std::unique_lock lock(playback_queue_mutex_);
         playback_queue_cv_.wait_for(lock, std::chrono::milliseconds(20), [this, needs_prebuffer] {
@@ -5408,9 +5452,23 @@ class WindowsAudioEngine::Impl {
         }
         packet = std::move(playback_queue_.front());
         playback_queue_.pop_front();
+        queued_frames_before_render = playback_queue_frames_.load();
       }
 
-      const auto output = ReformatPcm(packet.pcm, packet.sample_rate,
+      const int packet_frames = static_cast<int>(packet.pcm.size()) /
+                                std::max(1, packet.channels);
+      const int catch_up_frames = PlaybackCatchUpFrameCount(
+          packet_frames, queued_frames_before_render,
+          LocalAdaptiveTargetFrames(packet.sample_rate), packet.sample_rate);
+      std::vector<int16_t> catch_up_pcm;
+      const std::vector<int16_t>* playback_pcm = &packet.pcm;
+      if (catch_up_frames < packet_frames) {
+        catch_up_pcm = ReformatPcm(packet.pcm, packet_frames, packet.channels,
+                                   catch_up_frames, packet.channels);
+        playback_pcm = &catch_up_pcm;
+      }
+
+      const auto output = ReformatPcm(*playback_pcm, packet.sample_rate,
                                       packet.channels,
                                       mix_format->nSamplesPerSec,
                                       mix_format->nChannels);

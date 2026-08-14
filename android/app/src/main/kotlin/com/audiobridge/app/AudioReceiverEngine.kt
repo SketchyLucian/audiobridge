@@ -125,6 +125,8 @@ private const val ADAPTIVE_SEQUENCE_RESET_GAP = 50L
 private const val ADAPTIVE_NETWORK_TARGET_HYSTERESIS_MS = 5
 private const val ADAPTIVE_FAST_RELAX_MARGIN_MS = 8
 private const val ADAPTIVE_AUDIBLE_SIGNAL_FLOOR = 0.001
+private const val PLAYBACK_CATCH_UP_GUARD_MS = 4
+private const val PLAYBACK_CATCH_UP_MAX_REDUCTION_DIVISOR = 50
 private const val ADAPTIVE_LINK_MEMORY_PREFS = "audio_bridge_adaptive_link_memory"
 private const val ADAPTIVE_LINK_MEMORY_VERSION = 1
 private const val ADAPTIVE_LINK_MEMORY_MAX_AGE_MS = 14L * 24L * 60L * 60L * 1000L
@@ -208,6 +210,53 @@ internal fun adaptiveBufferIncreaseTargetMs(
     } else {
         stepTargetMs
     }
+}
+
+internal fun playbackCatchUpFrameCount(
+    packetFrames: Int,
+    queuedFrames: Long,
+    targetFrames: Long,
+    sampleRate: Int
+): Int {
+    if (packetFrames <= 0) {
+        return 0
+    }
+    if (sampleRate <= 0 || targetFrames <= 0L) {
+        return packetFrames
+    }
+
+    val guardFrames = max(
+        packetFrames.toLong(),
+        sampleRate.toLong() * PLAYBACK_CATCH_UP_GUARD_MS / 1000L
+    )
+    val excessFrames = queuedFrames - targetFrames - guardFrames
+    if (excessFrames <= 0L) {
+        return packetFrames
+    }
+
+    val correctionRangeFrames = max(
+        targetFrames,
+        sampleRate.toLong() * 20L / 1000L
+    )
+    val proportionalReduction =
+        (excessFrames * packetFrames + correctionRangeFrames - 1L) /
+            correctionRangeFrames
+    val maxReduction = max(
+        1,
+        (packetFrames + PLAYBACK_CATCH_UP_MAX_REDUCTION_DIVISOR - 1) /
+            PLAYBACK_CATCH_UP_MAX_REDUCTION_DIVISOR
+    )
+    val framesToRemove = proportionalReduction
+        .coerceIn(1L, maxReduction.toLong())
+        .toInt()
+    return max(1, packetFrames - framesToRemove)
+}
+
+internal fun packetArrivalDelaySampleMs(elapsedMs: Double, expectedMs: Double): Double {
+    if (!elapsedMs.isFinite() || !expectedMs.isFinite()) {
+        return 0.0
+    }
+    return (elapsedMs - expectedMs).coerceIn(0.0, ADAPTIVE_DELAY_MAX_MS)
 }
 
 internal fun acceptsSessionPacket(expectedSessionId: Long, packetSessionId: Long): Boolean {
@@ -3206,9 +3255,9 @@ class AudioReceiverEngine(private val context: Context) {
             releaseAudioTrack()
         }
 
-        val playbackPayload: ByteArray
-        val playbackPayloadOffset: Int
-        val playbackPayloadSize: Int
+        var playbackPayload: ByteArray
+        var playbackPayloadOffset: Int
+        var playbackPayloadSize: Int
         if (sampleRate == playbackSampleRate) {
             resetPcmReformatter(sampleRate, channels, playbackSampleRate)
             playbackPayload = data
@@ -3235,8 +3284,30 @@ class AudioReceiverEngine(private val context: Context) {
 
         val track = ensureAudioTrack(playbackSampleRate, channels) ?: return
         currentInputSampleRate = sampleRate
-        val playbackPayloadFrames = playbackPayloadSize / bytesPerFrame
         val packetReceivedAtReceiverMs = SystemClock.elapsedRealtime()
+        var playbackPayloadFrames = playbackPayloadSize / bytesPerFrame
+        val queuedFramesBeforeWrite = max(
+            0L,
+            writtenFrames.get() - playbackFrames(track)
+        )
+        val catchUpFrames = playbackCatchUpFrameCount(
+            packetFrames = playbackPayloadFrames,
+            queuedFrames = queuedFramesBeforeWrite,
+            targetFrames = adaptiveTargetFrames(playbackSampleRate).toLong(),
+            sampleRate = playbackSampleRate
+        )
+        if (catchUpFrames < playbackPayloadFrames) {
+            playbackPayload = resamplePcm16FrameCount(
+                data = playbackPayload,
+                offset = playbackPayloadOffset,
+                inputFrames = playbackPayloadFrames,
+                outputFrames = catchUpFrames,
+                channels = channels
+            )
+            playbackPayloadOffset = 0
+            playbackPayloadSize = playbackPayload.size
+            playbackPayloadFrames = catchUpFrames
+        }
         val networkSampleMs = estimateNetworkLatencyMs(
             packetReceivedAtReceiverMs = packetReceivedAtReceiverMs,
             senderSendTimeMs = senderSendTimeMs,
@@ -3548,7 +3619,6 @@ class AudioReceiverEngine(private val context: Context) {
         val queuedFrames = max(0L, writtenFrames.get() - playbackFrames(track))
         val targetFrames = adaptiveTargetFrames(sampleRate).toLong()
         val packetFrames = max(1L, payloadFrames.toLong())
-        val softLimit = max(targetFrames + packetFrames * 2L, targetFrames * 3L / 2L)
         val hardLimit = max(targetFrames * 3L, targetFrames + sampleRate * 50L / 1000L)
 
         when (
@@ -3580,11 +3650,50 @@ class AudioReceiverEngine(private val context: Context) {
             }
         }
 
-        if (queuedFrames > softLimit) {
-            droppedPackets.incrementAndGet()
-            return true
-        }
         return false
+    }
+
+    private fun resamplePcm16FrameCount(
+        data: ByteArray,
+        offset: Int,
+        inputFrames: Int,
+        outputFrames: Int,
+        channels: Int
+    ): ByteArray {
+        val channelCount = max(1, channels)
+        val boundedOutputFrames = outputFrames.coerceIn(1, inputFrames)
+        val output = ByteArray(boundedOutputFrames * channelCount * 2)
+        if (boundedOutputFrames == inputFrames) {
+            data.copyInto(
+                destination = output,
+                destinationOffset = 0,
+                startIndex = offset,
+                endIndex = offset + output.size
+            )
+            return output
+        }
+
+        for (outputFrame in 0 until boundedOutputFrames) {
+            val sourcePosition = if (boundedOutputFrames == 1) {
+                0.0
+            } else {
+                outputFrame.toDouble() * (inputFrames - 1) / (boundedOutputFrames - 1)
+            }
+            val leftFrame = floor(sourcePosition).toInt().coerceIn(0, inputFrames - 1)
+            val rightFrame = min(leftFrame + 1, inputFrames - 1)
+            val fraction = sourcePosition - leftFrame
+            for (channel in 0 until channelCount) {
+                val left = readPcm16Frame(data, offset, leftFrame, channelCount, channel)
+                val right = readPcm16Frame(data, offset, rightFrame, channelCount, channel)
+                val sample = (left + (right - left) * fraction)
+                    .roundToInt()
+                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    .toShort()
+                val outputOffset = (outputFrame * channelCount + channel) * 2
+                writePcm16(output, outputOffset, sample)
+            }
+        }
+        return output
     }
 
     private fun writeSilence(track: AudioTrack, payloadSize: Int): Int {
@@ -4019,8 +4128,7 @@ class AudioReceiverEngine(private val context: Context) {
 
         val elapsedMs = (now - adaptiveLastArrivalAtMs).coerceAtLeast(0L).toDouble()
         val expectedMs = adaptiveLastPacketDurationMs * sequenceDelta.toDouble()
-        adaptiveRelativeDelayMs = (adaptiveRelativeDelayMs + elapsedMs - expectedMs)
-            .coerceIn(0.0, ADAPTIVE_DELAY_MAX_MS)
+        adaptiveRelativeDelayMs = packetArrivalDelaySampleMs(elapsedMs, expectedMs)
         if (adaptiveDelayWindowStartAtMs <= 0L) {
             adaptiveDelayWindowStartAtMs = adaptiveLastArrivalAtMs
         }
