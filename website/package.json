@@ -9,6 +9,6 @@
     "deploy": "npx wrangler deploy --minify"
   },
   "devDependencies": {
-    "wrangler": "^4.114.0"
+    "wrangler": "^4.166.0"
   }
 }
