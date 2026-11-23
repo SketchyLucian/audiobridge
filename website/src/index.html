@@ -1,325 +1,412 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#f4f0e8" data-theme-color>
-    <meta name="description" content="AudioBridge turns Windows and Android devices into a low-latency audio link over Wi-Fi, USB tethering, or native USB.">
-    <meta property="og:type" content="website">
-    <meta property="og:title" content="AudioBridge — Move audio. Keep the moment.">
-    <meta property="og:description" content="Low-latency audio between Windows and Android over Wi-Fi or USB. Free early access available now.">
-    <meta property="og:url" content="https://audiobridge-site.nguyendaiquang-dev.workers.dev/">
-    <meta property="og:image" content="https://audiobridge-site.nguyendaiquang-dev.workers.dev/og-card.svg">
-    <meta name="twitter:card" content="summary_large_image">
-    <title>AudioBridge — Low-latency audio between your devices</title>
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-    <link rel="manifest" href="/site.webmanifest">
-    <script src="/theme.js"></script>
-    <link rel="stylesheet" href="/styles.css">
-    <script src="/app.js" defer></script>
-  </head>
-  <body>
-    <a class="skip-link" href="#main">Skip to content</a>
-    <div class="page-glow page-glow-one" aria-hidden="true"></div>
-    <div class="page-glow page-glow-two" aria-hidden="true"></div>
 
-    <header class="site-header" data-header>
-      <a class="brand" href="#top" aria-label="AudioBridge home">
-        <svg class="brand-mark" viewBox="0 0 42 42" aria-hidden="true">
-          <path d="M7 26.5v-11l8.5-6.5v24L7 26.5Z"/>
-          <path d="M35 15.5v11L26.5 33V9l8.5 6.5Z"/>
-          <path class="brand-mark-bridge" d="M15.5 21h11"/>
-        </svg>
-        <span>AudioBridge</span>
-      </a>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f0e8" data-theme-color>
+  <meta name="description"
+    content="AudioBridge turns Windows and Android devices into a low-latency audio link over Wi-Fi, USB tethering, or native USB.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="AudioBridge — Move audio. Keep the moment.">
+  <meta property="og:description"
+    content="Low-latency audio between Windows and Android over Wi-Fi or USB. Free early access available now.">
+  <meta property="og:url" content="https://audiobridge-site.nguyendaiquang-dev.workers.dev/">
+  <meta property="og:image" content="https://audiobridge-site.nguyendaiquang-dev.workers.dev/og-card.svg">
+  <meta name="twitter:card" content="summary_large_image">
+  <title>AudioBridge — Low-latency audio between your devices</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/site.webmanifest">
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
 
-      <div class="header-actions">
-        <nav class="site-nav" id="site-nav" aria-label="Primary navigation" data-nav>
-          <a href="#features">Features</a>
-          <a href="#roadmap">Roadmap</a>
-          <a href="#questions">FAQ</a>
-          <a class="nav-download" href="#download">Get the beta</a>
-        </nav>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="page-glow page-glow-one" aria-hidden="true"></div>
+  <div class="page-glow page-glow-two" aria-hidden="true"></div>
 
-        <button class="theme-toggle" type="button" aria-pressed="false" data-theme-toggle>
-          <span class="theme-icon theme-icon-light" aria-hidden="true">☀</span>
-          <span class="theme-icon theme-icon-dark" aria-hidden="true">☾</span>
-          <span class="sr-only" data-theme-label>Switch to dark mode</span>
-        </button>
+  <header class="site-header" data-header>
+    <a class="brand" href="#top" aria-label="AudioBridge home">
+      <svg class="brand-mark" viewBox="0 0 42 42" aria-hidden="true">
+        <path d="M7 26.5v-11l8.5-6.5v24L7 26.5Z" />
+        <path d="M35 15.5v11L26.5 33V9l8.5 6.5Z" />
+        <path class="brand-mark-bridge" d="M15.5 21h11" />
+      </svg>
+      <span>AudioBridge</span>
+    </a>
 
-        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
-          <span class="sr-only" data-nav-label>Open navigation</span>
-          <span></span><span></span>
-        </button>
+    <div class="header-actions">
+      <nav class="site-nav" id="site-nav" aria-label="Primary navigation" data-nav>
+        <a href="#features">Features</a>
+        <a href="#roadmap">Roadmap</a>
+        <a href="#questions">FAQ</a>
+        <a class="nav-download" href="#download">Get the beta</a>
+      </nav>
+
+      <button class="theme-toggle" type="button" aria-pressed="false" data-theme-toggle>
+        <span class="theme-icon theme-icon-light" aria-hidden="true">☀</span>
+        <span class="theme-icon theme-icon-dark" aria-hidden="true">☾</span>
+        <span class="sr-only" data-theme-label>Switch to dark mode</span>
+      </button>
+
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+        <span class="sr-only" data-nav-label>Open navigation</span>
+        <span></span><span></span>
+      </button>
+    </div>
+  </header>
+  <button class="nav-scrim" type="button" aria-label="Close navigation" tabindex="-1" data-nav-scrim></button>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-copy reveal">
+        <div class="eyebrow">
+          <span class="status-dot"></span>
+          Open source · v1.6.0
+        </div>
+        <h1>Move audio.<br><span>Keep the moment.</span></h1>
+        <p class="hero-lede">Turn your Windows PC and Android device into one responsive audio system—over Wi-Fi, USB
+          tethering, or a native USB cable.</p>
+        <div class="hero-actions" id="download">
+          <a class="button button-primary"
+            href="https://github.com/SketchyLucian/audiobridge/releases/download/v1.6.0/AudioBridge-1.6.0-x64.msi"
+            data-download="windows">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M3 4.5 10.4 3v8.2H3V4.5Zm8.4-1.7L21 1v10.2h-9.6V2.8ZM3 12.2h7.4v8.2L3 19v-6.8Zm8.4 0H21V23l-9.6-1.8v-9Z" />
+            </svg>
+            Download for Windows
+          </a>
+          <a class="button button-secondary"
+            href="https://github.com/SketchyLucian/audiobridge/releases/download/v1.6.0/AudioBridge-1.6.0-android.apk"
+            data-download="android">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="m7.5 6.2-1.3-2.3.8-.5 1.4 2.4a8.6 8.6 0 0 1 7.2 0L17 3.4l.8.5-1.3 2.3A7.2 7.2 0 0 1 20 12H4a7.2 7.2 0 0 1 3.5-5.8ZM8 9.3a.9.9 0 1 0 0-1.8.9.9 0 0 0 0 1.8Zm8 0a.9.9 0 1 0 0-1.8.9.9 0 0 0 0 1.8ZM4 13h16v6a2 2 0 0 1-2 2h-1v2h-2v-2H9v2H7v-2H6a2 2 0 0 1-2-2v-6Z" />
+            </svg>
+            Android APK
+          </a>
+        </div>
+        <p class="release-note">Open source under GNU GPL v3.0. Android users upgrading from versions older than 1.4.6
+          must uninstall first because the signing key changed in 1.4.6. <a
+            href="https://github.com/SketchyLucian/audiobridge/releases/tag/v1.6.0">See release notes</a></p>
       </div>
-    </header>
-    <button class="nav-scrim" type="button" aria-label="Close navigation" tabindex="-1" data-nav-scrim></button>
 
-    <main id="main">
-      <section class="hero" id="top">
-        <div class="hero-copy reveal">
-          <div class="eyebrow">
-            <span class="status-dot"></span>
-            Open source · v1.5.0
-          </div>
-          <h1>Move audio.<br><span>Keep the moment.</span></h1>
-          <p class="hero-lede">Turn your Windows PC and Android device into one responsive audio system—over Wi-Fi, USB tethering, or a native USB cable.</p>
-          <div class="hero-actions" id="download">
-            <a class="button button-primary" href="https://github.com/SketchyLucian/audiobridge/releases/download/v1.5.0/AudioBridge-1.5.0-x64.msi" data-download="windows">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4.5 10.4 3v8.2H3V4.5Zm8.4-1.7L21 1v10.2h-9.6V2.8ZM3 12.2h7.4v8.2L3 19v-6.8Zm8.4 0H21V23l-9.6-1.8v-9Z"/></svg>
-              Download for Windows
-            </a>
-            <a class="button button-secondary" href="https://github.com/SketchyLucian/audiobridge/releases/download/v1.5.0/AudioBridge-1.5.0-android.apk" data-download="android">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7.5 6.2-1.3-2.3.8-.5 1.4 2.4a8.6 8.6 0 0 1 7.2 0L17 3.4l.8.5-1.3 2.3A7.2 7.2 0 0 1 20 12H4a7.2 7.2 0 0 1 3.5-5.8ZM8 9.3a.9.9 0 1 0 0-1.8.9.9 0 0 0 0 1.8Zm8 0a.9.9 0 1 0 0-1.8.9.9 0 0 0 0 1.8ZM4 13h16v6a2 2 0 0 1-2 2h-1v2h-2v-2H9v2H7v-2H6a2 2 0 0 1-2-2v-6Z"/></svg>
-              Android APK
-            </a>
-          </div>
-          <p class="release-note">Open source under GNU GPL v3.0. Android users upgrading from versions older than 1.4.6 must uninstall first because the signing key changed in 1.4.6. <a href="https://github.com/SketchyLucian/audiobridge/releases/tag/v1.5.0">See release notes</a></p>
-        </div>
+      <div class="hero-product reveal"
+        aria-label="Illustration of AudioBridge connecting a Windows PC and Android phone">
+        <div class="orbit orbit-one" aria-hidden="true"></div>
+        <div class="orbit orbit-two" aria-hidden="true"></div>
 
-        <div class="hero-product reveal" aria-label="Illustration of AudioBridge connecting a Windows PC and Android phone">
-          <div class="orbit orbit-one" aria-hidden="true"></div>
-          <div class="orbit orbit-two" aria-hidden="true"></div>
-
-          <article class="device-panel desktop-panel">
-            <header class="device-header">
-              <div>
-                <span class="device-kicker">Windows sender</span>
-                <strong>DESKTOP</strong>
-              </div>
-              <span class="live-pill"><i></i> Streaming</span>
-            </header>
-            <div class="transport-switch" aria-label="Selected transport">
-              <span>Wi-Fi</span><span>USB tether</span><span class="active">Native USB</span>
-            </div>
-            <div class="signal-card">
-              <div class="signal-copy"><span>Live signal</span><strong>-8 dB</strong></div>
-              <div class="waveform" aria-hidden="true">
-                <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-              </div>
-            </div>
-            <div class="metric-row">
-              <div><span>Profile</span><strong>Gaming</strong></div>
-              <div><span>Codec</span><strong>Opus</strong></div>
-              <div><span>Packet</span><strong>1 ms</strong></div>
-            </div>
-          </article>
-
-          <div class="bridge-line" aria-hidden="true">
-            <span></span><i></i><i></i><i></i><b></b>
-          </div>
-
-          <article class="device-panel phone-panel">
-            <div class="phone-speaker"></div>
-            <div class="phone-status"><span>9:41</span><span>◒  82%</span></div>
-            <div class="phone-app-mark">
-              <svg viewBox="0 0 42 42" aria-hidden="true">
-                <path d="M7 26.5v-11l8.5-6.5v24L7 26.5Z"/>
-                <path d="M35 15.5v11L26.5 33V9l8.5 6.5Z"/>
-                <path class="brand-mark-bridge" d="M15.5 21h11"/>
-              </svg>
-            </div>
-            <span class="phone-label">ANDROID RECEIVER</span>
-            <strong>Locked in.</strong>
-            <div class="phone-level"><span></span></div>
-            <div class="phone-metrics">
-              <div><span>Buffer</span><strong>6 ms</strong></div>
-              <div><span>Signal</span><strong>Strong</strong></div>
-            </div>
-          </article>
-        </div>
-
-        <div class="hero-proof reveal">
-          <div><strong>48 kHz</strong><span>Stereo audio</span></div>
-          <div><strong>3 ways</strong><span>Wi-Fi or USB</span></div>
-          <div><strong>6 codecs</strong><span>PCM to Opus</span></div>
-          <div><strong>0 cutoffs</strong><span>Silence stays connected</span></div>
-        </div>
-      </section>
-
-      <section class="section features-section" id="features">
-        <div class="section-heading reveal">
-          <p class="section-label">The signal path, simplified</p>
-          <h2>One bridge.<br>Every listening setup.</h2>
-          <p>Built for the awkward moments when the audio is on one device and your best speaker, microphone, or headphones are attached to another.</p>
-        </div>
-
-        <div class="feature-grid">
-          <article class="feature-card feature-wide reveal">
-            <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13a8 8 0 0 1 16 0M7 13a5 5 0 0 1 10 0m-5 0v7m-3-3 3 3 3-3"/></svg></div>
+        <article class="device-panel desktop-panel">
+          <header class="device-header">
             <div>
-              <span class="feature-number">01</span>
-              <h3>Choose your route</h3>
-              <p>Use convenient Wi-Fi, a steadier USB tethered network, or the native USB low-latency path.</p>
+              <span class="device-kicker">Windows sender</span>
+              <strong>DESKTOP</strong>
             </div>
-            <div class="route-stack" aria-hidden="true">
-              <span><i class="route-wifi"></i>Wi-Fi</span>
-              <span><i class="route-tether"></i>USB tether</span>
-              <span class="selected"><i class="route-native"></i>Native USB</span>
+            <span class="live-pill"><i></i> Streaming</span>
+          </header>
+          <div class="transport-switch" aria-label="Selected transport">
+            <span>Wi-Fi</span><span>USB tether</span><span class="active">Native USB</span>
+          </div>
+          <div class="signal-card">
+            <div class="signal-copy"><span>Live signal</span><strong>-8 dB</strong></div>
+            <div class="waveform" aria-hidden="true">
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
             </div>
-          </article>
+          </div>
+          <div class="metric-row">
+            <div><span>Profile</span><strong>Gaming</strong></div>
+            <div><span>Codec</span><strong>Opus</strong></div>
+            <div><span>Packet</span><strong>1 ms</strong></div>
+          </div>
+        </article>
 
-          <article class="feature-card reveal">
-            <div class="feature-icon coral"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h3l2-7 4 14 2-7h5"/></svg></div>
-            <span class="feature-number">02</span>
-            <h3>Tune for the moment</h3>
-            <p>Switch between Gaming, Balanced, Music, and your own Custom audio profile.</p>
-            <div class="profile-dial" aria-hidden="true"><i></i><b>Gaming<small>LOW DELAY</small></b></div>
-          </article>
-
-          <article class="feature-card reveal">
-            <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10v4m4-7v10m4-14v18m4-15v12m4-8v4"/></svg></div>
-            <span class="feature-number">03</span>
-            <h3>See what the stream feels</h3>
-            <p>Watch buffer, packet loss, underruns, signal, and estimated latency while audio is moving.</p>
-            <div class="micro-chart" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
-          </article>
-
-          <article class="feature-card feature-wide soundboard-card reveal">
-            <div>
-              <div class="feature-icon coral"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 17V7m5 13V4m6 13V7m5 7v-4M2 12h4m1 0h4m2 0h4m1 0h4"/></svg></div>
-              <span class="feature-number">04</span>
-              <h3>Route more than playback</h3>
-              <p>Queue sounds into the outgoing stream or feed a compatible virtual microphone for calls, games, and live sessions.</p>
-            </div>
-            <div class="soundboard" aria-hidden="true">
-              <span class="sound active"><i>▶</i><b>Round start</b><em>0:04</em></span>
-              <span class="sound"><i>▶</i><b>Air horn</b><em>0:02</em></span>
-              <span class="sound"><i>▶</i><b>GG</b><em>0:01</em></span>
-            </div>
-          </article>
+        <div class="bridge-line" aria-hidden="true">
+          <span></span><i></i><i></i><i></i><b></b>
         </div>
-      </section>
 
-      <section class="section use-cases">
-        <div class="use-case-intro reveal">
-          <p class="section-label">Made for real setups</p>
-          <h2>Less rewiring.<br>More listening.</h2>
-        </div>
-        <div class="use-case-list">
-          <article class="reveal"><span>01</span><div><h3>Use your phone as a PC speaker</h3><p>Send desktop audio to the Android device already beside you.</p></div></article>
-          <article class="reveal"><span>02</span><div><h3>Bring your phone mic to Windows</h3><p>Capture from Android and listen or route it on your computer.</p></div></article>
-          <article class="reveal"><span>03</span><div><h3>Keep gaming audio responsive</h3><p>Reach for USB and the Gaming profile when timing matters most.</p></div></article>
-        </div>
-      </section>
+        <article class="device-panel phone-panel">
+          <div class="phone-speaker"></div>
+          <div class="phone-status"><span>9:41</span><span>◒ 82%</span></div>
+          <div class="phone-app-mark">
+            <svg viewBox="0 0 42 42" aria-hidden="true">
+              <path d="M7 26.5v-11l8.5-6.5v24L7 26.5Z" />
+              <path d="M35 15.5v11L26.5 33V9l8.5 6.5Z" />
+              <path class="brand-mark-bridge" d="M15.5 21h11" />
+            </svg>
+          </div>
+          <span class="phone-label">ANDROID RECEIVER</span>
+          <strong>Locked in.</strong>
+          <div class="phone-level"><span></span></div>
+          <div class="phone-metrics">
+            <div><span>Buffer</span><strong>6 ms</strong></div>
+            <div><span>Signal</span><strong>Strong</strong></div>
+          </div>
+        </article>
+      </div>
 
-      <section class="section roadmap-section" id="roadmap">
-        <div class="roadmap-heading reveal">
+      <div class="hero-proof reveal">
+        <div><strong>48 kHz</strong><span>Stereo audio</span></div>
+        <div><strong>3 ways</strong><span>Wi-Fi or USB</span></div>
+        <div><strong>6 codecs</strong><span>PCM to Opus</span></div>
+        <div><strong>0 cutoffs</strong><span>Silence stays connected</span></div>
+      </div>
+    </section>
+
+    <section class="section features-section" id="features">
+      <div class="section-heading reveal">
+        <p class="section-label">The signal path, simplified</p>
+        <h2>One bridge.<br>Every listening setup.</h2>
+        <p>Built for the awkward moments when the audio is on one device and your best speaker, microphone, or
+          headphones are attached to another.</p>
+      </div>
+
+      <div class="feature-grid">
+        <article class="feature-card feature-wide reveal">
+          <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 13a8 8 0 0 1 16 0M7 13a5 5 0 0 1 10 0m-5 0v7m-3-3 3 3 3-3" />
+            </svg></div>
           <div>
-            <p class="section-label">Road to launch</p>
-            <h2>Shipping in stages.<br>Showing the work.</h2>
+            <span class="feature-number">01</span>
+            <h3>Choose your route</h3>
+            <p>Use convenient Wi-Fi, a steadier USB tethered network, or the native USB low-latency path.</p>
           </div>
-          <p>AudioBridge is available in early access today. This roadmap tracks the work between a useful beta and a release worth paying for.</p>
-        </div>
-
-        <ol class="roadmap" data-roadmap>
-          <li class="roadmap-item complete reveal">
-            <div class="roadmap-marker"><span>01</span></div>
-            <div class="roadmap-card">
-              <div class="roadmap-meta"><span>Foundation</span><strong>Complete</strong></div>
-              <h3>Core audio bridge</h3>
-              <p>Windows and Android sender/receiver modes, discovery, silence-safe heartbeats, Wi-Fi, USB tethering, Native USB, six codecs, live metrics, and soundboard routing.</p>
-              <ul><li>Audio relay engine</li><li>Low-latency profiles</li><li>Windows + Android releases</li></ul>
-            </div>
-          </li>
-
-          <li class="roadmap-item active reveal">
-            <div class="roadmap-marker"><span>02</span></div>
-            <div class="roadmap-card">
-              <div class="roadmap-meta"><span>Production hardening</span><strong>In progress</strong></div>
-              <h3>Trust every connection</h3>
-              <p>Strengthen pairing and transport security, smooth difficult networks, finish audio-focus behavior, and make device selection and firewall setup clearer.</p>
-              <ul><li>Connection approval</li><li>Jitter and packet-loss handling</li><li>Device compatibility testing</li></ul>
-            </div>
-          </li>
-
-          <li class="roadmap-item next reveal">
-            <div class="roadmap-marker"><span>03</span></div>
-            <div class="roadmap-card">
-              <div class="roadmap-meta"><span>Distribution</span><strong>Up next</strong></div>
-              <h3>Store-ready releases</h3>
-              <p>Prepare a trusted Windows package, a Google Play build without sideload updates, automated release checks, and the legal and support pages a public product needs.</p>
-              <ul><li>Windows code signing</li><li>Android App Bundle</li><li>Privacy, terms, and support</li></ul>
-            </div>
-          </li>
-
-          <li class="roadmap-item planned reveal">
-            <div class="roadmap-marker"><span>04</span></div>
-            <div class="roadmap-card">
-              <div class="roadmap-meta"><span>Founding beta</span><strong>Planned</strong></div>
-              <h3>Prove it on real hardware</h3>
-              <p>Run a focused beta across varied Windows PCs, Android phones, Wi-Fi conditions, and USB controllers, then turn the findings into a release candidate.</p>
-              <ul><li>Closed tester group</li><li>Diagnostics and feedback</li><li>Launch candidate</li></ul>
-            </div>
-          </li>
-
-          <li class="roadmap-item planned reveal">
-            <div class="roadmap-marker"><span>05</span></div>
-            <div class="roadmap-card">
-              <div class="roadmap-meta"><span>Public launch</span><strong>Planned</strong></div>
-              <h3>AudioBridge + AudioBridge Pro</h3>
-              <p>Keep a genuinely useful free experience and introduce a fair Pro upgrade for power features, multiple devices, advanced controls, and soundboard workflows.</p>
-              <ul><li>Free companion experience</li><li>Optional Pro license</li><li>Stable update channel</li></ul>
-            </div>
-          </li>
-        </ol>
-      </section>
-
-      <section class="section principles-section">
-        <div class="principles-card reveal">
-          <p class="section-label">The launch promise</p>
-          <blockquote>Reliability is not a premium feature.</blockquote>
-          <p>Security, stable connections, silence-safe sessions, and essential fixes belong to everyone. Pro will add capability—not remove frustration.</p>
-          <div class="principle-tags"><span>No ads</span><span>Local audio path</span><span>Fair early access</span></div>
-        </div>
-      </section>
-
-      <section class="section faq-section" id="questions">
-        <div class="faq-heading reveal">
-          <p class="section-label">Good questions</p>
-          <h2>Before you connect.</h2>
-        </div>
-        <div class="faq-list">
-          <details class="reveal" open>
-            <summary>Will silence disconnect the stream?<span></span></summary>
-            <p>No. AudioBridge keeps the session alive even when the source is silent, so a pause in playback is not mistaken for a disconnected device.</p>
-          </details>
-          <details class="reveal">
-            <summary>Does the audio go through a cloud server?<span></span></summary>
-            <p>No. The audio relay runs directly between your devices over the selected local Wi-Fi or USB connection. Internet access is used for update checks and downloads.</p>
-          </details>
-          <details class="reveal">
-            <summary>Which platforms are supported?<span></span></summary>
-            <p>Windows and Android are the primary early-access platforms. An experimental Linux Wi-Fi build also exists with a smaller feature set.</p>
-          </details>
-          <details class="reveal">
-            <summary>Is AudioBridge free and open source?<span></span></summary>
-            <p>Yes. AudioBridge 1.5.0 is free and open source under the GNU GPL v3.0 license on GitHub.</p>
-          </details>
-        </div>
-      </section>
-
-      <section class="final-cta">
-        <div class="final-cta-art" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-        <div class="final-cta-copy reveal">
-          <p class="section-label">Try the bridge</p>
-          <h2>Your next speaker<br>is already nearby.</h2>
-          <p>Download both apps, choose the same connection mode, and start moving audio.</p>
-          <div class="hero-actions">
-            <a class="button button-light" href="https://github.com/SketchyLucian/audiobridge/releases/download/v1.5.0/AudioBridge-1.5.0-x64.msi">Windows MSI</a>
-            <a class="button button-ghost" href="https://github.com/SketchyLucian/audiobridge/releases/download/v1.5.0/AudioBridge-1.5.0-android.apk">Android APK</a>
+          <div class="route-stack" aria-hidden="true">
+            <span><i class="route-wifi"></i>Wi-Fi</span>
+            <span><i class="route-tether"></i>USB tether</span>
+            <span class="selected"><i class="route-native"></i>Native USB</span>
           </div>
-        </div>
-      </section>
-    </main>
+        </article>
 
-    <footer class="site-footer">
-      <a class="brand" href="#top">
-        <svg class="brand-mark" viewBox="0 0 42 42" aria-hidden="true"><path d="M7 26.5v-11l8.5-6.5v24L7 26.5Z"/><path d="M35 15.5v11L26.5 33V9l8.5 6.5Z"/><path class="brand-mark-bridge" d="M15.5 21h11"/></svg>
-        <span>AudioBridge</span>
-      </a>
-      <p>Low-latency audio between the devices you already own.</p>
-      <div class="footer-links"><a href="#roadmap">Roadmap</a><a href="https://github.com/SketchyLucian/audiobridge">GitHub</a><a href="https://github.com/SketchyLucian/audiobridge/releases">Releases</a><span>© <span data-year>2026</span></span></div>
-    </footer>
-  </body>
+        <article class="feature-card reveal">
+          <div class="feature-icon coral"><svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 12h3l2-7 4 14 2-7h5" />
+            </svg></div>
+          <span class="feature-number">02</span>
+          <h3>Tune for the moment</h3>
+          <p>Switch between Gaming, Balanced, Music, and your own Custom audio profile.</p>
+          <div class="profile-dial" aria-hidden="true"><i></i><b>Gaming<small>LOW DELAY</small></b></div>
+        </article>
+
+        <article class="feature-card reveal">
+          <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 10v4m4-7v10m4-14v18m4-15v12m4-8v4" />
+            </svg></div>
+          <span class="feature-number">03</span>
+          <h3>See what the stream feels</h3>
+          <p>Watch buffer, packet loss, underruns, signal, and estimated latency while audio is moving.</p>
+          <div class="micro-chart" aria-hidden="true">
+            <span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+        </article>
+
+        <article class="feature-card feature-wide soundboard-card reveal">
+          <div>
+            <div class="feature-icon coral"><svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 17V7m5 13V4m6 13V7m5 7v-4M2 12h4m1 0h4m2 0h4m1 0h4" />
+              </svg></div>
+            <span class="feature-number">04</span>
+            <h3>Route more than playback</h3>
+            <p>Queue sounds into the outgoing stream or feed a compatible virtual microphone for calls, games, and live
+              sessions.</p>
+          </div>
+          <div class="soundboard" aria-hidden="true">
+            <span class="sound active"><i>▶</i><b>Round start</b><em>0:04</em></span>
+            <span class="sound"><i>▶</i><b>Air horn</b><em>0:02</em></span>
+            <span class="sound"><i>▶</i><b>GG</b><em>0:01</em></span>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section use-cases">
+      <div class="use-case-intro reveal">
+        <p class="section-label">Made for real setups</p>
+        <h2>Less rewiring.<br>More listening.</h2>
+      </div>
+      <div class="use-case-list">
+        <article class="reveal"><span>01</span>
+          <div>
+            <h3>Use your phone as a PC speaker</h3>
+            <p>Send desktop audio to the Android device already beside you.</p>
+          </div>
+        </article>
+        <article class="reveal"><span>02</span>
+          <div>
+            <h3>Bring your phone mic to Windows</h3>
+            <p>Capture from Android and listen or route it on your computer.</p>
+          </div>
+        </article>
+        <article class="reveal"><span>03</span>
+          <div>
+            <h3>Keep gaming audio responsive</h3>
+            <p>Reach for USB and the Gaming profile when timing matters most.</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section roadmap-section" id="roadmap">
+      <div class="roadmap-heading reveal">
+        <div>
+          <p class="section-label">Road to launch</p>
+          <h2>Shipping in stages.<br>Showing the work.</h2>
+        </div>
+        <p>AudioBridge is available in early access today. This roadmap tracks the work between a useful beta and a
+          release worth paying for.</p>
+      </div>
+
+      <ol class="roadmap" data-roadmap>
+        <li class="roadmap-item complete reveal">
+          <div class="roadmap-marker"><span>01</span></div>
+          <div class="roadmap-card">
+            <div class="roadmap-meta"><span>Foundation</span><strong>Complete</strong></div>
+            <h3>Core audio bridge</h3>
+            <p>Windows and Android sender/receiver modes, discovery, silence-safe heartbeats, Wi-Fi, USB tethering,
+              Native USB, six codecs, live metrics, and soundboard routing.</p>
+            <ul>
+              <li>Audio relay engine</li>
+              <li>Low-latency profiles</li>
+              <li>Windows + Android releases</li>
+            </ul>
+          </div>
+        </li>
+
+        <li class="roadmap-item active reveal">
+          <div class="roadmap-marker"><span>02</span></div>
+          <div class="roadmap-card">
+            <div class="roadmap-meta"><span>Production hardening</span><strong>In progress</strong></div>
+            <h3>Trust every connection</h3>
+            <p>Strengthen pairing and transport security, smooth difficult networks, finish audio-focus behavior, and
+              make device selection and firewall setup clearer.</p>
+            <ul>
+              <li>Connection approval</li>
+              <li>Jitter and packet-loss handling</li>
+              <li>Device compatibility testing</li>
+            </ul>
+          </div>
+        </li>
+
+        <li class="roadmap-item next reveal">
+          <div class="roadmap-marker"><span>03</span></div>
+          <div class="roadmap-card">
+            <div class="roadmap-meta"><span>Distribution</span><strong>Up next</strong></div>
+            <h3>Store-ready releases</h3>
+            <p>Prepare a trusted Windows package, a Google Play build without sideload updates, automated release
+              checks, and the legal and support pages a public product needs.</p>
+            <ul>
+              <li>Windows code signing</li>
+              <li>Android App Bundle</li>
+              <li>Privacy, terms, and support</li>
+            </ul>
+          </div>
+        </li>
+
+        <li class="roadmap-item planned reveal">
+          <div class="roadmap-marker"><span>04</span></div>
+          <div class="roadmap-card">
+            <div class="roadmap-meta"><span>Founding beta</span><strong>Planned</strong></div>
+            <h3>Prove it on real hardware</h3>
+            <p>Run a focused beta across varied Windows PCs, Android phones, Wi-Fi conditions, and USB controllers, then
+              turn the findings into a release candidate.</p>
+            <ul>
+              <li>Closed tester group</li>
+              <li>Diagnostics and feedback</li>
+              <li>Launch candidate</li>
+            </ul>
+          </div>
+        </li>
+
+        <li class="roadmap-item planned reveal">
+          <div class="roadmap-marker"><span>05</span></div>
+          <div class="roadmap-card">
+            <div class="roadmap-meta"><span>Public launch</span><strong>Planned</strong></div>
+            <h3>AudioBridge + AudioBridge Pro</h3>
+            <p>Keep a genuinely useful free experience and introduce a fair Pro upgrade for power features, multiple
+              devices, advanced controls, and soundboard workflows.</p>
+            <ul>
+              <li>Free companion experience</li>
+              <li>Optional Pro license</li>
+              <li>Stable update channel</li>
+            </ul>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section class="section principles-section">
+      <div class="principles-card reveal">
+        <p class="section-label">The launch promise</p>
+        <blockquote>Reliability is not a premium feature.</blockquote>
+        <p>Security, stable connections, silence-safe sessions, and essential fixes belong to everyone. Pro will add
+          capability—not remove frustration.</p>
+        <div class="principle-tags"><span>No ads</span><span>Local audio path</span><span>Fair early access</span></div>
+      </div>
+    </section>
+
+    <section class="section faq-section" id="questions">
+      <div class="faq-heading reveal">
+        <p class="section-label">Good questions</p>
+        <h2>Before you connect.</h2>
+      </div>
+      <div class="faq-list">
+        <details class="reveal" open>
+          <summary>Will silence disconnect the stream?<span></span></summary>
+          <p>No. AudioBridge keeps the session alive even when the source is silent, so a pause in playback is not
+            mistaken for a disconnected device.</p>
+        </details>
+        <details class="reveal">
+          <summary>Does the audio go through a cloud server?<span></span></summary>
+          <p>No. The audio relay runs directly between your devices over the selected local Wi-Fi or USB connection.
+            Internet access is used for update checks and downloads.</p>
+        </details>
+        <details class="reveal">
+          <summary>Which platforms are supported?<span></span></summary>
+          <p>Windows and Android are the primary early-access platforms. An experimental Linux Wi-Fi build also exists
+            with a smaller feature set.</p>
+        </details>
+        <details class="reveal">
+          <summary>Is AudioBridge free and open source?<span></span></summary>
+          <p>Yes. AudioBridge 1.5.0 is free and open source under the GNU GPL v3.0 license on GitHub.</p>
+        </details>
+      </div>
+    </section>
+
+    <section class="final-cta">
+      <div class="final-cta-art" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+      </div>
+      <div class="final-cta-copy reveal">
+        <p class="section-label">Try the bridge</p>
+        <h2>Your next speaker<br>is already nearby.</h2>
+        <p>Download both apps, choose the same connection mode, and start moving audio.</p>
+        <div class="hero-actions">
+          <a class="button button-light"
+            href="https://github.com/SketchyLucian/audiobridge/releases/download/v1.5.0/AudioBridge-1.5.0-x64.msi">Windows
+            MSI</a>
+          <a class="button button-ghost"
+            href="https://github.com/SketchyLucian/audiobridge/releases/download/v1.5.0/AudioBridge-1.5.0-android.apk">Android
+            APK</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <a class="brand" href="#top">
+      <svg class="brand-mark" viewBox="0 0 42 42" aria-hidden="true">
+        <path d="M7 26.5v-11l8.5-6.5v24L7 26.5Z" />
+        <path d="M35 15.5v11L26.5 33V9l8.5 6.5Z" />
+        <path class="brand-mark-bridge" d="M15.5 21h11" />
+      </svg>
+      <span>AudioBridge</span>
+    </a>
+    <p>Low-latency audio between the devices you already own.</p>
+    <div class="footer-links"><a href="#roadmap">Roadmap</a><a
+        href="https://github.com/SketchyLucian/audiobridge">GitHub</a><a
+        href="https://github.com/SketchyLucian/audiobridge/releases">Releases</a><span>© <span
+          data-year>2026</span></span></div>
+  </footer>
+</body>
+
 </html>

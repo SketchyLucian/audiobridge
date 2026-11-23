@@ -369,7 +369,8 @@ class AudioReceiverEngine(private val context: Context) {
     private var aacEncoderSubmittedFrames = 0L
 
     @Volatile
-    private var audioTrack: AudioTrack? = null
+    private var playbackSink: PlaybackOutputSink? = null
+    private var currentOutputBackend: OutputAudioBackend = OutputAudioBackend.AUTO
     private var currentInputSampleRate = 0
     private var currentSampleRate = 0
     private var currentChannels = 0
@@ -403,8 +404,6 @@ class AudioReceiverEngine(private val context: Context) {
     }
     private var adaptiveLinkMemoryKey: String? = null
     private var lastAdaptiveLinkMemoryWriteAtMs = 0L
-    private var lastPlaybackHead = 0
-    private var playbackHeadWraps = 0L
     private var lastSequence = -1L
     private var lastAudioPacketReceivedAtMs = 0L
     private var lastPeerPacketReceivedAtMs = 0L
@@ -415,6 +414,10 @@ class AudioReceiverEngine(private val context: Context) {
     private var lastCodecId = CODEC_PCM
     private val nativeOutputSampleRate = readNativeOutputSampleRate()
     private val opusNative = OpusNative()
+    private val aaudioNative by lazy { AAudioOutputNative() }
+    private val audioFocusController by lazy {
+        AudioFocusController(context) { applyEffectiveVolume() }
+    }
     private var opusDecoderHandle = 0L
     private var opusChannels = 0
     private var opusEncoderHandle = 0L
@@ -508,7 +511,11 @@ class AudioReceiverEngine(private val context: Context) {
         "backend" to "android-audiorecord-audiotrack-codecs-udp-native-usb",
         "detail" to "Low-latency UDP microphone capture plus UDP, USB tethering, and Android Open Accessory USB playback",
         "supportedCodecs" to listOf("pcm", "opus", "aac", "g711MuLaw", "g711ALaw", "imaAdpcm"),
-        "supportedOutputBackends" to listOf("auto", "audioTrack"),
+        "supportedOutputBackends" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            listOf("auto", "audioTrack", "oboe")
+        } else {
+            listOf("auto", "audioTrack")
+        },
         "codecBitrateRanges" to mapOf(
             "pcm" to mapOf("minKbps" to 0, "maxKbps" to 0),
             "opus" to mapOf("minKbps" to 64, "maxKbps" to 256),
@@ -571,24 +578,20 @@ class AudioReceiverEngine(private val context: Context) {
 
         val sampleRate = currentSampleRate.takeIf { it > 0 } ?: profile.sampleRate
         val peerConnected = isPeerConnected(now)
-        val track = audioTrack
-        if (track == null) {
+        val sink = playbackSink
+        if (sink == null) {
             return idleReceiverMetrics(sampleRate, peerConnected)
         }
-        val playedFrames = playbackFrames(track)
+        val playedFrames = sink.playbackFrames()
         val queuedFrames = max(0L, writtenFrames.get() - playedFrames)
-        val underruns = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            track.underrunCount
-        } else {
-            0
-        }
+        val underruns = sink.underrunCount()
         val sourceIdle = isSourceIdle(now)
         if (sourceIdle) {
             return idleReceiverMetrics(sampleRate, peerConnected)
         }
 
         val outputLatencyMs = queuedFrames * 1000.0 / sampleRate
-        adaptPlaybackBuffer(track, sampleRate, queuedFrames, underruns)
+        adaptPlaybackBuffer(sink, sampleRate, queuedFrames, underruns)
         val adaptiveMaxBufferMs = adaptiveMaxPlaybackBufferMs()
 
         val metrics = mutableMapOf<String, Any>(
@@ -834,6 +837,7 @@ class AudioReceiverEngine(private val context: Context) {
         }
 
         running = true
+        audioFocusController.requestFocus()
         droppedPackets.set(0)
         lostPackets.set(0)
         trimCount.set(0)
@@ -889,20 +893,29 @@ class AudioReceiverEngine(private val context: Context) {
         releaseOpusDecoder()
         releaseAacDecoder()
         releaseAudioTrack()
+        audioFocusController.abandonFocus()
         lastPeerPacketReceivedAtMs = 0L
         receiverSessionId = 0L
         sessionProtocolActive = false
     }
 
+    private fun effectiveVolume(): Float {
+        return if (muted) 0f else (volume * audioFocusController.gainMultiplier).coerceIn(0f, 1f)
+    }
+
+    private fun applyEffectiveVolume() {
+        playbackSink?.setVolume(effectiveVolume())
+    }
+
     fun setVolume(arguments: Any?) {
         val value = (arguments as? Map<*, *>)?.get("value") as? Number ?: return
         volume = value.toFloat().coerceIn(0f, 1f)
-        audioTrack?.setVolume(if (muted) 0f else volume)
+        applyEffectiveVolume()
     }
 
     fun setMuted(arguments: Any?) {
         muted = (arguments as? Map<*, *>)?.get("value") as? Boolean ?: return
-        audioTrack?.setVolume(if (muted) 0f else volume)
+        applyEffectiveVolume()
     }
 
     fun disconnect() {
@@ -912,6 +925,7 @@ class AudioReceiverEngine(private val context: Context) {
         } else {
             stopStream()
         }
+        audioFocusController.abandonFocus()
         source = null
         transportMode = TransportMode.WIFI
         networkBindAddress = null
@@ -923,8 +937,11 @@ class AudioReceiverEngine(private val context: Context) {
     }
 
     private fun validateOutputBackend() {
-        if (profile.outputBackend == OutputAudioBackend.OBOE) {
-            error("Oboe/AAudio output is not implemented yet. Use Auto or AudioTrack.")
+        if (
+            profile.outputBackend == OutputAudioBackend.OBOE &&
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+        ) {
+            error("AAudio / Oboe output requires Android 8.0 or newer. Use Auto or AudioTrack.")
         }
     }
 
@@ -3133,7 +3150,7 @@ class AudioReceiverEngine(private val context: Context) {
                 val now = SystemClock.elapsedRealtime()
                 lastAdaptiveBufferRelaxAtMs = now
                 lastPlaybackPressureAtMs = now
-                if (audioTrack != null) {
+                if (playbackSink != null) {
                     val nextMaxBufferMs = adaptiveMaxPlaybackBufferMs(playbackBufferMs)
                     val nextBufferMs = when {
                         !receiverAdaptiveBuffer -> playbackBufferMs
@@ -3200,8 +3217,10 @@ class AudioReceiverEngine(private val context: Context) {
 
         val playbackSampleRate = outputSampleRateForPlayback(sampleRate)
         if (
-            audioTrack != null &&
-            (sampleRate != currentInputSampleRate || channels != currentChannels)
+            playbackSink != null &&
+            (sampleRate != currentInputSampleRate ||
+                channels != currentChannels ||
+                currentOutputBackend != profile.outputBackend)
         ) {
             releaseAudioTrack()
         }
@@ -3233,7 +3252,7 @@ class AudioReceiverEngine(private val context: Context) {
             playbackPayloadSize = playbackPayload.size
         }
 
-        val track = ensureAudioTrack(playbackSampleRate, channels) ?: return
+        val sink = ensurePlaybackSink(playbackSampleRate, channels) ?: return
         currentInputSampleRate = sampleRate
         val playbackPayloadFrames = playbackPayloadSize / bytesPerFrame
         val packetReceivedAtReceiverMs = SystemClock.elapsedRealtime()
@@ -3252,7 +3271,7 @@ class AudioReceiverEngine(private val context: Context) {
             packetFrames = payloadFrames
         )
         if (shouldDropForLatency(
-                track,
+                sink,
                 playbackSampleRate,
                 playbackPayloadFrames,
                 networkSampleMs
@@ -3261,17 +3280,17 @@ class AudioReceiverEngine(private val context: Context) {
             return
         }
 
-        val writtenBytes = if (muted || packetMuted) {
+        val writtenBytes = if (muted || packetMuted || audioFocusController.isMutedByFocus) {
             signalLevel = 0.0
-            writeSilence(track, playbackPayloadSize)
+            writeSilence(sink, playbackPayloadSize)
         } else {
             signalLevel = pcmPeakLevel(
                 playbackPayload,
                 playbackPayloadOffset,
                 playbackPayloadSize
             )
-            writePcmToTrack(
-                track,
+            writePcmToSink(
+                sink,
                 playbackPayload,
                 playbackPayloadOffset,
                 playbackPayloadSize
@@ -3280,11 +3299,11 @@ class AudioReceiverEngine(private val context: Context) {
         if (writtenBytes > 0) {
             val queuedAfterWrite = writtenFrames.addAndGet((writtenBytes / bytesPerFrame).toLong())
             updateAudioLatencyEstimate(
-                track = track,
+                sink = sink,
                 sampleRate = playbackSampleRate,
                 networkSampleMs = networkSampleMs
             )
-            startPlaybackIfReady(track, queuedAfterWrite)
+            startPlaybackIfReady(sink, queuedAfterWrite)
             if (writtenBytes < playbackPayloadSize) {
                 droppedPackets.incrementAndGet()
             }
@@ -3540,12 +3559,12 @@ class AudioReceiverEngine(private val context: Context) {
     }
 
     private fun shouldDropForLatency(
-        track: AudioTrack,
+        sink: PlaybackOutputSink,
         sampleRate: Int,
         payloadFrames: Int,
         networkSampleMs: Double?
     ): Boolean {
-        val queuedFrames = max(0L, writtenFrames.get() - playbackFrames(track))
+        val queuedFrames = max(0L, writtenFrames.get() - sink.playbackFrames())
         val targetFrames = adaptiveTargetFrames(sampleRate).toLong()
         val packetFrames = max(1L, payloadFrames.toLong())
         val softLimit = max(targetFrames + packetFrames * 2L, targetFrames * 3L / 2L)
@@ -3567,14 +3586,14 @@ class AudioReceiverEngine(private val context: Context) {
                 return true
             }
             LatencyRecoveryDecision.TRIM_AND_ACCEPT -> {
-                if (trimQueuedAudio(track)) {
+                if (trimQueuedAudio(sink)) {
                     return false
                 }
                 droppedPackets.incrementAndGet()
                 return true
             }
             LatencyRecoveryDecision.TRIM_AND_DROP -> {
-                trimQueuedAudio(track)
+                trimQueuedAudio(sink)
                 droppedPackets.incrementAndGet()
                 return true
             }
@@ -3587,9 +3606,11 @@ class AudioReceiverEngine(private val context: Context) {
         return false
     }
 
-    private fun writeSilence(track: AudioTrack, payloadSize: Int): Int {
-        val output = ByteArray(payloadSize)
-        return writePcmToTrack(track, output, 0, output.size)
+    private fun writeSilence(sink: PlaybackOutputSink, payloadSize: Int): Int {
+        if (silentPlaybackBuffer.size < payloadSize) {
+            silentPlaybackBuffer = ByteArray(payloadSize)
+        }
+        return writePcmToSink(sink, silentPlaybackBuffer, 0, payloadSize)
     }
 
     private fun maintainSilentPlayback(now: Long) {
@@ -3609,10 +3630,10 @@ class AudioReceiverEngine(private val context: Context) {
         val sampleRate = currentSampleRate.takeIf { it > 0 }
             ?: outputSampleRateForPlayback(inputSampleRate)
         val channels = currentChannels.takeIf { it > 0 } ?: profile.channels.coerceIn(1, 2)
-        val track = audioTrack ?: ensureAudioTrack(sampleRate, channels) ?: return
+        val sink = playbackSink ?: ensurePlaybackSink(sampleRate, channels) ?: return
         currentInputSampleRate = inputSampleRate
 
-        val playedFrames = playbackFrames(track)
+        val playedFrames = sink.playbackFrames()
         val queuedFrames = max(0L, writtenFrames.get() - playedFrames)
         val maxChunkFrames = latencyFrames(sampleRate, SILENT_PLAYBACK_KEEPALIVE_INTERVAL_MS)
         val targetFrames = max(currentTargetBufferFrames, maxChunkFrames)
@@ -3633,16 +3654,12 @@ class AudioReceiverEngine(private val context: Context) {
         if (silentPlaybackBuffer.size < bytesToWrite) {
             silentPlaybackBuffer = ByteArray(bytesToWrite)
         }
-        val writtenBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            track.write(
-                silentPlaybackBuffer,
-                0,
-                bytesToWrite,
-                AudioTrack.WRITE_NON_BLOCKING
-            )
-        } else {
-            track.write(silentPlaybackBuffer, 0, bytesToWrite)
-        }
+        val writtenBytes = sink.write(
+            silentPlaybackBuffer,
+            0,
+            bytesToWrite,
+            blocking = false
+        )
         logAudioTrackWrite(writtenBytes, bytesToWrite)
         if (writtenBytes <= 0) {
             return
@@ -3651,7 +3668,7 @@ class AudioReceiverEngine(private val context: Context) {
         val queuedAfterWrite = writtenFrames.addAndGet(
             (writtenBytes / bytesPerFrame).toLong()
         )
-        startPlaybackIfReady(track, queuedAfterWrite)
+        startPlaybackIfReady(sink, queuedAfterWrite)
     }
 
     private fun pcmPeakLevel(data: ByteArray, offset: Int, size: Int): Double {
@@ -3774,8 +3791,8 @@ class AudioReceiverEngine(private val context: Context) {
         pcmReformatterOutputSampleRate = 0
     }
 
-    private fun writePcmToTrack(
-        track: AudioTrack,
+    private fun writePcmToSink(
+        sink: PlaybackOutputSink,
         data: ByteArray,
         offset: Int,
         size: Int
@@ -3784,24 +3801,20 @@ class AudioReceiverEngine(private val context: Context) {
             return 0
         }
 
-        if (!currentUseBlockingWrites && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val written = track.write(data, offset, size, AudioTrack.WRITE_NON_BLOCKING)
+        if (!currentUseBlockingWrites) {
+            val written = sink.write(data, offset, size, blocking = false)
             logAudioTrackWrite(written, size)
             return written
         }
 
         var totalWritten = 0
         while (totalWritten < size && running) {
-            val written = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                track.write(
-                    data,
-                    offset + totalWritten,
-                    size - totalWritten,
-                    AudioTrack.WRITE_BLOCKING
-                )
-            } else {
-                track.write(data, offset + totalWritten, size - totalWritten)
-            }
+            val written = sink.write(
+                data,
+                offset + totalWritten,
+                size - totalWritten,
+                blocking = true
+            )
             if (written <= 0) {
                 break
             }
@@ -3816,13 +3829,13 @@ class AudioReceiverEngine(private val context: Context) {
         if (audioTrackWriteCount <= 5 || audioTrackWriteCount % 1000L == 0L) {
             Log.i(
                 LOG_TAG,
-                "AudioTrack write #$audioTrackWriteCount written=$written requested=$requested playState=${audioTrack?.playState}"
+                "AudioOutput(${playbackSink?.backendName ?: "none"}) write #$audioTrackWriteCount written=$written requested=$requested playState=${playbackSink?.playStateDebug}"
             )
         }
     }
 
     private fun adaptPlaybackBuffer(
-        track: AudioTrack,
+        sink: PlaybackOutputSink,
         sampleRate: Int,
         queuedFrames: Long,
         underruns: Int
@@ -3852,7 +3865,7 @@ class AudioReceiverEngine(private val context: Context) {
 
         val targetFrames = adaptiveTargetFrames(sampleRate).toLong()
         val networkFloorMs = adaptiveNetworkFloorBufferMs(requestedLatencyMs)
-        val isPlaying = track.playState == AudioTrack.PLAYSTATE_PLAYING
+        val isPlaying = sink.isPlaying
         val isPlaybackStable = isPlaying &&
             playbackStartedAtMs > 0L &&
             now - playbackStartedAtMs >= ADAPTIVE_PLAYBACK_START_GRACE_MS
@@ -4319,9 +4332,9 @@ class AudioReceiverEngine(private val context: Context) {
             adaptiveMaxPlaybackBufferMs(requestedLatencyMs)
         )
         var nextTargetFrames = min(currentBufferSizeFrames, latencyFrames(sampleRate, nextLatencyMs))
-        val track = audioTrack
-        if (track != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val adjustedFrames = track.setBufferSizeInFrames(nextTargetFrames)
+        val sink = playbackSink
+        if (sink != null) {
+            val adjustedFrames = sink.setBufferSizeInFrames(nextTargetFrames)
             if (adjustedFrames > 0) {
                 nextTargetFrames = min(currentBufferSizeFrames, adjustedFrames)
             }
@@ -4340,35 +4353,33 @@ class AudioReceiverEngine(private val context: Context) {
         return latencyFrames(sampleRate, adaptivePlaybackBufferMs)
     }
 
-    private fun startPlaybackIfReady(track: AudioTrack, queuedFrames: Long) {
-        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+    private fun startPlaybackIfReady(sink: PlaybackOutputSink, queuedFrames: Long) {
+        if (sink.isPlaying) {
             return
         }
         if (queuedFrames < currentTargetBufferFrames) {
             return
         }
 
-        try {
-            track.play()
+        if (sink.play()) {
             playbackStartedAtMs = SystemClock.elapsedRealtime()
-            lastKnownUnderrunCount = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                track.underrunCount
-            } else {
-                0
-            }
-            Log.i(LOG_TAG, "AudioTrack started queuedFrames=$queuedFrames target=$currentTargetBufferFrames")
-        } catch (_: IllegalStateException) {
-            Log.w(LOG_TAG, "AudioTrack play failed")
+            lastKnownUnderrunCount = sink.underrunCount()
+            Log.i(
+                LOG_TAG,
+                "AudioOutput(${sink.backendName}) started queuedFrames=$queuedFrames target=$currentTargetBufferFrames"
+            )
+        } else {
+            Log.w(LOG_TAG, "AudioOutput(${sink.backendName}) play failed")
         }
     }
 
     private fun updateAudioLatencyEstimate(
-        track: AudioTrack,
+        sink: PlaybackOutputSink,
         sampleRate: Int,
         networkSampleMs: Double?
     ) {
         networkSampleMs ?: return
-        val queuedFrames = max(0L, writtenFrames.get() - playbackFrames(track))
+        val queuedFrames = max(0L, writtenFrames.get() - sink.playbackFrames())
         val outputQueueMs = queuedFrames * 1000.0 / sampleRate
         networkLatencyMs = smoothLatency(networkLatencyMs, networkSampleMs)
         audioLatencyMs = smoothLatency(audioLatencyMs, networkSampleMs + outputQueueMs)
@@ -4406,46 +4417,27 @@ class AudioReceiverEngine(private val context: Context) {
         return previous * previousWeight + sample * (1.0 - previousWeight)
     }
 
-    private fun trimQueuedAudio(track: AudioTrack): Boolean {
-        try {
-            track.pause()
-            track.flush()
-            writtenFrames.set(playbackFrames(track))
-            track.play()
-            trimCount.incrementAndGet()
-            audioLatencyMs = Double.NaN
-            return true
-        } catch (_: IllegalStateException) {
+    private fun trimQueuedAudio(sink: PlaybackOutputSink): Boolean {
+        if (!sink.trimFlush()) {
             return false
         }
+        writtenFrames.set(sink.playbackFrames())
+        trimCount.incrementAndGet()
+        audioLatencyMs = Double.NaN
+        return true
     }
 
-    private fun ensureAudioTrack(sampleRate: Int, channels: Int): AudioTrack? {
+    private fun ensurePlaybackSink(sampleRate: Int, channels: Int): PlaybackOutputSink? {
         if (
             sampleRate == currentSampleRate &&
             channels == currentChannels &&
-            audioTrack != null
+            currentOutputBackend == profile.outputBackend &&
+            playbackSink != null
         ) {
-            return audioTrack
+            return playbackSink
         }
 
         releaseAudioTrack()
-
-        val channelMask = when (channels) {
-            1 -> AudioFormat.CHANNEL_OUT_MONO
-            2 -> AudioFormat.CHANNEL_OUT_STEREO
-            6 -> AudioFormat.CHANNEL_OUT_5POINT1
-            else -> AudioFormat.CHANNEL_OUT_STEREO
-        }
-        val minBufferSize = AudioTrack.getMinBufferSize(
-            sampleRate,
-            channelMask,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        if (minBufferSize <= 0) {
-            Log.w(LOG_TAG, "AudioTrack minBufferSize invalid=$minBufferSize sampleRate=$sampleRate channels=$channels")
-            return null
-        }
 
         val requestedLatencyMs = profile.playbackBufferMs.coerceIn(minLatencyMs(), MAX_LATENCY_MS)
         val adaptiveMaxBufferMs = adaptiveMaxPlaybackBufferMs(requestedLatencyMs)
@@ -4469,6 +4461,105 @@ class AudioReceiverEngine(private val context: Context) {
         } else {
             requestedBufferFrames
         }
+        val useBlockingWrites = shouldUseBlockingWrites(sampleRate, requestedLatencyMs)
+        var targetBufferFrames = startBufferFrames
+        var actualBufferFrames = capacityBufferFrames
+
+        val createdSink: PlaybackOutputSink? = if (
+            profile.outputBackend == OutputAudioBackend.OBOE &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            aaudioNative.isAvailable()
+        ) {
+            val handle = aaudioNative.createStream(
+                sampleRate = sampleRate,
+                channels = channels,
+                capacityFrames = capacityBufferFrames,
+                targetFrames = startBufferFrames,
+                lowLatency = requestedLatencyMs <= LOW_LATENCY_PERFORMANCE_MAX_MS
+            )
+            if (handle != 0L) {
+                val nativeCapacity = aaudioNative.getBufferCapacityInFrames(handle)
+                if (nativeCapacity > 0) {
+                    actualBufferFrames = nativeCapacity
+                }
+                val adjusted = aaudioNative.setBufferSizeInFrames(handle, startBufferFrames)
+                if (adjusted > 0) {
+                    targetBufferFrames = adjusted
+                }
+                AAudioOutputSink(aaudioNative, handle, actualBufferFrames).also {
+                    it.setVolume(effectiveVolume())
+                }
+            } else {
+                Log.w(LOG_TAG, "AAudio createStream failed; falling back to AudioTrack")
+                null
+            }
+        } else {
+            null
+        } ?: createAudioTrackSink(
+            sampleRate = sampleRate,
+            channels = channels,
+            capacityBufferFrames = capacityBufferFrames,
+            startBufferFrames = startBufferFrames,
+            requestedLatencyMs = requestedLatencyMs
+        )?.also { sink ->
+            actualBufferFrames = sink.bufferCapacityFrames
+            val adjustedFrames = sink.setBufferSizeInFrames(startBufferFrames)
+            if (adjustedFrames > 0) {
+                targetBufferFrames = adjustedFrames
+            }
+        }
+
+        if (createdSink == null) {
+            return null
+        }
+
+        playbackSink = createdSink
+        currentOutputBackend = profile.outputBackend
+        currentSampleRate = sampleRate
+        currentChannels = channels
+        currentBufferSizeFrames = actualBufferFrames
+        currentTargetBufferFrames = min(actualBufferFrames, targetBufferFrames)
+        currentUseBlockingWrites = useBlockingWrites
+        adaptivePlaybackBufferMs = (currentTargetBufferFrames * 1000L / sampleRate)
+            .toInt()
+            .coerceIn(minLatencyMs(), MAX_LATENCY_MS)
+        lastSequence = -1L
+        lastKnownUnderrunCount = 0
+        playbackStartedAtMs = 0L
+        audioLatencyMs = Double.NaN
+        networkLatencyMs = Double.NaN
+        writtenFrames.set(0)
+        audioTrackCreateCount += 1
+        Log.i(
+            LOG_TAG,
+            "created AudioOutput(${createdSink.backendName}) #$audioTrackCreateCount sampleRate=$sampleRate channels=$channels capacityFrames=$actualBufferFrames targetFrames=$currentTargetBufferFrames blocking=$currentUseBlockingWrites"
+        )
+        return playbackSink
+    }
+
+    private fun createAudioTrackSink(
+        sampleRate: Int,
+        channels: Int,
+        capacityBufferFrames: Int,
+        startBufferFrames: Int,
+        requestedLatencyMs: Int
+    ): AudioTrackOutputSink? {
+        val channelMask = when (channels) {
+            1 -> AudioFormat.CHANNEL_OUT_MONO
+            2 -> AudioFormat.CHANNEL_OUT_STEREO
+            6 -> AudioFormat.CHANNEL_OUT_5POINT1
+            else -> AudioFormat.CHANNEL_OUT_STEREO
+        }
+        val minBufferSize = AudioTrack.getMinBufferSize(
+            sampleRate,
+            channelMask,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBufferSize <= 0) {
+            Log.w(LOG_TAG, "AudioTrack minBufferSize invalid=$minBufferSize sampleRate=$sampleRate channels=$channels")
+            return null
+        }
+
         val capacityBufferSize = max(
             minBufferSize,
             capacityBufferFrames * max(1, channels) * 2
@@ -4495,10 +4586,7 @@ class AudioReceiverEngine(private val context: Context) {
             builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
         }
 
-        val useBlockingWrites = shouldUseBlockingWrites(sampleRate, requestedLatencyMs)
-        var actualBufferFrames = capacityBufferSize / (max(1, channels) * 2)
-        var targetBufferFrames = startBufferFrames
-        audioTrack = try {
+        val track = try {
             builder.build()
         } catch (error: IllegalArgumentException) {
             Log.w(LOG_TAG, "AudioTrack build failed", error)
@@ -4506,59 +4594,18 @@ class AudioReceiverEngine(private val context: Context) {
         } catch (error: UnsupportedOperationException) {
             Log.w(LOG_TAG, "AudioTrack build unsupported", error)
             return null
-        }.apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val adjustedFrames = setBufferSizeInFrames(startBufferFrames)
-                if (adjustedFrames > 0) {
-                    targetBufferFrames = adjustedFrames
-                }
-            }
-            setVolume(if (muted) 0f else volume)
         }
-        currentSampleRate = sampleRate
-        currentChannels = channels
-        currentBufferSizeFrames = actualBufferFrames
-        currentTargetBufferFrames = min(actualBufferFrames, targetBufferFrames)
-        currentUseBlockingWrites = useBlockingWrites
-        adaptivePlaybackBufferMs = (currentTargetBufferFrames * 1000L / sampleRate)
-            .toInt()
-            .coerceIn(minLatencyMs(), MAX_LATENCY_MS)
-        lastPlaybackHead = 0
-        playbackHeadWraps = 0
-        lastSequence = -1L
-        lastKnownUnderrunCount = 0
-        playbackStartedAtMs = 0L
-        audioLatencyMs = Double.NaN
-        networkLatencyMs = Double.NaN
-        writtenFrames.set(0)
-        audioTrackCreateCount += 1
-        Log.i(
-            LOG_TAG,
-            "created AudioTrack #$audioTrackCreateCount sampleRate=$sampleRate channels=$channels minBuffer=$minBufferSize capacityBytes=$capacityBufferSize targetFrames=$currentTargetBufferFrames blocking=$currentUseBlockingWrites"
-        )
-        return audioTrack
-    }
-
-    private fun playbackFrames(track: AudioTrack): Long {
-        val rawHead = track.playbackHeadPosition
-        if (rawHead < lastPlaybackHead && lastPlaybackHead - rawHead > Int.MAX_VALUE / 2) {
-            playbackHeadWraps += 1L
+        val actualBufferFrames = capacityBufferSize / (max(1, channels) * 2)
+        return AudioTrackOutputSink(track, actualBufferFrames).also {
+            it.setBufferSizeInFrames(startBufferFrames)
+            it.setVolume(effectiveVolume())
         }
-        lastPlaybackHead = rawHead
-        return (playbackHeadWraps shl 32) + rawHead.toLong()
     }
 
     private fun releaseAudioTrack() {
-        audioTrack?.run {
-            try {
-                pause()
-                flush()
-                stop()
-            } catch (_: IllegalStateException) {
-            }
-            release()
-        }
-        audioTrack = null
+        playbackSink?.release()
+        playbackSink = null
+        currentOutputBackend = OutputAudioBackend.AUTO
         releaseOpusDecoder()
         releaseAacDecoder()
         currentInputSampleRate = 0

@@ -28,6 +28,7 @@ void main() {
       selectedSoundboardPath: r'C:\sounds\two.mp3',
       soundboardTarget: SoundboardPlaybackTarget.stream,
       selectedSoundboardOutputDeviceId: 'cable-1',
+      selectedCaptureOutputDeviceId: 'speakers-realtek',
       soundboardVolume: 0.31,
       silentConnectionTimeoutSeconds: 300,
     );
@@ -46,6 +47,10 @@ void main() {
     expect(
       restored.selectedSoundboardOutputDeviceId,
       preferences.selectedSoundboardOutputDeviceId,
+    );
+    expect(
+      restored.selectedCaptureOutputDeviceId,
+      preferences.selectedCaptureOutputDeviceId,
     );
     expect(restored.soundboardVolume, preferences.soundboardVolume);
     expect(

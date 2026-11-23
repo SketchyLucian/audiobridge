@@ -19,6 +19,7 @@ class PlatformAudioCapabilities {
       RelayTransport.usb,
     },
     this.soundboardOutputDevices = const [],
+    this.captureOutputDevices = const [],
     this.canPlaySoundEffects = false,
     this.detail,
   });
@@ -32,6 +33,7 @@ class PlatformAudioCapabilities {
   final Map<AudioCodec, CodecBitrateRange> codecBitrateRanges;
   final Set<RelayTransport> supportedTransports;
   final List<SoundboardOutputDevice> soundboardOutputDevices;
+  final List<SoundboardOutputDevice> captureOutputDevices;
   final bool canPlaySoundEffects;
   final String? detail;
 
@@ -41,6 +43,7 @@ class PlatformAudioCapabilities {
     final bitrateRanges = payload['codecBitrateRanges'];
     final transportNames = payload['supportedTransports'];
     final soundboardOutputDevices = payload['soundboardOutputDevices'];
+    final captureOutputDevices = payload['captureOutputDevices'];
 
     return PlatformAudioCapabilities(
       platform: payload['platform']?.toString() ?? _platformName(),
@@ -53,6 +56,9 @@ class PlatformAudioCapabilities {
       supportedTransports: _readSupportedTransports(transportNames),
       soundboardOutputDevices: _readSoundboardOutputDevices(
         soundboardOutputDevices,
+      ),
+      captureOutputDevices: _readSoundboardOutputDevices(
+        captureOutputDevices,
       ),
       canPlaySoundEffects: payload['canPlaySoundEffects'] == true,
       detail: payload['detail']?.toString(),
@@ -324,9 +330,13 @@ abstract interface class AudioRelayEngine {
     AudioProfile profile, {
     String? networkBindAddress,
     RelayTransport transport = RelayTransport.wifi,
+    String? captureOutputDeviceId,
   });
 
-  Future<void> prepareUsbSender(AudioProfile profile);
+  Future<void> prepareUsbSender(
+    AudioProfile profile, {
+    String? captureOutputDeviceId,
+  });
 
   Future<void> prepareUsbReceiver(AudioProfile profile);
 
@@ -334,7 +344,10 @@ abstract interface class AudioRelayEngine {
 
   Future<void> connectToSender(RelayDevice device, AudioProfile profile);
 
-  Future<void> startStream(AudioProfile profile);
+  Future<void> startStream(
+    AudioProfile profile, {
+    String? captureOutputDeviceId,
+  });
 
   Future<void> stopStream();
 
@@ -401,6 +414,7 @@ class MethodChannelAudioRelayEngine implements AudioRelayEngine {
     AudioProfile profile, {
     String? networkBindAddress,
     RelayTransport transport = RelayTransport.wifi,
+    String? captureOutputDeviceId,
   }) {
     final networkBindKey = networkBindAddress == null
         ? null
@@ -408,14 +422,21 @@ class MethodChannelAudioRelayEngine implements AudioRelayEngine {
     final payload = {
       ...profile.toMap(),
       'transport': transport.name,
+      'captureOutputDeviceId': captureOutputDeviceId ?? '',
       ?networkBindKey: networkBindAddress,
     };
     return _invoke('prepareSender', payload);
   }
 
   @override
-  Future<void> prepareUsbSender(AudioProfile profile) {
-    return _invoke('prepareUsbSender', profile.toMap());
+  Future<void> prepareUsbSender(
+    AudioProfile profile, {
+    String? captureOutputDeviceId,
+  }) {
+    return _invoke('prepareUsbSender', {
+      ...profile.toMap(),
+      'captureOutputDeviceId': captureOutputDeviceId ?? '',
+    });
   }
 
   @override
@@ -444,8 +465,15 @@ class MethodChannelAudioRelayEngine implements AudioRelayEngine {
   }
 
   @override
-  Future<void> startStream(AudioProfile profile) {
-    return _invoke('startStream', profile.toMap());
+  Future<void> startStream(
+    AudioProfile profile, {
+    String? captureOutputDeviceId,
+  }) {
+    final payload = {
+      ...profile.toMap(),
+      'captureOutputDeviceId': ?captureOutputDeviceId,
+    };
+    return _invoke('startStream', payload);
   }
 
   @override

@@ -3094,6 +3094,102 @@ void main() {
 
     controller.dispose();
   });
+
+  test('oboe output backend is marked implemented', () {
+    expect(OutputAudioBackend.oboe.isImplemented, true);
+  });
+
+  test('windows sender can select and live-switch capture output device', () async {
+    final engine = _FakeAudioRelayEngine(
+      capabilities: const PlatformAudioCapabilities(
+        platform: 'windows',
+        canSend: true,
+        canReceive: true,
+        backend: 'fake',
+        supportedCodecs: {AudioCodec.pcm},
+        supportedOutputBackends: {OutputAudioBackend.auto},
+        codecBitrateRanges: {},
+        captureOutputDevices: [
+          SoundboardOutputDevice(
+            id: 'speakers-1',
+            name: 'Speakers (Realtek(R) Audio)',
+            isDefault: true,
+          ),
+          SoundboardOutputDevice(
+            id: 'hdmi-1',
+            name: 'LG FULL HD (NVIDIA High Definition Audio)',
+            isDefault: false,
+          ),
+        ],
+      ),
+    );
+    final controller = AudioRelayController(
+      engine: engine,
+      discoveryService: _FakeDiscoveryService(),
+      profileStore: _FakeAudioProfileStore(),
+      preferencesStore: _FakeAudioRelayPreferencesStore(),
+      appVersionProvider: () async => '1.6.0',
+      checkForUpdatesOnInitialize: false,
+    );
+    await controller.initialize();
+
+    expect(controller.canSelectCaptureOutputDevice, true);
+    expect(controller.effectiveSelectedCaptureOutputDeviceId, isNull);
+
+    await controller.startDiscovery();
+    await controller.startSenderStream();
+    expect(engine.senderCaptureOutputDeviceIds.last, isNull);
+
+    await controller.selectCaptureOutputDevice('hdmi-1');
+    expect(controller.effectiveSelectedCaptureOutputDeviceId, 'hdmi-1');
+    expect(engine.senderCaptureOutputDeviceIds.last, 'hdmi-1');
+
+    await controller.selectCaptureOutputDevice('');
+    expect(controller.effectiveSelectedCaptureOutputDeviceId, isNull);
+    expect(engine.senderCaptureOutputDeviceIds.last, isNull);
+
+    controller.dispose();
+  });
+
+  test('telemetry-only metrics polls notify metricsListenable without full rebuilds', () async {
+    final engine = _FakeAudioRelayEngine(
+      capabilities: _supportedCapabilities,
+    );
+    final controller =
+        AudioRelayController(
+            engine: engine,
+            discoveryService: _FakeDiscoveryService(),
+            checkForUpdatesOnInitialize: false,
+          )
+          ..role = RelayRole.sender
+          ..capabilities = _supportedCapabilities;
+
+    await controller.startDiscovery();
+    await controller.startSenderStream();
+
+    engine.metrics = const AudioRelayMetrics(
+      peerConnected: true,
+      signalLevel: 0.42,
+      outputLatencyMs: 24,
+    );
+
+    var controllerNotifications = 0;
+    var metricsNotifications = 0;
+    controller.addListener(() {
+      controllerNotifications += 1;
+    });
+    controller.metricsListenable.addListener(() {
+      metricsNotifications += 1;
+    });
+
+    await controller.pollMetricsForTesting();
+
+    expect(controller.signalLevel, closeTo(0.42, 0.001));
+    expect(controllerNotifications, 0);
+    expect(metricsNotifications, 1);
+
+    controller.dispose();
+  });
 }
 
 const _supportedCapabilities = PlatformAudioCapabilities(
@@ -3256,6 +3352,8 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   final List<RelayDevice> connectedDevices = [];
   final List<String?> senderBindAddresses = [];
   final List<RelayTransport> senderTransports = [];
+  final List<String?> senderCaptureOutputDeviceIds = [];
+  final List<String?> startedCaptureOutputDeviceIds = [];
   final List<String> soundEffectPaths = [];
   final List<double> soundEffectVolumes = [];
   final List<SoundboardPlaybackTarget> soundEffectTargets = [];
@@ -3295,17 +3393,23 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
     AudioProfile profile, {
     String? networkBindAddress,
     RelayTransport transport = RelayTransport.wifi,
+    String? captureOutputDeviceId,
   }) async {
     calls.add('prepareSender');
     profiles.add(profile);
     senderBindAddresses.add(networkBindAddress);
     senderTransports.add(transport);
+    senderCaptureOutputDeviceIds.add(captureOutputDeviceId);
   }
 
   @override
-  Future<void> prepareUsbSender(AudioProfile profile) async {
+  Future<void> prepareUsbSender(
+    AudioProfile profile, {
+    String? captureOutputDeviceId,
+  }) async {
     calls.add('prepareUsbSender');
     profiles.add(profile);
+    senderCaptureOutputDeviceIds.add(captureOutputDeviceId);
     final error = prepareUsbError;
     if (error != null) {
       throw error;
@@ -3362,9 +3466,13 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
   }
 
   @override
-  Future<void> startStream(AudioProfile profile) async {
+  Future<void> startStream(
+    AudioProfile profile, {
+    String? captureOutputDeviceId,
+  }) async {
     calls.add('startStream');
     startedProfiles.add(profile);
+    startedCaptureOutputDeviceIds.add(captureOutputDeviceId);
   }
 
   @override

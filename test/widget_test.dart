@@ -171,13 +171,17 @@ class _WidgetTestAudioEngine implements AudioRelayEngine {
     AudioProfile profile, {
     String? networkBindAddress,
     RelayTransport transport = RelayTransport.wifi,
+    String? captureOutputDeviceId,
   }) async {}
 
   @override
   Future<void> prepareUsbReceiver(AudioProfile profile) async {}
 
   @override
-  Future<void> prepareUsbSender(AudioProfile profile) async {}
+  Future<void> prepareUsbSender(
+    AudioProfile profile, {
+    String? captureOutputDeviceId,
+  }) async {}
 
   @override
   Future<void> setMuted(bool value) async {}
@@ -186,7 +190,10 @@ class _WidgetTestAudioEngine implements AudioRelayEngine {
   Future<void> setVolume(double value) async {}
 
   @override
-  Future<void> startStream(AudioProfile profile) async {
+  Future<void> startStream(
+    AudioProfile profile, {
+    String? captureOutputDeviceId,
+  }) async {
     startStreamCalls += 1;
   }
 

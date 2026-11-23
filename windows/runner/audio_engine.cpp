@@ -3,6 +3,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include "audio_codecs.h"
+
 #include <audioclient.h>
 #include <avrt.h>
 #include <cmath>
@@ -19,6 +21,7 @@
 #include <mfreadwrite.h>
 #include <mmdeviceapi.h>
 #include <mmreg.h>
+#include <mmsystem.h>
 #include <objbase.h>
 #include <propsys.h>
 #include <propvarutil.h>
@@ -30,8 +33,6 @@
 #include <usbiodef.h>
 #include <winusb.h>
 #include <wrl/client.h>
-
-#include "opus.h"
 
 #include <algorithm>
 #include <array>
@@ -48,6 +49,30 @@
 #include <vector>
 
 namespace {
+
+using namespace audiobridge_codecs;
+
+constexpr ULONGLONG kMaxUsbLogBytes = 64 * 1024;
+
+class ScopedTimerResolution {
+ public:
+  explicit ScopedTimerResolution(UINT period_ms = 1) : period_ms_(period_ms) {
+    active_ = (timeBeginPeriod(period_ms_) == TIMERR_NOERROR);
+  }
+
+  ~ScopedTimerResolution() {
+    if (active_) {
+      timeEndPeriod(period_ms_);
+    }
+  }
+
+  ScopedTimerResolution(const ScopedTimerResolution&) = delete;
+  ScopedTimerResolution& operator=(const ScopedTimerResolution&) = delete;
+
+ private:
+  UINT period_ms_ = 1;
+  bool active_ = false;
+};
 
 void UsbDebugLog(const std::string& message) {
   static std::mutex log_mutex;
@@ -66,7 +91,19 @@ void UsbDebugLog(const std::string& message) {
   const std::string path =
       temp_length > 0 ? std::string(temp_path) + "AudioBridgeNativeUsb.log"
                       : "AudioBridgeNativeUsb.log";
-  std::ofstream file(path, std::ios::app);
+
+  std::ios_base::openmode mode = std::ios::app;
+  WIN32_FILE_ATTRIBUTE_DATA attrs = {};
+  if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs)) {
+    const ULONGLONG file_size =
+        (static_cast<ULONGLONG>(attrs.nFileSizeHigh) << 32) |
+        attrs.nFileSizeLow;
+    if (file_size >= kMaxUsbLogBytes) {
+      mode = std::ios::trunc;
+    }
+  }
+
+  std::ofstream file(path, mode);
   file << line;
   OutputDebugStringA(line);
 }
@@ -143,10 +180,14 @@ class DefaultRenderDeviceWatcher final : public IMMNotificationClient {
     return count;
   }
 
-  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR,
+  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR device_id,
                                                  DWORD new_state) override {
     if (new_state != DEVICE_STATE_ACTIVE) {
-      changed_.store(true);
+      std::scoped_lock lock(watch_mutex_);
+      if (watched_device_id_.empty() ||
+          (device_id != nullptr && watched_device_id_ == device_id)) {
+        changed_.store(true);
+      }
     }
     return S_OK;
   }
@@ -163,7 +204,10 @@ class DefaultRenderDeviceWatcher final : public IMMNotificationClient {
                                                    ERole role,
                                                    LPCWSTR) override {
     if (flow == eRender && role == eConsole) {
-      changed_.store(true);
+      std::scoped_lock lock(watch_mutex_);
+      if (watched_device_id_.empty()) {
+        changed_.store(true);
+      }
     }
     return S_OK;
   }
@@ -171,6 +215,11 @@ class DefaultRenderDeviceWatcher final : public IMMNotificationClient {
   HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR,
                                                    const PROPERTYKEY) override {
     return S_OK;
+  }
+
+  void SetWatchedDeviceId(std::wstring device_id) {
+    std::scoped_lock lock(watch_mutex_);
+    watched_device_id_ = std::move(device_id);
   }
 
   void ResetChanged() {
@@ -184,6 +233,8 @@ class DefaultRenderDeviceWatcher final : public IMMNotificationClient {
  private:
   std::atomic<ULONG> reference_count_ = 1;
   std::atomic_bool changed_ = false;
+  std::mutex watch_mutex_;
+  std::wstring watched_device_id_;
 };
 
 std::string GuidToString(const GUID& guid) {
@@ -240,15 +291,6 @@ constexpr uint32_t kPacketV2Magic = 0x32524241;  // ABR2, little-endian.
 constexpr uint32_t kPacketV3Magic = 0x33524241;  // ABR3, little-endian.
 constexpr uint32_t kPacketV4Magic = 0x34524241;  // ABR4, little-endian.
 constexpr uint32_t kPacketV5Magic = 0x35524241;  // ABR5, little-endian.
-constexpr uint16_t kCodecPcm = 0;
-constexpr uint16_t kCodecOpus = 1;
-constexpr uint16_t kCodecAac = 2;
-constexpr uint16_t kCodecG711MuLaw = 8;
-constexpr uint16_t kCodecG711ALaw = 9;
-constexpr uint16_t kCodecImaAdpcm = 10;
-constexpr uint16_t kPacketKindAudio = 0;
-constexpr uint16_t kPacketKindHeartbeat = 1;
-constexpr uint16_t kPacketFlagMuted = 1;
 constexpr uint32_t kReceiverOptionAdaptiveBuffer = 1;
 constexpr int kReceiverOptionModeShift = 4;
 constexpr uint32_t kReceiverOptionModeMask = 3u << kReceiverOptionModeShift;
@@ -258,16 +300,6 @@ constexpr uint32_t kReceiverOptionCustomCapMask =
 constexpr int kReceiverOptionBitrateShift = 20;
 constexpr uint32_t kReceiverOptionBitrateMask =
     0xFFFu << kReceiverOptionBitrateShift;
-constexpr int kAacSamplesPerFrame = 1024;
-constexpr int kOpusSampleRate = 48000;
-constexpr int kOpusLowFrameSamples = kOpusSampleRate * 25 / 10000;
-constexpr int kOpusShortFrameMs = 5;
-constexpr int kOpusLongFrameMs = 10;
-constexpr int kOpusShortFrameSamples =
-    kOpusSampleRate * kOpusShortFrameMs / 1000;
-constexpr int kOpusLongFrameSamples =
-    kOpusSampleRate * kOpusLongFrameMs / 1000;
-constexpr int kOpusMaxPacketBytes = 4000;
 constexpr int64_t kSequenceModulus = 0x100000000LL;
 constexpr int kAdaptiveBufferCooldownMs = 1500;
 constexpr int kAdaptiveBufferRelaxMs = 6000;
@@ -366,14 +398,6 @@ struct PcmPlaybackPacket {
   int sample_rate = 48000;
   int channels = 2;
   uint16_t flags = 0;
-};
-
-struct EncodedAudioPacket {
-  std::vector<uint8_t> payload;
-  uint16_t codec_id = kCodecPcm;
-  uint16_t packet_kind = kPacketKindAudio;
-  uint16_t flags = 0;
-  uint32_t decoded_frame_count = 0;
 };
 
 struct RemoteReceiverClockEcho {
@@ -821,20 +845,6 @@ std::string WideToUtf8(const wchar_t* value) {
   return result;
 }
 
-int OpusFrameSamplesForPacketTime(int packet_time_ms) {
-  if (packet_time_ms <= 2) {
-    return kOpusLowFrameSamples;
-  }
-  return packet_time_ms <= kOpusShortFrameMs ? kOpusShortFrameSamples
-                                             : kOpusLongFrameSamples;
-}
-
-bool IsSupportedOpusFrameSamples(int frame_samples) {
-  return frame_samples == kOpusLowFrameSamples ||
-         frame_samples == kOpusShortFrameSamples ||
-         frame_samples == kOpusLongFrameSamples;
-}
-
 std::optional<double> ParseDoubleMetric(const std::string& message,
                                         const char* key) {
   const std::string token = std::string(key) + "=";
@@ -1220,653 +1230,6 @@ uint64_t ReadU64Le(const uint8_t* data) {
   return value;
 }
 
-uint8_t LinearToMuLaw(int16_t sample) {
-  constexpr int kBias = 0x84;
-  constexpr int kClip = 32635;
-  int value = sample;
-  const int sign = (value >> 8) & 0x80;
-  if (sign != 0) {
-    value = -value;
-  }
-  value = std::min(value, kClip) + kBias;
-
-  int exponent = 7;
-  for (int mask = 0x4000; (value & mask) == 0 && exponent > 0;
-       mask >>= 1) {
-    --exponent;
-  }
-  const int mantissa = (value >> (exponent + 3)) & 0x0F;
-  return static_cast<uint8_t>(~(sign | (exponent << 4) | mantissa));
-}
-
-uint8_t LinearToALaw(int16_t sample) {
-  int value = sample;
-  int mask = 0xD5;
-  if (value < 0) {
-    value = -value - 1;
-    mask = 0x55;
-  }
-  value = std::min(value, 32635);
-
-  int compressed = 0;
-  if (value >= 256) {
-    int exponent = 7;
-    for (int exp_mask = 0x4000; (value & exp_mask) == 0 && exponent > 0;
-         exp_mask >>= 1) {
-      --exponent;
-    }
-    const int mantissa = (value >> (exponent + 3)) & 0x0F;
-    compressed = (exponent << 4) | mantissa;
-  } else {
-    compressed = value >> 4;
-  }
-
-  return static_cast<uint8_t>(compressed ^ mask);
-}
-
-constexpr int kImaIndexTable[16] = {
-    -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
-constexpr int kImaStepTable[89] = {
-    7,     8,     9,     10,    11,    12,    13,    14,    16,
-    17,    19,    21,    23,    25,    28,    31,    34,    37,
-    41,    45,    50,    55,    60,    66,    73,    80,    88,
-    97,    107,   118,   130,   143,   157,   173,   190,   209,
-    230,   253,   279,   307,   337,   371,   408,   449,   494,
-    544,   598,   658,   724,   796,   876,   963,   1060,  1166,
-    1282,  1411,  1552,  1707,  1878,  2066,  2272,  2499,  2749,
-    3024,  3327,  3660,  4026,  4428,  4871,  5358,  5894,  6484,
-    7132,  7845,  8630,  9493,  10442, 11487, 12635, 13899, 15289,
-    16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
-
-struct ImaAdpcmChannelState {
-  int predictor = 0;
-  int step_index = 0;
-};
-
-uint8_t EncodeImaNibble(int16_t sample, ImaAdpcmChannelState& state) {
-  const int step = kImaStepTable[state.step_index];
-  int diff = static_cast<int>(sample) - state.predictor;
-  uint8_t code = 0;
-  if (diff < 0) {
-    code = 8;
-    diff = -diff;
-  }
-
-  int delta = step >> 3;
-  if (diff >= step) {
-    code |= 4;
-    diff -= step;
-    delta += step;
-  }
-  if (diff >= step >> 1) {
-    code |= 2;
-    diff -= step >> 1;
-    delta += step >> 1;
-  }
-  if (diff >= step >> 2) {
-    code |= 1;
-    delta += step >> 2;
-  }
-
-  state.predictor += (code & 8) != 0 ? -delta : delta;
-  state.predictor = std::clamp(state.predictor, -32768, 32767);
-  state.step_index =
-      std::clamp(state.step_index + kImaIndexTable[code & 0x0F], 0, 88);
-  return code & 0x0F;
-}
-
-class PcmCodecAdapter {
- public:
-  EncodedAudioPacket Encode(const std::vector<int16_t>& pcm, int channels,
-                            bool muted) const {
-    EncodedAudioPacket packet;
-    packet.flags = muted ? kPacketFlagMuted : 0;
-    packet.decoded_frame_count = channels <= 0
-                                     ? 0
-                                     : static_cast<uint32_t>(pcm.size() /
-                                                             channels);
-    packet.payload.resize(pcm.size() * sizeof(int16_t));
-    if (!packet.payload.empty()) {
-      std::memcpy(packet.payload.data(), pcm.data(), packet.payload.size());
-    }
-    return packet;
-  }
-};
-
-class AacCodecAdapter {
- public:
-  AacCodecAdapter() = default;
-
-  ~AacCodecAdapter() {
-    Shutdown();
-  }
-
-  bool Configure(int sample_rate, int channels, int bitrate_bps) {
-    const int clamped_sample_rate = std::clamp(sample_rate, 8000, 96000);
-    const int clamped_channels = std::clamp(channels, 1, 2);
-    const int clamped_bitrate = std::clamp(bitrate_bps, 96000, 192000);
-    if (writer_ != nullptr && sample_rate_ == clamped_sample_rate &&
-        channels_ == clamped_channels && bitrate_bps_ == clamped_bitrate) {
-      return true;
-    }
-
-    Shutdown();
-
-    Microsoft::WRL::ComPtr<IMFMediaType> output_type;
-    HRESULT hr = MFCreateMediaType(&output_type);
-    if (FAILED(hr)) {
-      return false;
-    }
-    output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    output_type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-    output_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND,
-                           clamped_sample_rate);
-    output_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, clamped_channels);
-    output_type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    output_type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
-                           clamped_bitrate / 8);
-    output_type->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
-    output_type->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
-
-    Microsoft::WRL::ComPtr<IMFMediaType> input_type;
-    hr = MFCreateMediaType(&input_type);
-    if (FAILED(hr)) {
-      return false;
-    }
-    input_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    input_type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-    input_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND,
-                          clamped_sample_rate);
-    input_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, clamped_channels);
-    input_type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    input_type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT,
-                          clamped_channels * sizeof(int16_t));
-    input_type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
-                          clamped_sample_rate * clamped_channels *
-                              static_cast<int>(sizeof(int16_t)));
-
-    Microsoft::WRL::ComPtr<IMFByteStream> byte_stream;
-    hr = MFCreateMFByteStreamOnStreamEx(
-        static_cast<IStream*>(&stream_), &byte_stream);
-    if (FAILED(hr)) {
-      return false;
-    }
-
-    Microsoft::WRL::ComPtr<IMFMediaSink> media_sink;
-    hr = MFCreateADTSMediaSink(byte_stream.Get(), output_type.Get(),
-                               &media_sink);
-    if (FAILED(hr)) {
-      return false;
-    }
-
-    Microsoft::WRL::ComPtr<IMFSinkWriter> writer;
-    hr = MFCreateSinkWriterFromMediaSink(media_sink.Get(), nullptr, &writer);
-    if (FAILED(hr)) {
-      media_sink->Shutdown();
-      return false;
-    }
-
-    constexpr DWORD stream_index = 0;
-    hr = writer->SetInputMediaType(stream_index, input_type.Get(), nullptr);
-    if (FAILED(hr)) {
-      media_sink->Shutdown();
-      return false;
-    }
-    hr = writer->BeginWriting();
-    if (FAILED(hr)) {
-      media_sink->Shutdown();
-      return false;
-    }
-
-    writer_ = writer;
-    media_sink_ = media_sink;
-    stream_index_ = stream_index;
-    sample_rate_ = clamped_sample_rate;
-    channels_ = clamped_channels;
-    bitrate_bps_ = clamped_bitrate;
-    written_frames_ = 0;
-    stream_.Drain();
-    return true;
-  }
-
-  EncodedAudioPacket Encode(const std::vector<int16_t>& pcm, int channels,
-                            bool muted) {
-    EncodedAudioPacket packet;
-    packet.codec_id = kCodecAac;
-    packet.flags = muted ? kPacketFlagMuted : 0;
-    packet.decoded_frame_count = 0;
-    if (writer_ == nullptr || pcm.empty()) {
-      return packet;
-    }
-
-    const size_t bytes = pcm.size() * sizeof(int16_t);
-    Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(bytes), &buffer);
-    if (FAILED(hr)) {
-      return packet;
-    }
-
-    BYTE* output = nullptr;
-    hr = buffer->Lock(&output, nullptr, nullptr);
-    if (FAILED(hr)) {
-      return packet;
-    }
-    if (muted) {
-      std::memset(output, 0, bytes);
-    } else {
-      std::memcpy(output, pcm.data(), bytes);
-    }
-    buffer->Unlock();
-    buffer->SetCurrentLength(static_cast<DWORD>(bytes));
-
-    Microsoft::WRL::ComPtr<IMFSample> sample;
-    hr = MFCreateSample(&sample);
-    if (FAILED(hr)) {
-      return packet;
-    }
-    sample->AddBuffer(buffer.Get());
-
-    const int frame_count =
-        channels_ <= 0 ? 0 : static_cast<int>(pcm.size()) / channels_;
-    sample->SetSampleTime(written_frames_ * 10000000LL / sample_rate_);
-    sample->SetSampleDuration(frame_count * 10000000LL / sample_rate_);
-    written_frames_ += frame_count;
-
-    hr = writer_->WriteSample(stream_index_, sample.Get());
-    if (FAILED(hr)) {
-      Shutdown();
-      return packet;
-    }
-
-    packet.payload = stream_.Drain();
-    return packet;
-  }
-
-  void Shutdown() {
-    if (writer_ != nullptr) {
-      writer_->Finalize();
-    }
-    writer_.Reset();
-    if (media_sink_ != nullptr) {
-      media_sink_->Shutdown();
-    }
-    media_sink_.Reset();
-    stream_index_ = 0;
-    written_frames_ = 0;
-    stream_.Drain();
-  }
-
- private:
-  class MemoryStream final : public IStream {
-   public:
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
-                                             void** object) override {
-      if (object == nullptr) {
-        return E_POINTER;
-      }
-      if (riid == IID_IUnknown || riid == IID_IStream ||
-          riid == IID_ISequentialStream) {
-        *object = static_cast<IStream*>(this);
-        AddRef();
-        return S_OK;
-      }
-      *object = nullptr;
-      return E_NOINTERFACE;
-    }
-
-    ULONG STDMETHODCALLTYPE AddRef() override {
-      return ++reference_count_;
-    }
-
-    ULONG STDMETHODCALLTYPE Release() override {
-      const ULONG count = --reference_count_;
-      return count;
-    }
-
-    HRESULT STDMETHODCALLTYPE Read(void* data, ULONG bytes,
-                                   ULONG* bytes_read) override {
-      if (bytes_read != nullptr) {
-        *bytes_read = 0;
-      }
-      if (data == nullptr) {
-        return STG_E_INVALIDPOINTER;
-      }
-      std::scoped_lock lock(mutex_);
-      const size_t available = position_ < storage_.size()
-                                   ? storage_.size() - position_
-                                   : 0;
-      const size_t count = std::min<size_t>(bytes, available);
-      if (count > 0) {
-        std::memcpy(data, storage_.data() + position_, count);
-        position_ += count;
-      }
-      if (bytes_read != nullptr) {
-        *bytes_read = static_cast<ULONG>(count);
-      }
-      return count == bytes ? S_OK : S_FALSE;
-    }
-
-    HRESULT STDMETHODCALLTYPE Write(const void* data, ULONG bytes,
-                                    ULONG* bytes_written) override {
-      if (bytes_written != nullptr) {
-        *bytes_written = 0;
-      }
-      if (data == nullptr) {
-        return STG_E_INVALIDPOINTER;
-      }
-      std::scoped_lock lock(mutex_);
-      if (position_ + bytes > storage_.size()) {
-        storage_.resize(position_ + bytes);
-      }
-      std::memcpy(storage_.data() + position_, data, bytes);
-      position_ += bytes;
-      if (bytes_written != nullptr) {
-        *bytes_written = bytes;
-      }
-      return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move, DWORD origin,
-                                   ULARGE_INTEGER* new_position) override {
-      std::scoped_lock lock(mutex_);
-      int64_t base = 0;
-      if (origin == STREAM_SEEK_CUR) {
-        base = static_cast<int64_t>(position_);
-      } else if (origin == STREAM_SEEK_END) {
-        base = static_cast<int64_t>(storage_.size());
-      } else if (origin != STREAM_SEEK_SET) {
-        return STG_E_INVALIDFUNCTION;
-      }
-
-      const int64_t next = base + move.QuadPart;
-      if (next < 0) {
-        return STG_E_INVALIDFUNCTION;
-      }
-      position_ = static_cast<size_t>(next);
-      if (new_position != nullptr) {
-        new_position->QuadPart = position_;
-      }
-      return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER size) override {
-      std::scoped_lock lock(mutex_);
-      storage_.resize(static_cast<size_t>(size.QuadPart));
-      if (position_ > storage_.size()) {
-        position_ = storage_.size();
-      }
-      return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE CopyTo(IStream* target, ULARGE_INTEGER bytes,
-                                     ULARGE_INTEGER* bytes_read,
-                                     ULARGE_INTEGER* bytes_written) override {
-      if (bytes_read != nullptr) {
-        bytes_read->QuadPart = 0;
-      }
-      if (bytes_written != nullptr) {
-        bytes_written->QuadPart = 0;
-      }
-      if (target == nullptr) {
-        return STG_E_INVALIDPOINTER;
-      }
-
-      std::vector<uint8_t> copy;
-      {
-        std::scoped_lock lock(mutex_);
-        const size_t available = position_ < storage_.size()
-                                     ? storage_.size() - position_
-                                     : 0;
-        const size_t count =
-            static_cast<size_t>(std::min<uint64_t>(bytes.QuadPart, available));
-        copy.assign(storage_.begin() + position_,
-                    storage_.begin() + position_ + count);
-        position_ += count;
-      }
-
-      ULONG written = 0;
-      const HRESULT hr =
-          target->Write(copy.data(), static_cast<ULONG>(copy.size()), &written);
-      if (bytes_read != nullptr) {
-        bytes_read->QuadPart = copy.size();
-      }
-      if (bytes_written != nullptr) {
-        bytes_written->QuadPart = written;
-      }
-      return hr;
-    }
-
-    HRESULT STDMETHODCALLTYPE Commit(DWORD) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE Revert() override { return STG_E_REVERTED; }
-    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER,
-                                         DWORD) override {
-      return STG_E_INVALIDFUNCTION;
-    }
-    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER,
-                                           DWORD) override {
-      return STG_E_INVALIDFUNCTION;
-    }
-
-    HRESULT STDMETHODCALLTYPE Stat(STATSTG* stat, DWORD) override {
-      if (stat == nullptr) {
-        return STG_E_INVALIDPOINTER;
-      }
-      std::memset(stat, 0, sizeof(STATSTG));
-      std::scoped_lock lock(mutex_);
-      stat->type = STGTY_STREAM;
-      stat->cbSize.QuadPart = storage_.size();
-      return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE Clone(IStream** copy) override {
-      if (copy == nullptr) {
-        return E_POINTER;
-      }
-      *copy = nullptr;
-      return E_NOTIMPL;
-    }
-
-    std::vector<uint8_t> Drain() {
-      std::scoped_lock lock(mutex_);
-      std::vector<uint8_t> drained;
-      if (read_offset_ < storage_.size()) {
-        drained.assign(storage_.begin() + read_offset_, storage_.end());
-        read_offset_ = storage_.size();
-      }
-      return drained;
-    }
-
-   private:
-    std::atomic<ULONG> reference_count_ = 1;
-    std::mutex mutex_;
-    std::vector<uint8_t> storage_;
-    size_t position_ = 0;
-    size_t read_offset_ = 0;
-  };
-
-  MemoryStream stream_;
-  Microsoft::WRL::ComPtr<IMFSinkWriter> writer_;
-  Microsoft::WRL::ComPtr<IMFMediaSink> media_sink_;
-  DWORD stream_index_ = 0;
-  int sample_rate_ = 0;
-  int channels_ = 0;
-  int bitrate_bps_ = 0;
-  int64_t written_frames_ = 0;
-};
-
-class OpusCodecAdapter {
- public:
-  OpusCodecAdapter() = default;
-
-  ~OpusCodecAdapter() {
-    Shutdown();
-  }
-
-  bool Configure(int channels, int bitrate_bps, bool low_delay) {
-    const int clamped_channels = std::clamp(channels, 1, 2);
-    const int clamped_bitrate = std::clamp(bitrate_bps, 64000, 256000);
-    if (encoder_ != nullptr && channels_ == clamped_channels &&
-        bitrate_bps_ == clamped_bitrate && low_delay_ == low_delay) {
-      return true;
-    }
-
-    Shutdown();
-
-    int error = OPUS_OK;
-    encoder_ = opus_encoder_create(kOpusSampleRate, clamped_channels,
-                                   low_delay
-                                       ? OPUS_APPLICATION_RESTRICTED_LOWDELAY
-                                       : OPUS_APPLICATION_AUDIO,
-                                   &error);
-    if (error != OPUS_OK || encoder_ == nullptr) {
-      encoder_ = nullptr;
-      return false;
-    }
-
-    opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(clamped_bitrate));
-    opus_encoder_ctl(encoder_, OPUS_SET_VBR(0));
-    opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(low_delay ? 4 : 5));
-    opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
-    opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(0));
-    opus_encoder_ctl(encoder_, OPUS_SET_DTX(0));
-    channels_ = clamped_channels;
-    bitrate_bps_ = clamped_bitrate;
-    low_delay_ = low_delay;
-    return true;
-  }
-
-  EncodedAudioPacket Encode(const std::vector<int16_t>& pcm, int channels,
-                            int frame_samples, bool muted) {
-    EncodedAudioPacket packet;
-    packet.codec_id = kCodecOpus;
-    packet.flags = muted ? kPacketFlagMuted : 0;
-    packet.decoded_frame_count = channels <= 0
-                                     ? 0
-                                     : static_cast<uint32_t>(pcm.size() /
-                                                             channels);
-    const int expected_samples = IsSupportedOpusFrameSamples(frame_samples)
-                                     ? frame_samples
-                                     : kOpusShortFrameSamples;
-    if (encoder_ == nullptr || pcm.empty() ||
-        packet.decoded_frame_count != static_cast<uint32_t>(expected_samples)) {
-      return packet;
-    }
-
-    std::vector<int16_t> input(pcm);
-    if (muted) {
-      std::fill(input.begin(), input.end(), int16_t{0});
-    }
-
-    packet.payload.resize(kOpusMaxPacketBytes);
-    const int encoded_bytes = opus_encode(
-        encoder_, input.data(), expected_samples, packet.payload.data(),
-        static_cast<opus_int32>(packet.payload.size()));
-    if (encoded_bytes <= 0) {
-      packet.payload.clear();
-      return packet;
-    }
-    packet.payload.resize(static_cast<size_t>(encoded_bytes));
-    return packet;
-  }
-
-  void Shutdown() {
-    if (encoder_ != nullptr) {
-      opus_encoder_destroy(encoder_);
-      encoder_ = nullptr;
-    }
-    channels_ = 0;
-    bitrate_bps_ = 0;
-    low_delay_ = false;
-  }
-
- private:
-  OpusEncoder* encoder_ = nullptr;
-  int channels_ = 0;
-  int bitrate_bps_ = 0;
-  bool low_delay_ = false;
-};
-
-class G711CodecAdapter {
- public:
-  explicit G711CodecAdapter(bool mu_law) : mu_law_(mu_law) {}
-
-  EncodedAudioPacket Encode(const std::vector<int16_t>& pcm, int channels,
-                            bool muted) const {
-    EncodedAudioPacket packet;
-    packet.codec_id = mu_law_ ? kCodecG711MuLaw : kCodecG711ALaw;
-    packet.flags = muted ? kPacketFlagMuted : 0;
-    packet.decoded_frame_count = channels <= 0
-                                     ? 0
-                                     : static_cast<uint32_t>(pcm.size() /
-                                                             channels);
-    packet.payload.resize(pcm.size());
-    for (size_t index = 0; index < pcm.size(); ++index) {
-      const int16_t sample = muted ? 0 : pcm[index];
-      packet.payload[index] =
-          mu_law_ ? LinearToMuLaw(sample) : LinearToALaw(sample);
-    }
-    return packet;
-  }
-
- private:
-  bool mu_law_;
-};
-
-class ImaAdpcmCodecAdapter {
- public:
-  EncodedAudioPacket Encode(const std::vector<int16_t>& pcm, int channels,
-                            bool muted) {
-    EncodedAudioPacket packet;
-    packet.codec_id = kCodecImaAdpcm;
-    packet.flags = muted ? kPacketFlagMuted : 0;
-    packet.decoded_frame_count = channels <= 0
-                                     ? 0
-                                     : static_cast<uint32_t>(pcm.size() /
-                                                             channels);
-    if (pcm.empty()) {
-      return packet;
-    }
-
-    const int channel_count = std::max(1, channels);
-    std::vector<ImaAdpcmChannelState> states(channel_count);
-    for (int channel = 0; channel < channel_count; ++channel) {
-      const size_t sample_index = static_cast<size_t>(channel);
-      states[channel].predictor =
-          sample_index < pcm.size() && !muted ? pcm[sample_index] : 0;
-      states[channel].step_index = 0;
-    }
-
-    uint8_t pending_nibble = 0;
-    bool has_pending_nibble = false;
-    packet.payload.reserve(channel_count * 4 + (pcm.size() + 1) / 2);
-    for (const auto& state : states) {
-      packet.payload.push_back(static_cast<uint8_t>(state.predictor & 0xFF));
-      packet.payload.push_back(
-          static_cast<uint8_t>((state.predictor >> 8) & 0xFF));
-      packet.payload.push_back(static_cast<uint8_t>(state.step_index));
-      packet.payload.push_back(0);
-    }
-    for (size_t index = 0; index < pcm.size(); ++index) {
-      const int channel = static_cast<int>(index % channel_count);
-      const uint8_t nibble =
-          EncodeImaNibble(muted ? 0 : pcm[index], states[channel]);
-      if (!has_pending_nibble) {
-        pending_nibble = nibble;
-        has_pending_nibble = true;
-      } else {
-        packet.payload.push_back(
-            static_cast<uint8_t>(pending_nibble | (nibble << 4)));
-        has_pending_nibble = false;
-      }
-    }
-    if (has_pending_nibble) {
-      packet.payload.push_back(pending_nibble);
-    }
-
-    return packet;
-  }
-};
-
 void ConfigureLowDelaySocket(SOCKET socket) {
   int send_buffer_bytes = kAudioSocketBufferBytes;
   setsockopt(socket, SOL_SOCKET, SO_SNDBUF,
@@ -1906,6 +1269,8 @@ class WindowsAudioEngine::Impl {
         flutter::EncodableValue(true);
     capabilities[flutter::EncodableValue("soundboardOutputDevices")] =
         flutter::EncodableValue(GetSoundboardOutputDevices());
+    capabilities[flutter::EncodableValue("captureOutputDevices")] =
+        flutter::EncodableValue(GetCaptureOutputDevices());
     capabilities[flutter::EncodableValue("backend")] =
         flutter::EncodableValue("windows-wasapi-codecs-udp-native-usb");
     capabilities[flutter::EncodableValue("detail")] =
@@ -1974,6 +1339,14 @@ class WindowsAudioEngine::Impl {
   }
 
   flutter::EncodableList GetSoundboardOutputDevices() const {
+    return EnumerateRenderOutputDevices(eCommunications);
+  }
+
+  flutter::EncodableList GetCaptureOutputDevices() const {
+    return EnumerateRenderOutputDevices(eConsole);
+  }
+
+  flutter::EncodableList EnumerateRenderOutputDevices(ERole default_role) const {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool owns_com = SUCCEEDED(hr);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -1992,7 +1365,7 @@ class WindowsAudioEngine::Impl {
     std::wstring default_id;
     Microsoft::WRL::ComPtr<IMMDevice> default_device;
     if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(
-            eRender, eCommunications, &default_device))) {
+            eRender, default_role, &default_device))) {
       default_id = DeviceId(default_device.Get());
     }
 
@@ -2190,7 +1563,7 @@ class WindowsAudioEngine::Impl {
       metrics[flutter::EncodableValue("signalLevel")] =
           flutter::EncodableValue(TakeSignalLevel());
 
-      AudioProfile active_profile = profile_;
+      AudioProfile active_profile = CurrentProfile();
       const int input_sample_rate = local_input_sample_rate_.load();
       if (input_sample_rate > 0) {
         active_profile.sample_rate = input_sample_rate;
@@ -2299,7 +1672,8 @@ class WindowsAudioEngine::Impl {
 
   std::optional<std::string> PrepareSender(
       const flutter::EncodableValue* arguments) {
-    profile_ = ReadProfile(arguments);
+    SetProfile(ReadProfile(arguments));
+    ApplyCaptureOutputDeviceFromArguments(arguments);
     transport_mode_ = TransportMode::kWifi;
     usb_receiver_mode_ = false;
     in_addr bind_address = {};
@@ -2359,7 +1733,8 @@ class WindowsAudioEngine::Impl {
   std::optional<std::string> PrepareUsbSender(
       const flutter::EncodableValue* arguments) {
     UsbDebugLog("PrepareUsbSender");
-    profile_ = ReadProfile(arguments);
+    SetProfile(ReadProfile(arguments));
+    ApplyCaptureOutputDeviceFromArguments(arguments);
     transport_mode_ = TransportMode::kUsb;
     usb_receiver_mode_ = false;
 
@@ -2387,10 +1762,11 @@ class WindowsAudioEngine::Impl {
 
   std::optional<std::string> PrepareReceiver(
       const flutter::EncodableValue* arguments) {
-    profile_ = ReadProfile(arguments);
+    const AudioProfile next_profile = ReadProfile(arguments);
+    SetProfile(next_profile);
     transport_mode_ = TransportMode::kWifi;
     usb_receiver_mode_ = false;
-    if (profile_.codec != AudioCodec::kPcm) {
+    if (next_profile.codec != AudioCodec::kPcm) {
       return "Windows receiver playback currently supports PCM only. Select PCM on the sender.";
     }
 
@@ -2427,10 +1803,11 @@ class WindowsAudioEngine::Impl {
 
   std::optional<std::string> PrepareUsbReceiver(
       const flutter::EncodableValue* arguments) {
-    profile_ = ReadProfile(arguments);
+    const AudioProfile next_profile = ReadProfile(arguments);
+    SetProfile(next_profile);
     transport_mode_ = TransportMode::kUsb;
     usb_receiver_mode_ = true;
-    if (profile_.codec != AudioCodec::kPcm) {
+    if (next_profile.codec != AudioCodec::kPcm) {
       return "Windows USB receiver playback currently supports PCM only. Select PCM on the sender.";
     }
 
@@ -2456,9 +1833,9 @@ class WindowsAudioEngine::Impl {
 
     const auto profile_entry = payload.find(flutter::EncodableValue("profile"));
     if (profile_entry != payload.end()) {
-      profile_ = ReadProfile(&profile_entry->second);
+      SetProfile(ReadProfile(&profile_entry->second));
     }
-    if (profile_.codec != AudioCodec::kPcm) {
+    if (CurrentProfile().codec != AudioCodec::kPcm) {
       return "Windows receiver playback currently supports PCM only. Select PCM on the sender.";
     }
 
@@ -2498,10 +1875,14 @@ class WindowsAudioEngine::Impl {
 
   std::optional<std::string> StartStream(
       const flutter::EncodableValue* arguments) {
-    profile_ = ReadProfile(arguments);
-    UsbDebugLog("StartStream transport=" +
-                std::to_string(transport_mode_ == TransportMode::kUsb ? 1 : 0) +
-                " usb_receiver=" + std::to_string(usb_receiver_mode_ ? 1 : 0));
+    const AudioProfile next_profile = ReadProfile(arguments);
+    SetProfile(next_profile);
+    ApplyCaptureOutputDeviceFromArguments(arguments);
+    if (transport_mode_ == TransportMode::kUsb || usb_receiver_mode_) {
+      UsbDebugLog("StartStream transport=" +
+                  std::to_string(transport_mode_ == TransportMode::kUsb ? 1 : 0) +
+                  " usb_receiver=" + std::to_string(usb_receiver_mode_ ? 1 : 0));
+    }
 
     bool has_receiver_source = false;
     {
@@ -2514,7 +1895,7 @@ class WindowsAudioEngine::Impl {
       local_last_peer_packet_received_at_ms_ = 0;
     }
     if (has_receiver_source) {
-      if (profile_.codec != AudioCodec::kPcm) {
+      if (next_profile.codec != AudioCodec::kPcm) {
         return "Windows receiver playback currently supports PCM only. Select PCM on the sender.";
       }
       if (playback_running_) {
@@ -2526,7 +1907,7 @@ class WindowsAudioEngine::Impl {
       if (playback_render_thread_.joinable()) {
         playback_render_thread_.join();
       }
-      ResetLocalAdaptivePlayback(profile_.sample_rate);
+      ResetLocalAdaptivePlayback(next_profile.sample_rate);
       playback_running_ = true;
       playback_receive_thread_ = std::thread(&Impl::PlaybackReceiveLoop, this);
       playback_render_thread_ = std::thread(&Impl::PlaybackRenderLoop, this);
@@ -2534,7 +1915,7 @@ class WindowsAudioEngine::Impl {
     }
 
     if (usb_receiver_mode_) {
-      if (profile_.codec != AudioCodec::kPcm) {
+      if (next_profile.codec != AudioCodec::kPcm) {
         return "Windows USB receiver playback currently supports PCM only. Select PCM on the sender.";
       }
       if (usb_device_handle_ == INVALID_HANDLE_VALUE || usb_winusb_ == nullptr) {
@@ -2552,7 +1933,7 @@ class WindowsAudioEngine::Impl {
       if (playback_render_thread_.joinable()) {
         playback_render_thread_.join();
       }
-      ResetLocalAdaptivePlayback(profile_.sample_rate);
+      ResetLocalAdaptivePlayback(next_profile.sample_rate);
       playback_running_ = true;
       playback_receive_thread_ = std::thread(&Impl::PlaybackReceiveLoop, this);
       playback_render_thread_ = std::thread(&Impl::PlaybackRenderLoop, this);
@@ -2581,13 +1962,17 @@ class WindowsAudioEngine::Impl {
     }
 
     capture_running_ = true;
-    UsbDebugLog("StartStream capture thread starting");
+    if (transport_mode_ == TransportMode::kUsb) {
+      UsbDebugLog("StartStream capture thread starting");
+    }
     capture_thread_ = std::thread(&Impl::CaptureLoop, this);
     return std::nullopt;
   }
 
   void StopStream() {
-    UsbDebugLog("StopStream");
+    if (transport_mode_ == TransportMode::kUsb || usb_receiver_mode_) {
+      UsbDebugLog("StopStream");
+    }
     capture_running_ = false;
     if (capture_thread_.joinable()) {
       capture_thread_.join();
@@ -2680,8 +2065,9 @@ class WindowsAudioEngine::Impl {
     }
 
     const double gain = std::clamp(ReadDouble(map, "volume", 1.0), 0.0, 1.0);
-    const int sample_rate = OutputSampleRateForProfile();
-    const int channels = std::clamp(profile_.channels, 1, 2);
+    const AudioProfile profile = CurrentProfile();
+    const int sample_rate = OutputSampleRateForProfile(profile);
+    const int channels = std::clamp(profile.channels, 1, 2);
     auto decoded = DecodeSoundEffectFile(path, sample_rate, channels, gain);
     if (!decoded.has_value()) {
       return "Unable to decode that sound file.";
@@ -3711,10 +3097,11 @@ class WindowsAudioEngine::Impl {
     WriteU64(packet, 24, static_cast<uint64_t>(now));
     WriteU64(packet, 32, 0);
     WriteU64(packet, 40, 0);
+    const AudioProfile profile = CurrentProfile();
     WriteU32(packet, 48, static_cast<uint32_t>(std::clamp(
-                           profile_.playback_buffer_ms, kMinBufferMs,
+                           profile.playback_buffer_ms, kMinBufferMs,
                            kMaxBufferMs)));
-    WriteU32(packet, 52, ReceiverOptionsFor(profile_));
+    WriteU32(packet, 52, ReceiverOptionsFor(profile));
     WriteU64(packet, 56, session_id);
     return packet;
   }
@@ -4425,9 +3812,9 @@ class WindowsAudioEngine::Impl {
 
   std::vector<int16_t> ReformatPcmForProfile(
       const std::vector<int16_t>& input, int input_sample_rate,
-      int input_channels) {
-    const int output_sample_rate = OutputSampleRateForProfile();
-    const int output_channels = std::clamp(profile_.channels, 1, 2);
+      int input_channels, const AudioProfile& profile) {
+    const int output_sample_rate = OutputSampleRateForProfile(profile);
+    const int output_channels = std::clamp(profile.channels, 1, 2);
     const int source_channels = std::max(1, input_channels);
     const int input_frames = static_cast<int>(input.size()) / source_channels;
     if (input_frames <= 0 || input_sample_rate <= 0) {
@@ -4533,6 +3920,7 @@ class WindowsAudioEngine::Impl {
   }
 
   void CaptureLoop() {
+    ScopedTimerResolution timer_resolution(1);
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool owns_com = SUCCEEDED(hr);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -4561,13 +3949,28 @@ class WindowsAudioEngine::Impl {
     }
 
     while (capture_running_) {
+      capture_device_changed_.store(false);
+      const std::string requested_device_id = CurrentCaptureOutputDeviceId();
+      const std::wstring wide_requested_id = Widen(requested_device_id);
+      watcher->SetWatchedDeviceId(wide_requested_id);
       watcher->ResetChanged();
 
       Microsoft::WRL::ComPtr<IMMDevice> device;
-      hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-      if (FAILED(hr) || !device) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        continue;
+      if (!wide_requested_id.empty()) {
+        hr = enumerator->GetDevice(wide_requested_id.c_str(), &device);
+        DWORD state = 0;
+        if (FAILED(hr) || !device || FAILED(device->GetState(&state)) ||
+            state != DEVICE_STATE_ACTIVE) {
+          device.Reset();
+          watcher->SetWatchedDeviceId(L"");
+        }
+      }
+      if (!device) {
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        if (FAILED(hr) || !device) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          continue;
+        }
       }
 
       Microsoft::WRL::ComPtr<IAudioClient> audio_client;
@@ -4593,15 +3996,47 @@ class WindowsAudioEngine::Impl {
           reinterpret_cast<const WAVEFORMATEX*>(mix_format_storage.data());
       CoTaskMemFree(raw_mix_format);
 
+      const AudioProfile initial_profile = CurrentProfile();
       const int min_capture_buffer_ms =
           transport_mode_ == TransportMode::kUsb ? 5 : 10;
       const REFERENCE_TIME buffer_duration =
           10000000LL *
-          std::max(min_capture_buffer_ms, profile_.capture_buffer_ms) / 1000;
-      hr = audio_client->Initialize(
-          AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-          buffer_duration, 0, mix_format, nullptr);
+          std::max(min_capture_buffer_ms, initial_profile.capture_buffer_ms) /
+          1000;
+
+      HANDLE capture_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      bool use_event_callback = false;
+      if (capture_event != nullptr) {
+        hr = audio_client->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            buffer_duration, 0, mix_format, nullptr);
+        if (SUCCEEDED(hr) &&
+            SUCCEEDED(audio_client->SetEventHandle(capture_event))) {
+          use_event_callback = true;
+        } else {
+          CloseHandle(capture_event);
+          capture_event = nullptr;
+          audio_client.Reset();
+          hr = device->Activate(
+              __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+              reinterpret_cast<void**>(audio_client.GetAddressOf()));
+          if (SUCCEEDED(hr)) {
+            hr = audio_client->Initialize(
+                AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                buffer_duration, 0, mix_format, nullptr);
+          }
+        }
+      } else {
+        hr = audio_client->Initialize(
+            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+            buffer_duration, 0, mix_format, nullptr);
+      }
+
       if (FAILED(hr)) {
+        if (capture_event != nullptr) {
+          CloseHandle(capture_event);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
       }
@@ -4609,6 +4044,9 @@ class WindowsAudioEngine::Impl {
       Microsoft::WRL::ComPtr<IAudioCaptureClient> capture_client;
       hr = audio_client->GetService(IID_PPV_ARGS(&capture_client));
       if (FAILED(hr)) {
+        if (capture_event != nullptr) {
+          CloseHandle(capture_event);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
       }
@@ -4617,7 +4055,8 @@ class WindowsAudioEngine::Impl {
       ResetPacketizer();
       audio_client->Start();
 
-      while (capture_running_ && !watcher->TakeChanged()) {
+      while (capture_running_ && !watcher->TakeChanged() &&
+             !capture_device_changed_.load()) {
         UINT32 packet_frames = 0;
         hr = capture_client->GetNextPacketSize(&packet_frames);
         if (FAILED(hr)) {
@@ -4625,7 +4064,11 @@ class WindowsAudioEngine::Impl {
         }
 
         if (packet_frames == 0) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          if (use_event_callback && capture_event != nullptr) {
+            WaitForSingleObject(capture_event, 10);
+          } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
           continue;
         }
 
@@ -4642,16 +4085,21 @@ class WindowsAudioEngine::Impl {
         const auto captured_pcm =
             ConvertToPcm16(data, frames_available, *mix_format, silent,
                            volume_.load(), muted_.load());
-        const int output_sample_rate = OutputSampleRateForProfile();
-        const int output_channels = std::clamp(profile_.channels, 1, 2);
+        const AudioProfile profile = CurrentProfile();
+        const int output_sample_rate = OutputSampleRateForProfile(profile);
+        const int output_channels = std::clamp(profile.channels, 1, 2);
         auto output_pcm = ReformatPcmForProfile(
-            captured_pcm, mix_format->nSamplesPerSec, mix_format->nChannels);
+            captured_pcm, mix_format->nSamplesPerSec, mix_format->nChannels,
+            profile);
         MixSoundEffects(&output_pcm, output_sample_rate, output_channels);
-        SendPcm(output_pcm, output_sample_rate, output_channels);
+        SendPcm(output_pcm, output_sample_rate, output_channels, profile);
         capture_client->ReleaseBuffer(frames_available);
       }
 
       audio_client->Stop();
+      if (capture_event != nullptr) {
+        CloseHandle(capture_event);
+      }
       if (capture_running_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
@@ -4882,21 +4330,25 @@ class WindowsAudioEngine::Impl {
       const int active_bitrate_kbps =
           static_cast<int>((receiver_options & kReceiverOptionBitrateMask) >>
                            kReceiverOptionBitrateShift);
-      const bool adaptive_policy_changed =
-          profile_.receiver_adaptive_buffer != receiver_adaptive_buffer ||
-          profile_.mode != mode ||
-          profile_.adaptive_buffer_cap_ms != adaptive_buffer_cap_ms;
-      const bool playback_target_changed =
-          profile_.playback_buffer_ms != playback_buffer_ms;
-      if (active_bitrate_kbps > 0) {
-        profile_.bitrate_kbps = active_bitrate_kbps;
-      }
       const int previous_adaptive_buffer_ms =
           static_cast<int>(local_adaptive_playback_buffer_ms_.load());
-      profile_.playback_buffer_ms = playback_buffer_ms;
-      profile_.receiver_adaptive_buffer = receiver_adaptive_buffer;
-      profile_.mode = mode;
-      profile_.adaptive_buffer_cap_ms = adaptive_buffer_cap_ms;
+      bool adaptive_policy_changed = false;
+      bool playback_target_changed = false;
+      UpdateProfile([&](AudioProfile& profile) {
+        adaptive_policy_changed =
+            profile.receiver_adaptive_buffer != receiver_adaptive_buffer ||
+            profile.mode != mode ||
+            profile.adaptive_buffer_cap_ms != adaptive_buffer_cap_ms;
+        playback_target_changed =
+            profile.playback_buffer_ms != playback_buffer_ms;
+        if (active_bitrate_kbps > 0) {
+          profile.bitrate_kbps = active_bitrate_kbps;
+        }
+        profile.playback_buffer_ms = playback_buffer_ms;
+        profile.receiver_adaptive_buffer = receiver_adaptive_buffer;
+        profile.mode = mode;
+        profile.adaptive_buffer_cap_ms = adaptive_buffer_cap_ms;
+      });
       if (adaptive_policy_changed || playback_target_changed) {
         if (adaptive_policy_changed) {
           ResetLocalAdaptiveDelayTracker();
@@ -5018,12 +4470,14 @@ class WindowsAudioEngine::Impl {
   }
 
   int RequestedPlaybackBufferMs() const {
-    return std::clamp(profile_.playback_buffer_ms, kMinBufferMs, kMaxBufferMs);
+    return std::clamp(CurrentProfile().playback_buffer_ms, kMinBufferMs,
+                      kMaxBufferMs);
   }
 
   int AdaptiveMaxPlaybackBufferMs(int requested_ms) const {
+    const AudioProfile profile = CurrentProfile();
     int cap_ms = kMaxBufferMs;
-    switch (profile_.mode) {
+    switch (profile.mode) {
       case AudioMode::kGaming:
         cap_ms = kAdaptiveGamingCapMs;
         break;
@@ -5034,8 +4488,8 @@ class WindowsAudioEngine::Impl {
         cap_ms = kMaxBufferMs;
         break;
       case AudioMode::kCustom:
-        cap_ms = profile_.adaptive_buffer_cap_ms > 0
-                     ? profile_.adaptive_buffer_cap_ms
+        cap_ms = profile.adaptive_buffer_cap_ms > 0
+                     ? profile.adaptive_buffer_cap_ms
                      : kMaxBufferMs;
         break;
     }
@@ -5043,12 +4497,13 @@ class WindowsAudioEngine::Impl {
   }
 
   bool ShouldStartAdaptiveBufferAtRequested(int requested_ms) const {
-    return profile_.mode == AudioMode::kGaming ||
+    return CurrentProfile().mode == AudioMode::kGaming ||
            requested_ms <= kLowLatencyPerformanceMaxMs;
   }
 
   int AdaptiveBufferStepMs(int requested_ms) const {
-    const int packet_step_ms = std::clamp(profile_.packet_time_ms, 1, 12) * 2;
+    const int packet_step_ms =
+        std::clamp(CurrentProfile().packet_time_ms, 1, 12) * 2;
     const int profile_step_ms =
         requested_ms <= 28
             ? kAdaptiveLowLatencyStepMs
@@ -5084,7 +4539,7 @@ class WindowsAudioEngine::Impl {
 
   void ObserveLocalAdaptivePacketArrival(int64_t now, uint32_t sequence,
                                          int sample_rate, int packet_frames) {
-    if (!profile_.receiver_adaptive_buffer || sample_rate <= 0 ||
+    if (!CurrentProfile().receiver_adaptive_buffer || sample_rate <= 0 ||
         packet_frames <= 0) {
       return;
     }
@@ -5187,7 +4642,7 @@ class WindowsAudioEngine::Impl {
     }
 
     const int packet_guard_ms =
-        std::max(std::clamp(profile_.packet_time_ms, 1, 12),
+        std::max(std::clamp(CurrentProfile().packet_time_ms, 1, 12),
                  std::max(1, static_cast<int>(std::ceil(
                                  local_adaptive_last_packet_duration_ms_))));
     if (estimated_delay_ms <= packet_guard_ms) {
@@ -5242,10 +4697,9 @@ class WindowsAudioEngine::Impl {
 
   bool IsLocalPlaybackQueueTooLow(int sample_rate, int64_t queued_frames,
                                   int64_t target_frames) const {
-    const int64_t packet_frames =
-        std::max<int64_t>(1, sample_rate *
-                                 std::clamp(profile_.packet_time_ms, 1, 12) /
-                                 1000);
+    const int64_t packet_frames = std::max<int64_t>(
+        1, sample_rate * std::clamp(CurrentProfile().packet_time_ms, 1, 12) /
+               1000);
     const int64_t low_queue_frames =
         std::max(packet_frames, target_frames / kAdaptiveLowQueueDivisor);
     return queued_frames < low_queue_frames;
@@ -5264,7 +4718,7 @@ class WindowsAudioEngine::Impl {
     }
 
     const int requested_ms = RequestedPlaybackBufferMs();
-    if (!profile_.receiver_adaptive_buffer) {
+    if (!CurrentProfile().receiver_adaptive_buffer) {
       ResetLocalAdaptiveGrowthPressure(local_underrun_count_.load(),
                                        true);
       SetLocalAdaptivePlaybackBufferMs(sample_rate, requested_ms);
@@ -5413,6 +4867,7 @@ class WindowsAudioEngine::Impl {
   }
 
   void PlaybackRenderLoop() {
+    ScopedTimerResolution timer_resolution(1);
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool owns_com = SUCCEEDED(hr);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -5474,12 +4929,34 @@ class WindowsAudioEngine::Impl {
       CoTaskMemFree(raw_mix_format);
 
       const REFERENCE_TIME buffer_duration =
-          10000000LL *
-          std::clamp(profile_.playback_buffer_ms, kMinBufferMs, kMaxBufferMs) /
-          1000;
-      hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
-                                    buffer_duration, 0, mix_format, nullptr);
+          10000000LL * RequestedPlaybackBufferMs() / 1000;
+      HANDLE render_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      if (render_event != nullptr) {
+        hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                      buffer_duration, 0, mix_format, nullptr);
+        if (FAILED(hr) ||
+            FAILED(audio_client->SetEventHandle(render_event))) {
+          CloseHandle(render_event);
+          render_event = nullptr;
+          audio_client.Reset();
+          hr = device->Activate(
+              __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+              reinterpret_cast<void**>(audio_client.GetAddressOf()));
+          if (SUCCEEDED(hr)) {
+            hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+                                          buffer_duration, 0, mix_format,
+                                          nullptr);
+          }
+        }
+      } else {
+        hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+                                      buffer_duration, 0, mix_format, nullptr);
+      }
       if (FAILED(hr)) {
+        if (render_event != nullptr) {
+          CloseHandle(render_event);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
       }
@@ -5495,6 +4972,9 @@ class WindowsAudioEngine::Impl {
       Microsoft::WRL::ComPtr<IAudioRenderClient> render_client;
       hr = audio_client->GetService(IID_PPV_ARGS(&render_client));
       if (FAILED(hr)) {
+        if (render_event != nullptr) {
+          CloseHandle(render_event);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
       }
@@ -5549,7 +5029,7 @@ class WindowsAudioEngine::Impl {
         const bool wrote =
             WriteRenderPcm(render_client.Get(), audio_client.Get(),
                            buffer_frames, *mix_format, output,
-                           playback_running_);
+                           playback_running_, true, render_event);
         playback_queue_frames_ -=
             static_cast<int64_t>(packet.pcm.size()) /
             std::max(1, packet.channels);
@@ -5560,6 +5040,9 @@ class WindowsAudioEngine::Impl {
 
       if (render_started) {
         audio_client->Stop();
+      }
+      if (render_event != nullptr) {
+        CloseHandle(render_event);
       }
       local_render_started_ = false;
       local_render_started_at_ms_ = 0;
@@ -5584,7 +5067,8 @@ class WindowsAudioEngine::Impl {
                       const WAVEFORMATEX& format,
                       const std::vector<int16_t>& pcm,
                       const std::atomic_bool& running,
-                      bool apply_output_volume = true) {
+                      bool apply_output_volume = true,
+                      HANDLE render_event = nullptr) {
     const int channels = std::max<int>(1, format.nChannels);
     size_t offset_frames = 0;
     const size_t total_frames = pcm.size() / channels;
@@ -5595,7 +5079,11 @@ class WindowsAudioEngine::Impl {
       }
       const UINT32 available = buffer_frames > padding ? buffer_frames - padding : 0;
       if (available == 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (render_event != nullptr) {
+          WaitForSingleObject(render_event, 10);
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         continue;
       }
 
@@ -5643,8 +5131,9 @@ class WindowsAudioEngine::Impl {
     std::memset(output, 0, frames * format.nBlockAlign);
   }
 
-  void SendPcm(const std::vector<int16_t>& pcm, int sample_rate, int channels) {
-    if (profile_.codec == AudioCodec::kOpus) {
+  void SendPcm(const std::vector<int16_t>& pcm, int sample_rate, int channels,
+               const AudioProfile& profile) {
+    if (profile.codec == AudioCodec::kOpus) {
       sample_rate = kOpusSampleRate;
     }
     if (!pcm.empty()) {
@@ -5668,12 +5157,12 @@ class WindowsAudioEngine::Impl {
     const int packet_header_bytes =
         session_id == 0 ? kPacketV4HeaderBytes : kPacketV5HeaderBytes;
 
-    const int packet_time_ms = std::clamp(profile_.packet_time_ms, 1, 12);
+    const int packet_time_ms = std::clamp(profile.packet_time_ms, 1, 12);
     if (packetizer_sample_rate_ != sample_rate ||
         packetizer_channels_ != channels ||
         packetizer_packet_time_ms_ != packet_time_ms ||
-        packetizer_codec_ != profile_.codec) {
-      ResetPacketizer(sample_rate, channels, packet_time_ms);
+        packetizer_codec_ != profile.codec) {
+      ResetPacketizer(sample_rate, channels, packet_time_ms, profile.codec);
     }
 
     if (!pcm.empty()) {
@@ -5681,47 +5170,70 @@ class WindowsAudioEngine::Impl {
                                      pcm.end());
     }
 
-    const int bytes_per_frame = EncodedBytesPerFrame(profile_.codec, channels);
+    const int bytes_per_frame = EncodedBytesPerFrame(profile.codec, channels);
     const int max_payload_bytes = kMaxPacketBytes - kPacketV5HeaderBytes -
-                                  EncodedPacketOverhead(profile_.codec,
+                                  EncodedPacketOverhead(profile.codec,
                                                         channels);
-    const int max_frames = profile_.codec == AudioCodec::kOpus
+    const int max_frames = profile.codec == AudioCodec::kOpus
                                ? OpusFrameSamplesForPacketTime(packet_time_ms)
-                           : profile_.codec == AudioCodec::kAac
+                           : profile.codec == AudioCodec::kAac
                                ? kAacSamplesPerFrame
                                : std::max(1, max_payload_bytes /
                                                   std::max(1, bytes_per_frame));
-    if (profile_.codec == AudioCodec::kOpus &&
-        !opus_codec_.Configure(channels, profile_.bitrate_kbps * 1000,
-                               ShouldUseLowDelayOpus())) {
+    if (profile.codec == AudioCodec::kOpus &&
+        !opus_codec_.Configure(channels, profile.bitrate_kbps * 1000,
+                               ShouldUseLowDelayOpus(profile))) {
       return;
     }
-    if (profile_.codec == AudioCodec::kAac &&
+    if (profile.codec == AudioCodec::kAac &&
         !aac_codec_.Configure(sample_rate, channels,
-                              profile_.bitrate_kbps * 1000)) {
+                              profile.bitrate_kbps * 1000)) {
       return;
     }
 
+    const auto consume_pending = [this](size_t sample_count) {
+      packetizer_pending_offset_ += sample_count;
+      if (packetizer_pending_offset_ >= packetizer_pending_pcm_.size()) {
+        packetizer_pending_pcm_.clear();
+        packetizer_pending_offset_ = 0;
+      } else if (packetizer_pending_offset_ >= 8192) {
+        const size_t remaining =
+            packetizer_pending_pcm_.size() - packetizer_pending_offset_;
+        std::memmove(packetizer_pending_pcm_.data(),
+                     packetizer_pending_pcm_.data() +
+                         packetizer_pending_offset_,
+                     remaining * sizeof(int16_t));
+        packetizer_pending_pcm_.resize(remaining);
+        packetizer_pending_offset_ = 0;
+      }
+    };
+
     while (capture_running_) {
-      const int pending_frames =
-          static_cast<int>(packetizer_pending_pcm_.size()) / channels;
+      const size_t pending_samples =
+          packetizer_pending_pcm_.size() - packetizer_pending_offset_;
+      const int pending_frames = static_cast<int>(pending_samples) / channels;
       const int frames = NextPacketFrameCount(sample_rate, packet_time_ms,
                                               max_frames);
       if (pending_frames < frames) {
         break;
       }
 
-      const auto begin = packetizer_pending_pcm_.begin();
-      const auto end = begin + frames * channels;
-      const std::vector<int16_t> chunk(begin, end);
-      const auto encoded = EncodeAudio(chunk, channels);
-      if (encoded.payload.empty()) {
-        packetizer_pending_pcm_.erase(packetizer_pending_pcm_.begin(), end);
+      const size_t chunk_samples = static_cast<size_t>(frames) * channels;
+      const int16_t* chunk_ptr =
+          packetizer_pending_pcm_.data() + packetizer_pending_offset_;
+      EncodeAudioInto(chunk_ptr, chunk_samples, channels, profile,
+                      &packetizer_encoded_);
+      if (packetizer_encoded_.payload.empty()) {
+        consume_pending(chunk_samples);
         packetizer_sent_frames_ += frames;
         ++packetizer_packet_count_;
         continue;
       }
-      std::vector<uint8_t> packet(packet_header_bytes + encoded.payload.size());
+
+      const size_t total_packet_bytes =
+          static_cast<size_t>(packet_header_bytes) +
+          packetizer_encoded_.payload.size();
+      packetizer_tx_buffer_.resize(total_packet_bytes);
       const int64_t send_time_ms = NowMillis();
       RemoteReceiverClockEcho receiver_clock_echo;
       {
@@ -5739,60 +5251,66 @@ class WindowsAudioEngine::Impl {
               ? receiver_clock_echo.received_at_sender_time_ms
               : 0;
 
-      WriteU32(packet, 0,
+      WriteU32(packetizer_tx_buffer_, 0,
                session_id == 0 ? kPacketV4Magic : kPacketV5Magic);
-      WriteU32(packet, 4, sequence_++);
-      WriteU32(packet, 8, static_cast<uint32_t>(sample_rate));
-      WriteU16(packet, 12, static_cast<uint16_t>(channels));
-      WriteU16(packet, 14, encoded.flags);
-      WriteU16(packet, 16, encoded.codec_id);
-      WriteU16(packet, 18, encoded.packet_kind);
-      WriteU32(packet, 20, encoded.decoded_frame_count);
-      WriteU64(packet, 24, static_cast<uint64_t>(send_time_ms));
-      WriteU64(packet, 32, static_cast<uint64_t>(echoed_receiver_time_ms));
-      WriteU64(packet, 40,
+      WriteU32(packetizer_tx_buffer_, 4, sequence_++);
+      WriteU32(packetizer_tx_buffer_, 8, static_cast<uint32_t>(sample_rate));
+      WriteU16(packetizer_tx_buffer_, 12, static_cast<uint16_t>(channels));
+      WriteU16(packetizer_tx_buffer_, 14, packetizer_encoded_.flags);
+      WriteU16(packetizer_tx_buffer_, 16, packetizer_encoded_.codec_id);
+      WriteU16(packetizer_tx_buffer_, 18, packetizer_encoded_.packet_kind);
+      WriteU32(packetizer_tx_buffer_, 20,
+               packetizer_encoded_.decoded_frame_count);
+      WriteU64(packetizer_tx_buffer_, 24, static_cast<uint64_t>(send_time_ms));
+      WriteU64(packetizer_tx_buffer_, 32,
+               static_cast<uint64_t>(echoed_receiver_time_ms));
+      WriteU64(packetizer_tx_buffer_, 40,
                static_cast<uint64_t>(echo_received_at_sender_time_ms));
-      WriteU32(packet, 48, static_cast<uint32_t>(std::clamp(
-                             profile_.playback_buffer_ms, kMinBufferMs,
-                             kMaxBufferMs)));
-      WriteU32(packet, 52, ReceiverOptionsFor(profile_));
+      WriteU32(packetizer_tx_buffer_, 48,
+               static_cast<uint32_t>(std::clamp(profile.playback_buffer_ms,
+                                                kMinBufferMs, kMaxBufferMs)));
+      WriteU32(packetizer_tx_buffer_, 52, ReceiverOptionsFor(profile));
       if (session_id != 0) {
-        WriteU64(packet, 56, session_id);
+        WriteU64(packetizer_tx_buffer_, 56, session_id);
       }
-      if (!encoded.payload.empty()) {
-        std::memcpy(packet.data() + packet_header_bytes,
-                    encoded.payload.data(), encoded.payload.size());
-      }
+      std::memcpy(packetizer_tx_buffer_.data() + packet_header_bytes,
+                  packetizer_encoded_.payload.data(),
+                  packetizer_encoded_.payload.size());
 
       if (usb_mode) {
-        if (!WriteUsbFrame(packet.data(), packet.size())) {
+        if (!WriteUsbFrame(packetizer_tx_buffer_.data(),
+                           packetizer_tx_buffer_.size())) {
           UsbDebugLog("USB audio write failed; stopping capture");
           capture_running_ = false;
           usb_control_running_ = false;
-          packetizer_pending_pcm_.erase(packetizer_pending_pcm_.begin(), end);
+          consume_pending(chunk_samples);
           packetizer_sent_frames_ += frames;
           ++packetizer_packet_count_;
           break;
         }
         const uint64_t count = ++usb_audio_packets_sent_;
-        usb_audio_bytes_sent_.fetch_add(kUsbFrameHeaderBytes + packet.size());
+        usb_audio_bytes_sent_.fetch_add(kUsbFrameHeaderBytes +
+                                        packetizer_tx_buffer_.size());
         if (count <= 5 || count % 1000 == 0) {
-          UsbDebugLog("sent USB audio packet #" + std::to_string(count) +
-                      " bytes=" +
-                      std::to_string(kUsbFrameHeaderBytes + packet.size()) +
-                      " frames=" + std::to_string(frames) +
-                      " sampleRate=" + std::to_string(sample_rate) +
-                      " channels=" + std::to_string(channels) +
-                      " codec=" + std::to_string(encoded.codec_id));
+          UsbDebugLog(
+              "sent USB audio packet #" + std::to_string(count) +
+              " bytes=" +
+              std::to_string(kUsbFrameHeaderBytes +
+                             packetizer_tx_buffer_.size()) +
+              " frames=" + std::to_string(frames) +
+              " sampleRate=" + std::to_string(sample_rate) +
+              " channels=" + std::to_string(channels) +
+              " codec=" + std::to_string(packetizer_encoded_.codec_id));
         }
       } else {
-        sendto(socket_, reinterpret_cast<const char*>(packet.data()),
-               static_cast<int>(packet.size()), 0,
+        sendto(socket_,
+               reinterpret_cast<const char*>(packetizer_tx_buffer_.data()),
+               static_cast<int>(packetizer_tx_buffer_.size()), 0,
                reinterpret_cast<const sockaddr*>(&endpoint.address),
                sizeof(endpoint.address));
       }
 
-      packetizer_pending_pcm_.erase(packetizer_pending_pcm_.begin(), end);
+      consume_pending(chunk_samples);
       packetizer_sent_frames_ += frames;
       ++packetizer_packet_count_;
     }
@@ -5858,30 +5376,37 @@ class WindowsAudioEngine::Impl {
     }
   }
 
-  EncodedAudioPacket EncodeAudio(const std::vector<int16_t>& pcm,
-                                 int channels) {
+  void EncodeAudioInto(const int16_t* pcm, size_t sample_count, int channels,
+                       const AudioProfile& profile, EncodedAudioPacket* out) {
     const bool muted = muted_.load();
-    switch (profile_.codec) {
+    switch (profile.codec) {
       case AudioCodec::kOpus:
-        return opus_codec_.Encode(
-            pcm, channels, static_cast<int>(pcm.size() / std::max(1, channels)),
-            muted);
+        opus_codec_.EncodeInto(
+            pcm, sample_count, channels,
+            static_cast<int>(sample_count / std::max(1, channels)), muted, out);
+        return;
       case AudioCodec::kAac:
-        return aac_codec_.Encode(pcm, channels, muted);
+        aac_codec_.EncodeInto(pcm, sample_count, channels, muted, out);
+        return;
       case AudioCodec::kG711MuLaw:
-        return g711_mu_law_codec_.Encode(pcm, channels, muted);
+        g711_mu_law_codec_.EncodeInto(pcm, sample_count, channels, muted, out);
+        return;
       case AudioCodec::kG711ALaw:
-        return g711_a_law_codec_.Encode(pcm, channels, muted);
+        g711_a_law_codec_.EncodeInto(pcm, sample_count, channels, muted, out);
+        return;
       case AudioCodec::kImaAdpcm:
-        return ima_adpcm_codec_.Encode(pcm, channels, muted);
+        ima_adpcm_codec_.EncodeInto(pcm, sample_count, channels, muted, out);
+        return;
       case AudioCodec::kPcm:
       default:
-        return pcm_codec_.Encode(pcm, channels, muted);
+        pcm_codec_.EncodeInto(pcm, sample_count, channels, muted, out);
+        return;
     }
   }
 
   void ResetPacketizer() {
     packetizer_pending_pcm_.clear();
+    packetizer_pending_offset_ = 0;
     packetizer_sent_frames_ = 0;
     packetizer_packet_count_ = 0;
     packetizer_sample_rate_ = 0;
@@ -5890,25 +5415,69 @@ class WindowsAudioEngine::Impl {
     packetizer_codec_ = AudioCodec::kPcm;
   }
 
-  void ResetPacketizer(int sample_rate, int channels, int packet_time_ms) {
+  void ResetPacketizer(int sample_rate, int channels, int packet_time_ms,
+                       AudioCodec codec) {
     ResetPacketizer();
     packetizer_sample_rate_ = sample_rate;
     packetizer_channels_ = channels;
     packetizer_packet_time_ms_ = packet_time_ms;
-    packetizer_codec_ = profile_.codec;
+    packetizer_codec_ = codec;
   }
 
-  int OutputSampleRateForProfile() const {
-    if (profile_.codec == AudioCodec::kOpus) {
+  static int OutputSampleRateForProfile(const AudioProfile& profile) {
+    if (profile.codec == AudioCodec::kOpus) {
       return kOpusSampleRate;
     }
-    return std::clamp(profile_.sample_rate, 8000, 192000);
+    return std::clamp(profile.sample_rate, 8000, 192000);
   }
 
-  bool ShouldUseLowDelayOpus() const {
-    return profile_.mode == AudioMode::kGaming ||
-           profile_.packet_time_ms <= 2 ||
-           profile_.playback_buffer_ms <= 28;
+  static bool ShouldUseLowDelayOpus(const AudioProfile& profile) {
+    return profile.mode == AudioMode::kGaming ||
+           profile.packet_time_ms <= 2 ||
+           profile.playback_buffer_ms <= 28;
+  }
+
+  AudioProfile CurrentProfile() const {
+    std::scoped_lock lock(profile_mutex_);
+    return profile_;
+  }
+
+  void SetProfile(const AudioProfile& profile) {
+    std::scoped_lock lock(profile_mutex_);
+    profile_ = profile;
+  }
+
+  template <typename Fn>
+  void UpdateProfile(Fn&& updater) {
+    std::scoped_lock lock(profile_mutex_);
+    updater(profile_);
+  }
+
+  std::string CurrentCaptureOutputDeviceId() const {
+    std::scoped_lock lock(capture_device_mutex_);
+    return capture_output_device_id_;
+  }
+
+  void ApplyCaptureOutputDeviceFromArguments(
+      const flutter::EncodableValue* arguments) {
+    if (!arguments ||
+        !std::holds_alternative<flutter::EncodableMap>(*arguments)) {
+      return;
+    }
+    const auto& map = std::get<flutter::EncodableMap>(*arguments);
+    const auto it = map.find(flutter::EncodableValue("captureOutputDeviceId"));
+    if (it == map.end()) {
+      return;
+    }
+    std::string next_device_id;
+    if (std::holds_alternative<std::string>(it->second)) {
+      next_device_id = std::get<std::string>(it->second);
+    }
+    std::scoped_lock lock(capture_device_mutex_);
+    if (capture_output_device_id_ != next_device_id) {
+      capture_output_device_id_ = std::move(next_device_id);
+      capture_device_changed_.store(true);
+    }
   }
 
   static void FinishCom(bool owns_com) {
@@ -5917,7 +5486,11 @@ class WindowsAudioEngine::Impl {
     }
   }
 
+  mutable std::mutex profile_mutex_;
   AudioProfile profile_;
+  mutable std::mutex capture_device_mutex_;
+  std::string capture_output_device_id_;
+  std::atomic_bool capture_device_changed_ = false;
   TransportMode transport_mode_ = TransportMode::kWifi;
   bool usb_receiver_mode_ = false;
   SOCKET socket_ = INVALID_SOCKET;
@@ -6049,6 +5622,9 @@ class WindowsAudioEngine::Impl {
   size_t local_adaptive_delay_history_count_ = 0;
   int local_adaptive_network_target_buffer_ms_ = 0;
   std::vector<int16_t> packetizer_pending_pcm_;
+  size_t packetizer_pending_offset_ = 0;
+  EncodedAudioPacket packetizer_encoded_;
+  std::vector<uint8_t> packetizer_tx_buffer_;
   uint64_t packetizer_sent_frames_ = 0;
   uint64_t packetizer_packet_count_ = 0;
   int packetizer_sample_rate_ = 0;

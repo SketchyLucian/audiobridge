@@ -18,6 +18,7 @@ class AudioRelayPreferences {
     this.silentConnectionTimeoutSeconds,
     this.selectedSoundboardPath,
     this.selectedSoundboardOutputDeviceId,
+    this.selectedCaptureOutputDeviceId,
   });
 
   final RelayRole role;
@@ -30,6 +31,7 @@ class AudioRelayPreferences {
   final String? selectedSoundboardPath;
   final SoundboardPlaybackTarget soundboardTarget;
   final String? selectedSoundboardOutputDeviceId;
+  final String? selectedCaptureOutputDeviceId;
   final double soundboardVolume;
   final int? silentConnectionTimeoutSeconds;
 
@@ -46,6 +48,7 @@ class AudioRelayPreferences {
       'selectedSoundboardPath': selectedSoundboardPath,
       'soundboardTarget': soundboardTarget.name,
       'selectedSoundboardOutputDeviceId': selectedSoundboardOutputDeviceId,
+      'selectedCaptureOutputDeviceId': selectedCaptureOutputDeviceId,
       'soundboardVolume': soundboardVolume,
       'silentConnectionTimeoutSeconds': silentConnectionTimeoutSeconds,
     };
@@ -87,6 +90,9 @@ class AudioRelayPreferences {
       ),
       selectedSoundboardOutputDeviceId: _readOptionalString(
         map['selectedSoundboardOutputDeviceId'],
+      ),
+      selectedCaptureOutputDeviceId: _readOptionalString(
+        map['selectedCaptureOutputDeviceId'],
       ),
       soundboardVolume: _readUnitValue(map['soundboardVolume'], fallback: 0.82),
       silentConnectionTimeoutSeconds: _readPositiveInt(

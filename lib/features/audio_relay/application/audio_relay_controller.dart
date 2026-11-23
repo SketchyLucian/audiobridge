@@ -117,6 +117,7 @@ class AudioRelayController extends ChangeNotifier {
   SoundPlaybackItem? selectedSoundboardItem;
   SoundboardPlaybackTarget soundboardTarget = SoundboardPlaybackTarget.micRoute;
   String? selectedSoundboardOutputDeviceId;
+  String? selectedCaptureOutputDeviceId;
   double soundboardVolume = 0.82;
   bool soundboardBusy = false;
   bool soundboardMicBridgeEnabled = false;
@@ -128,6 +129,9 @@ class AudioRelayController extends ChangeNotifier {
   AppUpdateRelease? availableUpdate;
   String? updateMessage;
   double? updateDownloadProgress;
+
+  final _MetricsNotifier _metricsNotifier = _MetricsNotifier();
+  Listenable get metricsListenable => _metricsNotifier;
 
   Timer? _meterTimer;
   Timer? _profileApplyTimer;
@@ -186,7 +190,7 @@ class AudioRelayController extends ChangeNotifier {
     Duration(minutes: 10),
     Duration(minutes: 30),
   ];
-  static const _fallbackAppVersion = '1.5.0';
+  static const _fallbackAppVersion = '1.6.0';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -424,6 +428,30 @@ class AudioRelayController extends ChangeNotifier {
 
   bool get canRefreshSoundboardDevices {
     return canUseSoundboard && !soundboardDevicesRefreshing;
+  }
+
+  List<SoundboardOutputDevice> get captureOutputDevices {
+    return capabilities.captureOutputDevices;
+  }
+
+  bool get canSelectCaptureOutputDevice {
+    return role == RelayRole.sender &&
+        capabilities.platform == 'windows' &&
+        captureOutputDevices.isNotEmpty;
+  }
+
+  bool get canRefreshCaptureOutputDevices {
+    return canSelectCaptureOutputDevice && !soundboardDevicesRefreshing;
+  }
+
+  String? get effectiveSelectedCaptureOutputDeviceId {
+    final selectedId = selectedCaptureOutputDeviceId;
+    if (selectedId == null || selectedId.isEmpty) {
+      return null;
+    }
+    return captureOutputDevices.any((device) => device.id == selectedId)
+        ? selectedId
+        : null;
   }
 
   bool get isNativeUsbTransport => transport == RelayTransport.usb;
@@ -1097,7 +1125,10 @@ class AudioRelayController extends ChangeNotifier {
       if (role == RelayRole.sender) {
         final senderProfile = _materializedSenderProfile(profile);
         if (isUsbTunnelTransport) {
-          await _engine.prepareUsbSender(senderProfile);
+          await _engine.prepareUsbSender(
+            senderProfile,
+            captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
+          );
           _appliedSenderProfile = senderProfile;
           activity = RelayActivity.advertising;
         } else {
@@ -1105,6 +1136,7 @@ class AudioRelayController extends ChangeNotifier {
             senderProfile,
             networkBindAddress: _networkBindAddress,
             transport: transport,
+            captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
           );
           _appliedSenderProfile = senderProfile;
           await _startAdvertisingCurrentProfile(senderProfile);
@@ -1153,16 +1185,24 @@ class AudioRelayController extends ChangeNotifier {
     try {
       _resetAutoCodecSession();
       final senderProfile = _materializedSenderProfile(profile);
+      final captureDeviceId = effectiveSelectedCaptureOutputDeviceId;
       if (isUsbTunnelTransport) {
-        await _engine.prepareUsbSender(senderProfile);
+        await _engine.prepareUsbSender(
+          senderProfile,
+          captureOutputDeviceId: captureDeviceId,
+        );
       } else {
         await _engine.prepareSender(
           senderProfile,
           networkBindAddress: _networkBindAddress,
           transport: transport,
+          captureOutputDeviceId: captureDeviceId,
         );
       }
-      await _engine.startStream(senderProfile);
+      await _engine.startStream(
+        senderProfile,
+        captureOutputDeviceId: captureDeviceId ?? '',
+      );
       _appliedSenderProfile = senderProfile;
       _rememberAutoResolvedCodec(senderProfile);
       activity = RelayActivity.streaming;
@@ -1732,8 +1772,42 @@ class AudioRelayController extends ChangeNotifier {
     await playSelectedSoundboardItem();
   }
 
-  Future<void> refreshSoundboardDevices() async {
-    if (!canRefreshSoundboardDevices) {
+  Future<void> selectCaptureOutputDevice(String? id) async {
+    final normalized = id == null || id.trim().isEmpty ? null : id.trim();
+    if (selectedCaptureOutputDeviceId == normalized) {
+      return;
+    }
+    selectedCaptureOutputDeviceId = normalized;
+    notifyListeners();
+    _schedulePreferencesSave();
+
+    if (role == RelayRole.sender &&
+        (activity == RelayActivity.advertising ||
+            activity == RelayActivity.streaming)) {
+      final senderProfile =
+          _appliedSenderProfile ?? _materializedSenderProfile(profile);
+      try {
+        if (isUsbTunnelTransport) {
+          await _engine.prepareUsbSender(
+            senderProfile,
+            captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
+          );
+        } else {
+          await _engine.prepareSender(
+            senderProfile,
+            networkBindAddress: _networkBindAddress,
+            transport: transport,
+            captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
+          );
+        }
+      } on PlatformException catch (error) {
+        _fail(error.message ?? 'Unable to switch capture audio device.');
+      }
+    }
+  }
+
+  Future<void> refreshAudioDevices() async {
+    if (soundboardDevicesRefreshing) {
       return;
     }
 
@@ -1749,6 +1823,12 @@ class AudioRelayController extends ChangeNotifier {
       if (selectedSoundboardOutputDevice == null) {
         soundboardMicBridgeEnabled = false;
       }
+      if (selectedCaptureOutputDeviceId != null &&
+          !captureOutputDevices.any(
+            (device) => device.id == selectedCaptureOutputDeviceId,
+          )) {
+        selectedCaptureOutputDeviceId = null;
+      }
       _syncVirtualMicPassthrough();
       soundboardMessage = soundboardOutputDevices.isEmpty
           ? 'No virtual cable detected.'
@@ -1758,6 +1838,13 @@ class AudioRelayController extends ChangeNotifier {
       soundboardDevicesRefreshing = false;
       notifyListeners();
     }
+  }
+
+  Future<void> refreshSoundboardDevices() async {
+    if (!canRefreshSoundboardDevices) {
+      return;
+    }
+    await refreshAudioDevices();
   }
 
   Future<void> setUpSoundboardCallMicrophone() async {
@@ -1871,6 +1958,7 @@ class AudioRelayController extends ChangeNotifier {
       return;
     }
     super.notifyListeners();
+    _metricsNotifier.notify();
   }
 
   @override
@@ -1894,6 +1982,7 @@ class AudioRelayController extends ChangeNotifier {
     _stopVirtualMicPassthrough();
     unawaited(_engine.disconnect().catchError((Object _) {}));
     unawaited(_discoveryService.dispose().catchError((Object _) {}));
+    _metricsNotifier.dispose();
     super.dispose();
   }
 
@@ -2277,6 +2366,7 @@ class AudioRelayController extends ChangeNotifier {
 
   Future<void> _reconnectSender(int generation) async {
     final senderProfile = _materializedSenderProfile(profile);
+    final captureDeviceId = effectiveSelectedCaptureOutputDeviceId;
     if (usesNetworkDiscovery) {
       await _refreshLocalAddress(requireUsable: true);
       if (!_isReconnectCurrent(generation)) {
@@ -2286,18 +2376,25 @@ class AudioRelayController extends ChangeNotifier {
         senderProfile,
         networkBindAddress: _networkBindAddress,
         transport: transport,
+        captureOutputDeviceId: captureDeviceId,
       );
       if (!_isReconnectCurrent(generation)) {
         return;
       }
       await _startAdvertisingCurrentProfile(senderProfile);
     } else {
-      await _engine.prepareUsbSender(senderProfile);
+      await _engine.prepareUsbSender(
+        senderProfile,
+        captureOutputDeviceId: captureDeviceId,
+      );
     }
     if (!_isReconnectCurrent(generation)) {
       return;
     }
-    await _engine.startStream(senderProfile);
+    await _engine.startStream(
+      senderProfile,
+      captureOutputDeviceId: captureDeviceId ?? '',
+    );
     _appliedSenderProfile = senderProfile;
   }
 
@@ -2355,6 +2452,13 @@ class AudioRelayController extends ChangeNotifier {
 
     _metricsPollInFlight = true;
     try {
+      final previousActivity = activity;
+      final previousProfile = profile;
+      final previousAutoCodec = _autoResolvedCodec;
+      final previousNotice = noticeMessage;
+      final previousError = errorMessage;
+      final previousAppliedProfile = _appliedSenderProfile;
+
       final nextMetrics = await _engine.getMetrics();
       metrics = nextMetrics;
       await _updateStreamConnectionFromMetrics(nextMetrics);
@@ -2369,7 +2473,18 @@ class AudioRelayController extends ChangeNotifier {
       _updateAutoCodecFromMetrics(nextMetrics);
       _updateAdaptiveSenderProfileFromMetrics();
       if (isStreaming) {
-        notifyListeners();
+        final structuralChanged =
+            activity != previousActivity ||
+            !profile.hasSameSettings(previousProfile) ||
+            _autoResolvedCodec != previousAutoCodec ||
+            noticeMessage != previousNotice ||
+            errorMessage != previousError ||
+            _appliedSenderProfile != previousAppliedProfile;
+        if (structuralChanged) {
+          notifyListeners();
+        } else {
+          _metricsNotifier.notify();
+        }
       }
     } finally {
       _metricsPollInFlight = false;
@@ -2611,6 +2726,8 @@ class AudioRelayController extends ChangeNotifier {
     soundboardTarget = savedPreferences.soundboardTarget;
     selectedSoundboardOutputDeviceId =
         savedPreferences.selectedSoundboardOutputDeviceId;
+    selectedCaptureOutputDeviceId =
+        savedPreferences.selectedCaptureOutputDeviceId;
     soundboardVolume = savedPreferences.soundboardVolume;
   }
 
@@ -2638,6 +2755,7 @@ class AudioRelayController extends ChangeNotifier {
       selectedSoundboardPath: selectedSoundboardItem?.path,
       soundboardTarget: soundboardTarget,
       selectedSoundboardOutputDeviceId: selectedSoundboardOutputDeviceId,
+      selectedCaptureOutputDeviceId: selectedCaptureOutputDeviceId,
       soundboardVolume: soundboardVolume,
     );
   }
@@ -2894,7 +3012,10 @@ class AudioRelayController extends ChangeNotifier {
     );
     if (activity == RelayActivity.advertising) {
       if (isUsbTunnelTransport) {
-        await _engine.prepareUsbSender(senderProfile);
+        await _engine.prepareUsbSender(
+          senderProfile,
+          captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
+        );
         _appliedSenderProfile = senderProfile;
         _rememberAutoResolvedCodec(senderProfile);
       } else {
@@ -2902,6 +3023,7 @@ class AudioRelayController extends ChangeNotifier {
           senderProfile,
           networkBindAddress: _networkBindAddress,
           transport: transport,
+          captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
         );
         _appliedSenderProfile = senderProfile;
         _rememberAutoResolvedCodec(senderProfile);
@@ -2932,12 +3054,16 @@ class AudioRelayController extends ChangeNotifier {
         return;
       }
       if (isUsbTunnelTransport) {
-        await _engine.prepareUsbSender(senderProfile);
+        await _engine.prepareUsbSender(
+          senderProfile,
+          captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
+        );
       } else {
         await _engine.prepareSender(
           senderProfile,
           networkBindAddress: _networkBindAddress,
           transport: transport,
+          captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
         );
       }
       _appliedSenderProfile = senderProfile;
@@ -3469,12 +3595,16 @@ class AudioRelayController extends ChangeNotifier {
         return;
       }
       if (isUsbTunnelTransport) {
-        await _engine.prepareUsbSender(nextProfile);
+        await _engine.prepareUsbSender(
+          nextProfile,
+          captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
+        );
       } else {
         await _engine.prepareSender(
           nextProfile,
           networkBindAddress: _networkBindAddress,
           transport: transport,
+          captureOutputDeviceId: effectiveSelectedCaptureOutputDeviceId,
         );
       }
       _appliedSenderProfile = nextProfile;
@@ -3968,6 +4098,12 @@ class AudioRelayController extends ChangeNotifier {
       return 'Tethered network load is light, which helps reliability.';
     }
     return 'Network load is light, which helps reliability.';
+  }
+}
+
+class _MetricsNotifier extends ChangeNotifier {
+  void notify() {
+    notifyListeners();
   }
 }
 

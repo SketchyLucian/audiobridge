@@ -6,6 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_subdirectory("../../../../../third_party/opus-1.6.1" "opus")
 
-add_library(audiobridge_opus SHARED opus_jni.cpp)
+add_library(audiobridge_opus SHARED opus_jni.cpp aaudio_output_jni.cpp)
 
-target_link_libraries(audiobridge_opus PRIVATE Opus::opus log)
+target_link_libraries(audiobridge_opus PRIVATE Opus::opus log dl)

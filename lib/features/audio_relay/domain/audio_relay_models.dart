@@ -178,8 +178,9 @@ enum OutputAudioBackend {
     return switch (this) {
       OutputAudioBackend.auto ||
       OutputAudioBackend.audioTrack ||
+      OutputAudioBackend.oboe ||
       OutputAudioBackend.wasapiShared => true,
-      OutputAudioBackend.oboe || OutputAudioBackend.wasapiExclusive => false,
+      OutputAudioBackend.wasapiExclusive => false,
     };
   }
 

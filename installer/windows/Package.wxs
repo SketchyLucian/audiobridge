@@ -1,5 +1,6 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
   <Package
       Name="$(var.ProductName)"
       Manufacturer="$(var.Manufacturer)"
@@ -23,7 +24,26 @@
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)" />
+      <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)">
+        <Component Id="FirewallRules" Guid="*">
+          <fw:FirewallException
+              Id="AudioBridgeFirewallUdp"
+              Name="$(var.ProductName)"
+              Description="Allow AudioBridge LAN audio relay and discovery traffic"
+              Program="[INSTALLFOLDER]$(var.ExecutableName)"
+              Protocol="udp"
+              Profile="all"
+              Scope="any"
+              IgnoreFailure="yes" />
+          <RegistryValue
+              Root="HKLM"
+              Key="Software\$(var.Manufacturer)\$(var.ProductName)"
+              Name="FirewallConfigured"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+        </Component>
+      </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
@@ -48,6 +68,7 @@
 
     <Feature Id="MainFeature" Title="$(var.ProductName)" Level="1">
       <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="FirewallRules" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
   </Package>

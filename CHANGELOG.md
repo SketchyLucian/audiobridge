@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.6.0 - 2026-11-23
+
+- Upgraded Windows WASAPI capture and playback to event-driven scheduling
+  (`AUDCLNT_STREAMFLAGS_EVENTCALLBACK` with automatic fallback) and active
+  1 ms timer resolution, eliminating 1 ms polling overhead and reducing jitter.
+- Rewrote the Windows packetizer to use a head-offset buffer and zero-allocation
+  codec encode buffers, synchronized profile updates across threads, and capped
+  diagnostic USB log files at 64 KB.
+- Added a Windows Sender capture output-device selector ("System default" or
+  any active Windows audio output, with live switching and device refresh) so
+  users can capture a specific device without changing the system default.
+- Implemented native Android AAudio playback (`OutputAudioBackend.oboe` on
+  Android 8.0+) with automatic AudioTrack fallback, plus Android `AudioFocus`
+  handling (ducking on notifications, muting during calls).
+- Enabled R8 code/resource shrinking and focused release ABIs (`arm64-v8a`,
+  `armeabi-v7a`) to cut Android release APK size significantly.
+- Registered an automatic Windows Firewall UDP rule in the MSI installer,
+  removed the duplicate `third_party/opus-1.6.1.tar.gz` archive (~10.5 MB),
+  scoped Flutter 450 ms telemetry rebuilds to live metric widgets, and modularized
+  the Windows codec and Flutter UI code.
+
 ## 1.5.0 - 2026-11-23
 
 - Open-sourced AudioBridge under the GNU General Public License v3.0 and moved
