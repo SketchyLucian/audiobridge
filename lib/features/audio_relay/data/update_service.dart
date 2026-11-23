@@ -31,7 +31,7 @@ class AppUpdateException implements Exception {
 class GitHubUpdateService implements AppUpdateService {
   GitHubUpdateService({
     this.owner = 'SketchyLucian',
-    this.repo = 'audiobridge-releases',
+    this.repo = 'audiobridge',
     HttpClient Function()? httpClientFactory,
     Directory? downloadDirectory,
   }) : _httpClientFactory = httpClientFactory ?? HttpClient.new,

@@ -725,7 +725,7 @@ class _SoundboardPanel extends StatelessWidget {
                     : null,
               ),
               if (controller.soundboardTarget ==
-                  SoundboardPlaybackTarget.micRoute)
+                  SoundboardPlaybackTarget.micRoute) ...[
                 ConstrainedBox(
                   constraints: const BoxConstraints(
                     minWidth: 260,
@@ -733,6 +733,21 @@ class _SoundboardPanel extends StatelessWidget {
                   ),
                   child: _CallMicrophonePicker(controller: controller),
                 ),
+                Tooltip(
+                  message: 'Refresh audio devices',
+                  child: IconButton.filledTonal(
+                    key: const ValueKey('refresh-soundboard-devices'),
+                    onPressed: controller.canRefreshSoundboardDevices
+                        ? controller.refreshSoundboardDevices
+                        : null,
+                    icon: Icon(
+                      controller.soundboardDevicesRefreshing
+                          ? Icons.hourglass_top_rounded
+                          : Icons.refresh_rounded,
+                    ),
+                  ),
+                ),
+              ],
               if (controller.soundboardTarget ==
                       SoundboardPlaybackTarget.micRoute &&
                   controller.soundboardOutputDevices.isEmpty)
@@ -743,12 +758,12 @@ class _SoundboardPanel extends StatelessWidget {
                   icon: Icon(
                     controller.soundboardSetupBusy
                         ? Icons.hourglass_top_rounded
-                        : Icons.settings_rounded,
+                        : Icons.open_in_new_rounded,
                   ),
                   label: Text(
                     controller.soundboardSetupBusy
-                        ? 'Opening setup'
-                        : 'Set up call mic',
+                        ? 'Opening page'
+                        : 'Get VB-CABLE',
                   ),
                 ),
             ],

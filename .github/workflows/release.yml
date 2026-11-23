@@ -86,7 +86,7 @@ jobs:
       - name: Publish complete public release
         shell: pwsh
         env:
-          GH_RELEASE_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
+          GH_RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
           if ($env:GITHUB_REF_NAME -ne "v$version") {
@@ -95,5 +95,4 @@ jobs:
           .\scripts\publish_github_release.ps1 `
             -Tag $env:GITHUB_REF_NAME `
             -WindowsMsi "build/installer/AudioBridge-$version-x64.msi" `
-            -AndroidApk "build/release/AudioBridge-$version-android.apk" `
-            -AndroidSigningKeyReset
+            -AndroidApk "build/release/AudioBridge-$version-android.apk"

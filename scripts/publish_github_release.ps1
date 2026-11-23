@@ -12,7 +12,7 @@ param(
 
     [string] $Owner = 'SketchyLucian',
 
-    [string] $Repository = 'audiobridge-releases',
+    [string] $Repository = 'audiobridge',
 
     [string] $Token = $env:GH_RELEASE_TOKEN,
 

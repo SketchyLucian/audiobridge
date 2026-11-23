@@ -123,33 +123,32 @@ The MSI is written to `build/installer/AudioBridge-<version>-x64.msi`.
 
 ## Publishing releases
 
-Public releases are published to the public GitHub
-`SketchyLucian/audiobridge-releases` repository. The source repository remains
-private. A release is kept as a draft unless both of these signed artifacts
-exist and pass validation:
+Public releases are published directly to the public GitHub
+`SketchyLucian/audiobridge` repository. A release is kept as a draft unless both
+of these signed artifacts exist and pass validation:
 
 - `AudioBridge-<version>-x64.msi`
 - `AudioBridge-<version>-android.apk`
 
 The tag-triggered release workflow builds both platforms and calls
-`scripts/publish_github_release.ps1`. Configure its Android signing secrets and
-the `RELEASE_REPO_TOKEN` GitHub Actions secret; missing credentials or either
-missing artifact fails the workflow without publishing a partial release.
+`scripts/publish_github_release.ps1` with GitHub Actions' `GITHUB_TOKEN`.
+Configure the Android signing secrets; missing credentials or either missing
+artifact fails the workflow without publishing a partial release.
 
 Android 1.4.6 starts a new signing-key lineage because the previous release key
 was unavailable. Users with an earlier Android version must uninstall it before
-installing 1.4.6. Later releases signed with the new key can update normally.
+installing 1.4.6 or newer. Releases from 1.4.6 onward signed with the new key
+can update normally.
 
-After a new interactive MSI installation, AudioBridge asks whether to install
-the bundled VB-CABLE driver when no supported virtual audio cable is present.
-VB-CABLE is third-party donationware from VB-Audio Software; the prompt links
-to its origin and licensing page. If accepted, Windows requests administrator
-approval, verifies the bundled vendor package and driver signatures, and runs
-the vendor installer. Reboot Windows before selecting `CABLE Input` in
-AudioBridge and `CABLE Output` in the call app.
+Windows audio streaming works directly with your normal speakers or headphones
+via WASAPI loopback and does not require a virtual audio cable.
 
-The same setup remains available from the Soundboard's `Set up call mic`
-button and the `AudioBridge Virtual Mic Setup` Start menu shortcut.
+If you want to send Soundboard clips into a call app microphone on Windows,
+install a third-party virtual cable driver such as VB-CABLE (donationware from
+VB-Audio Software) or Voicemeeter directly from its vendor website. The
+Soundboard's `Get VB-CABLE` button opens the official VB-CABLE page when no
+virtual cable is detected. After installing and rebooting, select `CABLE Input`
+in AudioBridge and `CABLE Output` as the microphone in your call app.
 
 For USB tethering, enable USB tethering on Android, keep the device attached,
 and select `USB tether` in both apps. The sender and receiver still use UDP
@@ -242,3 +241,10 @@ Remaining production work:
 - Native encoders/decoders for FLAC, MP3, Vorbis, ALAC, and LC3.
 - Android audio focus handling.
 - Windows firewall guidance and explicit output-device selection.
+
+## License
+
+AudioBridge is open-source software licensed under the
+[GNU General Public License v3.0](LICENSE). Third-party components retain their
+original licenses (including Opus under the BSD 3-Clause license in
+`third_party/opus-1.6.1/COPYING`).

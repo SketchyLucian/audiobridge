@@ -104,6 +104,88 @@ std::wstring Widen(const std::string& value) {
   return output;
 }
 
+bool FileExistsUtf8(const std::string& path) {
+  const std::wstring wide_path = Widen(path);
+  if (wide_path.empty()) {
+    return false;
+  }
+  const DWORD attributes = GetFileAttributesW(wide_path.c_str());
+  return attributes != INVALID_FILE_ATTRIBUTES &&
+         (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+class DefaultRenderDeviceWatcher final : public IMMNotificationClient {
+ public:
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void** object) override {
+    if (object == nullptr) {
+      return E_POINTER;
+    }
+    if (riid == __uuidof(IUnknown) ||
+        riid == __uuidof(IMMNotificationClient)) {
+      *object = static_cast<IMMNotificationClient*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *object = nullptr;
+    return E_NOINTERFACE;
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return ++reference_count_;
+  }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG count = --reference_count_;
+    if (count == 0) {
+      delete this;
+    }
+    return count;
+  }
+
+  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR,
+                                                 DWORD new_state) override {
+    if (new_state != DEVICE_STATE_ACTIVE) {
+      changed_.store(true);
+    }
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override {
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override {
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow,
+                                                   ERole role,
+                                                   LPCWSTR) override {
+    if (flow == eRender && role == eConsole) {
+      changed_.store(true);
+    }
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR,
+                                                   const PROPERTYKEY) override {
+    return S_OK;
+  }
+
+  void ResetChanged() {
+    changed_.store(false);
+  }
+
+  bool TakeChanged() {
+    return changed_.exchange(false);
+  }
+
+ private:
+  std::atomic<ULONG> reference_count_ = 1;
+  std::atomic_bool changed_ = false;
+};
+
 std::string GuidToString(const GUID& guid) {
   wchar_t buffer[64] = {};
   if (StringFromGUID2(guid, buffer,
@@ -2438,6 +2520,12 @@ class WindowsAudioEngine::Impl {
       if (playback_running_) {
         return std::nullopt;
       }
+      if (playback_receive_thread_.joinable()) {
+        playback_receive_thread_.join();
+      }
+      if (playback_render_thread_.joinable()) {
+        playback_render_thread_.join();
+      }
       ResetLocalAdaptivePlayback(profile_.sample_rate);
       playback_running_ = true;
       playback_receive_thread_ = std::thread(&Impl::PlaybackReceiveLoop, this);
@@ -2457,6 +2545,12 @@ class WindowsAudioEngine::Impl {
       }
       if (playback_running_) {
         return std::nullopt;
+      }
+      if (playback_receive_thread_.joinable()) {
+        playback_receive_thread_.join();
+      }
+      if (playback_render_thread_.joinable()) {
+        playback_render_thread_.join();
       }
       ResetLocalAdaptivePlayback(profile_.sample_rate);
       playback_running_ = true;
@@ -2481,6 +2575,9 @@ class WindowsAudioEngine::Impl {
 
     if (capture_running_) {
       return std::nullopt;
+    }
+    if (capture_thread_.joinable()) {
+      capture_thread_.join();
     }
 
     capture_running_ = true;
@@ -2568,6 +2665,9 @@ class WindowsAudioEngine::Impl {
     const std::string path = ReadString(map, "path", "");
     if (path.empty()) {
       return "Choose a sound file first.";
+    }
+    if (!FileExistsUtf8(path)) {
+      return "The selected sound file could not be found.";
     }
 
     const std::string target = ReadString(map, "target", "stream");
@@ -3060,6 +3160,9 @@ class WindowsAudioEngine::Impl {
     const double gain = std::clamp(ReadDouble(map, "volume", 1.0), 0.0, 1.0);
     if (path.empty()) {
       return "Choose a sound file first.";
+    }
+    if (!FileExistsUtf8(path)) {
+      return "The selected sound file could not be found.";
     }
 
     const auto format = SoundboardOutputFormatForDevice(device_id);
@@ -4446,104 +4549,119 @@ class WindowsAudioEngine::Impl {
       return;
     }
 
-    Microsoft::WRL::ComPtr<IMMDevice> device;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    if (FAILED(hr)) {
-      FinishCom(owns_com);
-      capture_running_ = false;
-      return;
-    }
-
-    Microsoft::WRL::ComPtr<IAudioClient> audio_client;
-    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                          reinterpret_cast<void**>(audio_client.GetAddressOf()));
-    if (FAILED(hr)) {
-      FinishCom(owns_com);
-      capture_running_ = false;
-      return;
-    }
-
-    WAVEFORMATEX* raw_mix_format = nullptr;
-    hr = audio_client->GetMixFormat(&raw_mix_format);
-    if (FAILED(hr) || raw_mix_format == nullptr) {
-      FinishCom(owns_com);
-      capture_running_ = false;
-      return;
-    }
-
-    const size_t mix_format_size = sizeof(WAVEFORMATEX) + raw_mix_format->cbSize;
-    std::vector<BYTE> mix_format_storage(mix_format_size);
-    std::memcpy(mix_format_storage.data(), raw_mix_format, mix_format_size);
-    const auto* mix_format =
-        reinterpret_cast<const WAVEFORMATEX*>(mix_format_storage.data());
-    CoTaskMemFree(raw_mix_format);
-
-    const int min_capture_buffer_ms =
-        transport_mode_ == TransportMode::kUsb ? 5 : 10;
-    const REFERENCE_TIME buffer_duration =
-        10000000LL *
-        std::max(min_capture_buffer_ms, profile_.capture_buffer_ms) / 1000;
-    hr = audio_client->Initialize(
-        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, buffer_duration,
-        0, mix_format, nullptr);
-    if (FAILED(hr)) {
-      FinishCom(owns_com);
-      capture_running_ = false;
-      return;
-    }
-
-    Microsoft::WRL::ComPtr<IAudioCaptureClient> capture_client;
-    hr = audio_client->GetService(IID_PPV_ARGS(&capture_client));
-    if (FAILED(hr)) {
-      FinishCom(owns_com);
-      capture_running_ = false;
-      return;
-    }
+    Microsoft::WRL::ComPtr<DefaultRenderDeviceWatcher> watcher;
+    watcher.Attach(new DefaultRenderDeviceWatcher());
+    const bool watcher_registered = SUCCEEDED(
+        enumerator->RegisterEndpointNotificationCallback(watcher.Get()));
 
     DWORD task_index = 0;
     HANDLE task_handle = AvSetMmThreadCharacteristics(L"Pro Audio", &task_index);
     if (task_handle != nullptr) {
       AvSetMmThreadPriority(task_handle, AVRT_PRIORITY_CRITICAL);
     }
-    audio_client->Start();
 
     while (capture_running_) {
-      UINT32 packet_frames = 0;
-      hr = capture_client->GetNextPacketSize(&packet_frames);
-      if (FAILED(hr)) {
-        break;
-      }
+      watcher->ResetChanged();
 
-      if (packet_frames == 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      Microsoft::WRL::ComPtr<IMMDevice> device;
+      hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+      if (FAILED(hr) || !device) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
       }
 
-      BYTE* data = nullptr;
-      UINT32 frames_available = 0;
-      DWORD flags = 0;
-      hr = capture_client->GetBuffer(&data, &frames_available, &flags, nullptr,
-                                     nullptr);
+      Microsoft::WRL::ComPtr<IAudioClient> audio_client;
+      hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                            reinterpret_cast<void**>(audio_client.GetAddressOf()));
       if (FAILED(hr)) {
-        break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
       }
 
-      const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-      const auto captured_pcm =
-          ConvertToPcm16(data, frames_available, *mix_format, silent,
-                         volume_.load(), muted_.load());
-      const int output_sample_rate = OutputSampleRateForProfile();
-      const int output_channels = std::clamp(profile_.channels, 1, 2);
-      auto output_pcm = ReformatPcmForProfile(
-          captured_pcm, mix_format->nSamplesPerSec, mix_format->nChannels);
-      MixSoundEffects(&output_pcm, output_sample_rate, output_channels);
-      SendPcm(output_pcm, output_sample_rate, output_channels);
-      capture_client->ReleaseBuffer(frames_available);
+      WAVEFORMATEX* raw_mix_format = nullptr;
+      hr = audio_client->GetMixFormat(&raw_mix_format);
+      if (FAILED(hr) || raw_mix_format == nullptr) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      const size_t mix_format_size =
+          sizeof(WAVEFORMATEX) + raw_mix_format->cbSize;
+      std::vector<BYTE> mix_format_storage(mix_format_size);
+      std::memcpy(mix_format_storage.data(), raw_mix_format, mix_format_size);
+      const auto* mix_format =
+          reinterpret_cast<const WAVEFORMATEX*>(mix_format_storage.data());
+      CoTaskMemFree(raw_mix_format);
+
+      const int min_capture_buffer_ms =
+          transport_mode_ == TransportMode::kUsb ? 5 : 10;
+      const REFERENCE_TIME buffer_duration =
+          10000000LL *
+          std::max(min_capture_buffer_ms, profile_.capture_buffer_ms) / 1000;
+      hr = audio_client->Initialize(
+          AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+          buffer_duration, 0, mix_format, nullptr);
+      if (FAILED(hr)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      Microsoft::WRL::ComPtr<IAudioCaptureClient> capture_client;
+      hr = audio_client->GetService(IID_PPV_ARGS(&capture_client));
+      if (FAILED(hr)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      resampler_initialized_ = false;
+      ResetPacketizer();
+      audio_client->Start();
+
+      while (capture_running_ && !watcher->TakeChanged()) {
+        UINT32 packet_frames = 0;
+        hr = capture_client->GetNextPacketSize(&packet_frames);
+        if (FAILED(hr)) {
+          break;
+        }
+
+        if (packet_frames == 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
+
+        BYTE* data = nullptr;
+        UINT32 frames_available = 0;
+        DWORD flags = 0;
+        hr = capture_client->GetBuffer(&data, &frames_available, &flags,
+                                       nullptr, nullptr);
+        if (FAILED(hr)) {
+          break;
+        }
+
+        const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+        const auto captured_pcm =
+            ConvertToPcm16(data, frames_available, *mix_format, silent,
+                           volume_.load(), muted_.load());
+        const int output_sample_rate = OutputSampleRateForProfile();
+        const int output_channels = std::clamp(profile_.channels, 1, 2);
+        auto output_pcm = ReformatPcmForProfile(
+            captured_pcm, mix_format->nSamplesPerSec, mix_format->nChannels);
+        MixSoundEffects(&output_pcm, output_sample_rate, output_channels);
+        SendPcm(output_pcm, output_sample_rate, output_channels);
+        capture_client->ReleaseBuffer(frames_available);
+      }
+
+      audio_client->Stop();
+      if (capture_running_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
     }
 
-    audio_client->Stop();
     if (task_handle != nullptr) {
       AvRevertMmThreadCharacteristics(task_handle);
+    }
+    if (watcher_registered) {
+      enumerator->UnregisterEndpointNotificationCallback(watcher.Get());
     }
     FinishCom(owns_com);
     capture_running_ = false;
@@ -5311,65 +5429,10 @@ class WindowsAudioEngine::Impl {
       return;
     }
 
-    Microsoft::WRL::ComPtr<IMMDevice> device;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    if (FAILED(hr)) {
-      FinishCom(owns_com);
-      playback_running_ = false;
-      return;
-    }
-
-    Microsoft::WRL::ComPtr<IAudioClient> audio_client;
-    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                          reinterpret_cast<void**>(audio_client.GetAddressOf()));
-    if (FAILED(hr)) {
-      FinishCom(owns_com);
-      playback_running_ = false;
-      return;
-    }
-
-    WAVEFORMATEX* raw_mix_format = nullptr;
-    hr = audio_client->GetMixFormat(&raw_mix_format);
-    if (FAILED(hr) || raw_mix_format == nullptr) {
-      FinishCom(owns_com);
-      playback_running_ = false;
-      return;
-    }
-
-    const size_t mix_format_size = sizeof(WAVEFORMATEX) + raw_mix_format->cbSize;
-    std::vector<BYTE> mix_format_storage(mix_format_size);
-    std::memcpy(mix_format_storage.data(), raw_mix_format, mix_format_size);
-    const auto* mix_format =
-        reinterpret_cast<const WAVEFORMATEX*>(mix_format_storage.data());
-    CoTaskMemFree(raw_mix_format);
-
-    const REFERENCE_TIME buffer_duration =
-        10000000LL *
-        std::clamp(profile_.playback_buffer_ms, kMinBufferMs, kMaxBufferMs) /
-        1000;
-    hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
-                                  buffer_duration, 0, mix_format, nullptr);
-    if (FAILED(hr)) {
-      FinishCom(owns_com);
-      playback_running_ = false;
-      return;
-    }
-
-    UINT32 buffer_frames = 0;
-    audio_client->GetBufferSize(&buffer_frames);
-    local_buffer_size_frames_ = buffer_frames;
-    local_output_sample_rate_ = mix_format->nSamplesPerSec;
-    SetLocalAdaptivePlaybackBufferMs(
-        mix_format->nSamplesPerSec,
-        static_cast<int>(local_adaptive_playback_buffer_ms_.load()));
-
-    Microsoft::WRL::ComPtr<IAudioRenderClient> render_client;
-    hr = audio_client->GetService(IID_PPV_ARGS(&render_client));
-    if (FAILED(hr)) {
-      FinishCom(owns_com);
-      playback_running_ = false;
-      return;
-    }
+    Microsoft::WRL::ComPtr<DefaultRenderDeviceWatcher> watcher;
+    watcher.Attach(new DefaultRenderDeviceWatcher());
+    const bool watcher_registered = SUCCEEDED(
+        enumerator->RegisterEndpointNotificationCallback(watcher.Get()));
 
     DWORD task_index = 0;
     HANDLE task_handle = AvSetMmThreadCharacteristics(L"Pro Audio", &task_index);
@@ -5377,69 +5440,145 @@ class WindowsAudioEngine::Impl {
       AvSetMmThreadPriority(task_handle, AVRT_PRIORITY_CRITICAL);
     }
 
-    bool render_started = false;
-    bool needs_prebuffer = true;
     while (playback_running_) {
-      PcmPlaybackPacket packet;
-      {
-        std::unique_lock lock(playback_queue_mutex_);
-        playback_queue_cv_.wait_for(lock, std::chrono::milliseconds(20), [this, needs_prebuffer] {
+      watcher->ResetChanged();
+
+      Microsoft::WRL::ComPtr<IMMDevice> device;
+      hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+      if (FAILED(hr) || !device) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      Microsoft::WRL::ComPtr<IAudioClient> audio_client;
+      hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                            reinterpret_cast<void**>(audio_client.GetAddressOf()));
+      if (FAILED(hr)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      WAVEFORMATEX* raw_mix_format = nullptr;
+      hr = audio_client->GetMixFormat(&raw_mix_format);
+      if (FAILED(hr) || raw_mix_format == nullptr) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      const size_t mix_format_size =
+          sizeof(WAVEFORMATEX) + raw_mix_format->cbSize;
+      std::vector<BYTE> mix_format_storage(mix_format_size);
+      std::memcpy(mix_format_storage.data(), raw_mix_format, mix_format_size);
+      const auto* mix_format =
+          reinterpret_cast<const WAVEFORMATEX*>(mix_format_storage.data());
+      CoTaskMemFree(raw_mix_format);
+
+      const REFERENCE_TIME buffer_duration =
+          10000000LL *
+          std::clamp(profile_.playback_buffer_ms, kMinBufferMs, kMaxBufferMs) /
+          1000;
+      hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0,
+                                    buffer_duration, 0, mix_format, nullptr);
+      if (FAILED(hr)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      UINT32 buffer_frames = 0;
+      audio_client->GetBufferSize(&buffer_frames);
+      local_buffer_size_frames_ = buffer_frames;
+      local_output_sample_rate_ = mix_format->nSamplesPerSec;
+      SetLocalAdaptivePlaybackBufferMs(
+          mix_format->nSamplesPerSec,
+          static_cast<int>(local_adaptive_playback_buffer_ms_.load()));
+
+      Microsoft::WRL::ComPtr<IAudioRenderClient> render_client;
+      hr = audio_client->GetService(IID_PPV_ARGS(&render_client));
+      if (FAILED(hr)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+
+      bool render_started = false;
+      bool needs_prebuffer = true;
+      while (playback_running_ && !watcher->TakeChanged()) {
+        PcmPlaybackPacket packet;
+        {
+          std::unique_lock lock(playback_queue_mutex_);
+          playback_queue_cv_.wait_for(
+              lock, std::chrono::milliseconds(20),
+              [this, needs_prebuffer] {
+                if (!playback_running_) {
+                  return true;
+                }
+                if (needs_prebuffer) {
+                  return playback_queue_frames_.load() >=
+                         local_target_buffer_frames_.load();
+                }
+                return !playback_queue_.empty();
+              });
           if (!playback_running_) {
-            return true;
+            break;
           }
-          if (needs_prebuffer) {
-            return playback_queue_frames_.load() >=
-                   local_target_buffer_frames_.load();
+          if (needs_prebuffer &&
+              playback_queue_frames_.load() <
+                  local_target_buffer_frames_.load()) {
+            continue;
           }
-          return !playback_queue_.empty();
-        });
-        if (!playback_running_) {
+          needs_prebuffer = false;
+          if (playback_queue_.empty()) {
+            ++local_underrun_count_;
+            needs_prebuffer = true;
+            continue;
+          }
+          packet = std::move(playback_queue_.front());
+          playback_queue_.pop_front();
+        }
+
+        const auto output = ReformatPcm(packet.pcm, packet.sample_rate,
+                                        packet.channels,
+                                        mix_format->nSamplesPerSec,
+                                        mix_format->nChannels);
+        if (!render_started) {
+          audio_client->Start();
+          render_started = true;
+          local_render_started_ = true;
+          local_render_started_at_ms_ = NowMillis();
+          local_last_known_underrun_count_ = local_underrun_count_.load();
+        }
+        const bool wrote =
+            WriteRenderPcm(render_client.Get(), audio_client.Get(),
+                           buffer_frames, *mix_format, output,
+                           playback_running_);
+        playback_queue_frames_ -=
+            static_cast<int64_t>(packet.pcm.size()) /
+            std::max(1, packet.channels);
+        if (!wrote) {
           break;
         }
-        if (needs_prebuffer &&
-            playback_queue_frames_.load() < local_target_buffer_frames_.load()) {
-          continue;
-        }
-        needs_prebuffer = false;
-        if (playback_queue_.empty()) {
-          ++local_underrun_count_;
-          needs_prebuffer = true;
-          continue;
-        }
-        packet = std::move(playback_queue_.front());
-        playback_queue_.pop_front();
       }
 
-      const auto output = ReformatPcm(packet.pcm, packet.sample_rate,
-                                      packet.channels,
-                                      mix_format->nSamplesPerSec,
-                                      mix_format->nChannels);
-      if (!render_started) {
-        audio_client->Start();
-        render_started = true;
-        local_render_started_ = true;
-        local_render_started_at_ms_ = NowMillis();
-        local_last_known_underrun_count_ = local_underrun_count_.load();
+      if (render_started) {
+        audio_client->Stop();
       }
-      WriteRenderPcm(render_client.Get(), audio_client.Get(), buffer_frames,
-                     *mix_format, output, playback_running_);
-      playback_queue_frames_ -=
-          static_cast<int64_t>(packet.pcm.size()) / std::max(1, packet.channels);
+      local_render_started_ = false;
+      local_render_started_at_ms_ = 0;
+      if (playback_running_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
     }
 
-    if (render_started) {
-      audio_client->Stop();
-    }
-    local_render_started_ = false;
-    local_render_started_at_ms_ = 0;
     if (task_handle != nullptr) {
       AvRevertMmThreadCharacteristics(task_handle);
+    }
+    if (watcher_registered) {
+      enumerator->UnregisterEndpointNotificationCallback(watcher.Get());
     }
     FinishCom(owns_com);
     playback_running_ = false;
   }
 
-  void WriteRenderPcm(IAudioRenderClient* render_client,
+  bool WriteRenderPcm(IAudioRenderClient* render_client,
                       IAudioClient* audio_client,
                       UINT32 buffer_frames,
                       const WAVEFORMATEX& format,
@@ -5452,7 +5591,7 @@ class WindowsAudioEngine::Impl {
     while (running && offset_frames < total_frames) {
       UINT32 padding = 0;
       if (FAILED(audio_client->GetCurrentPadding(&padding))) {
-        return;
+        return false;
       }
       const UINT32 available = buffer_frames > padding ? buffer_frames - padding : 0;
       if (available == 0) {
@@ -5464,14 +5603,17 @@ class WindowsAudioEngine::Impl {
           available, total_frames - offset_frames));
       BYTE* output = nullptr;
       if (FAILED(render_client->GetBuffer(frames_to_write, &output))) {
-        return;
+        return false;
       }
       WritePcmToMixBuffer(pcm.data() + offset_frames * channels,
                           frames_to_write, format, output,
                           apply_output_volume);
-      render_client->ReleaseBuffer(frames_to_write, 0);
+      if (FAILED(render_client->ReleaseBuffer(frames_to_write, 0))) {
+        return false;
+      }
       offset_frames += frames_to_write;
     }
+    return true;
   }
 
   void WritePcmToMixBuffer(const int16_t* pcm, UINT32 frames,

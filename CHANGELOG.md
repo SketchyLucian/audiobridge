@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0 - 2026-11-23
+
+- Open-sourced AudioBridge under the GNU General Public License v3.0 and moved
+  public releases and in-app update checks directly to `SketchyLucian/audiobridge`.
+- Unbundled the third-party VB-CABLE installer from the Windows MSI and replaced
+  the post-install prompt with a direct link to VB-Audio's download page for
+  optional Soundboard call-mic routing.
+- Automatically followed Windows default audio output device changes and
+  recovered from invalidated endpoints in both loopback capture and receiver
+  playback, preventing silent stalls and reconnect crashes.
+- Added a Soundboard audio-device refresh button, clearer missing-file errors,
+  and reset the physical microphone bridge toggle when stopping.
+
 ## 1.4.10 - 2026-08-14
 
 - Rolled back the 1.4.9 playback drift correction because its packet-level

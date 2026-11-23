@@ -2,8 +2,8 @@ Name:           audiobridge
 Version:        %{_app_version}
 Release:        1
 Summary:        Wi-Fi LAN audio relay
-License:        Proprietary
-URL:            https://github.com/SketchyLucian/audiobridge-releases
+License:        GPL-3.0-or-later
+URL:            https://github.com/SketchyLucian/audiobridge
 BuildArch:      x86_64
 Requires:       alsa-lib
 

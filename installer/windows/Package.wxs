@@ -34,12 +34,6 @@
               Name="$(var.ProductName)"
               Target="[INSTALLFOLDER]$(var.ExecutableName)"
               WorkingDirectory="INSTALLFOLDER" />
-          <Shortcut
-              Id="VirtualMicSetupShortcut"
-              Name="$(var.ProductName) Virtual Mic Setup"
-              Target="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
-              Arguments="-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]VirtualMic\setup_windows_virtual_mic.ps1&quot; -PromptInstallDriver"
-              WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
           <RegistryValue
               Root="HKCU"
@@ -56,21 +50,6 @@
       <ComponentGroupRef Id="ApplicationFiles" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
-
-    <CustomAction
-        Id="PromptVirtualMicSetupAfterInstall"
-        Directory="System64Folder"
-        ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]VirtualMic\setup_windows_virtual_mic.ps1&quot; -PromptInstallDriver"
-        Execute="immediate"
-        Impersonate="yes"
-        Return="asyncNoWait" />
-
-    <InstallExecuteSequence>
-      <Custom
-          Action="PromptVirtualMicSetupAfterInstall"
-          After="InstallFinalize"
-          Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED AND UILevel &gt;= 4" />
-    </InstallExecuteSequence>
   </Package>
 
   <Fragment>

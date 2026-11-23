@@ -121,6 +121,7 @@ class AudioRelayController extends ChangeNotifier {
   bool soundboardBusy = false;
   bool soundboardMicBridgeEnabled = false;
   bool soundboardSetupBusy = false;
+  bool soundboardDevicesRefreshing = false;
   String? soundboardMessage;
   String appVersion = _fallbackAppVersion;
   AppUpdateStatus updateStatus = AppUpdateStatus.idle;
@@ -185,7 +186,7 @@ class AudioRelayController extends ChangeNotifier {
     Duration(minutes: 10),
     Duration(minutes: 30),
   ];
-  static const _fallbackAppVersion = '1.4.8';
+  static const _fallbackAppVersion = '1.5.0';
   static const _sampleRateOptions = [44100, 48000, 96000];
   static const _lowLatencyAutoCodecPreference = [
     AudioCodec.opus,
@@ -411,7 +412,7 @@ class AudioRelayController extends ChangeNotifier {
         soundboardOutputDevices.isNotEmpty) {
       return null;
     }
-    return 'A Windows virtual microphone driver is required. Set up the call mic, then select it in the call app.';
+    return 'Optional: install a virtual audio cable (such as VB-CABLE) only if you want soundboard clips in a call app microphone.';
   }
 
   bool get canSetUpSoundboardCallMicrophone {
@@ -419,6 +420,10 @@ class AudioRelayController extends ChangeNotifier {
         capabilities.platform == 'windows' &&
         soundboardOutputDevices.isEmpty &&
         !soundboardSetupBusy;
+  }
+
+  bool get canRefreshSoundboardDevices {
+    return canUseSoundboard && !soundboardDevicesRefreshing;
   }
 
   bool get isNativeUsbTransport => transport == RelayTransport.usb;
@@ -1233,6 +1238,7 @@ class AudioRelayController extends ChangeNotifier {
     _cancelSourcePrune();
     _cancelPendingProfileApply();
     await _engine.disconnect();
+    soundboardMicBridgeEnabled = false;
     _virtualMicPassthroughEnabled = false;
     _virtualMicPassthroughOutputDeviceId = null;
     await _discoveryService.dispose();
@@ -1726,21 +1732,49 @@ class AudioRelayController extends ChangeNotifier {
     await playSelectedSoundboardItem();
   }
 
+  Future<void> refreshSoundboardDevices() async {
+    if (!canRefreshSoundboardDevices) {
+      return;
+    }
+
+    soundboardDevicesRefreshing = true;
+    notifyListeners();
+    try {
+      final refreshedCapabilities = await _engine.getCapabilities();
+      if (_isDisposed) {
+        return;
+      }
+      capabilities = refreshedCapabilities;
+      _selectDefaultSoundboardOutputDevice();
+      if (selectedSoundboardOutputDevice == null) {
+        soundboardMicBridgeEnabled = false;
+      }
+      _syncVirtualMicPassthrough();
+      soundboardMessage = soundboardOutputDevices.isEmpty
+          ? 'No virtual cable detected.'
+          : 'Audio devices refreshed.';
+      _schedulePreferencesSave();
+    } finally {
+      soundboardDevicesRefreshing = false;
+      notifyListeners();
+    }
+  }
+
   Future<void> setUpSoundboardCallMicrophone() async {
     if (!canSetUpSoundboardCallMicrophone) {
       return;
     }
 
     soundboardSetupBusy = true;
-    soundboardMessage = 'Opening call microphone setup';
+    soundboardMessage = 'Opening VB-CABLE download page';
     notifyListeners();
     try {
       await _engine.launchVirtualMicSetup();
       soundboardMessage =
-          'Setup opened. Install the driver, reboot Windows, then reopen AudioBridge.';
+          'Opened VB-CABLE download page. Install it, reboot Windows, then refresh devices.';
     } on PlatformException catch (error) {
       soundboardMessage =
-          error.message ?? 'Unable to open call microphone setup.';
+          error.message ?? 'Unable to open the VB-CABLE download page.';
     } finally {
       soundboardSetupBusy = false;
       notifyListeners();

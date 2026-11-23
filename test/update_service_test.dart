@@ -10,19 +10,19 @@ void main() {
       'tag_name': 'v1.0.5',
       'name': 'v1.0.5',
       'html_url':
-          'https://github.com/SketchyLucian/audiobridge-releases/releases/tag/v1.0.5',
+          'https://github.com/SketchyLucian/audiobridge/releases/tag/v1.0.5',
       'assets': [
         {
           'name': 'AudioBridge-1.0.5-x64.msi',
           'size': 100,
           'browser_download_url':
-              'https://github.com/SketchyLucian/audiobridge-releases/releases/download/v1.0.5/AudioBridge-1.0.5-x64.msi',
+              'https://github.com/SketchyLucian/audiobridge/releases/download/v1.0.5/AudioBridge-1.0.5-x64.msi',
         },
         {
           'name': 'AudioBridge-1.0.5-android.apk',
           'size': 100,
           'browser_download_url':
-              'https://github.com/SketchyLucian/audiobridge-releases/releases/download/v1.0.5/AudioBridge-1.0.5-android.apk',
+              'https://github.com/SketchyLucian/audiobridge/releases/download/v1.0.5/AudioBridge-1.0.5-android.apk',
         },
       ],
     }, target: AppUpdateTarget.android);
@@ -39,19 +39,19 @@ void main() {
       'tag_name': 'v1.0.5',
       'name': 'v1.0.5',
       'html_url':
-          'https://github.com/SketchyLucian/audiobridge-releases/releases/tag/v1.0.5',
+          'https://github.com/SketchyLucian/audiobridge/releases/tag/v1.0.5',
       'assets': [
         {
           'name': 'AudioBridge-1.0.5-x64.msi',
           'size': 100,
           'browser_download_url':
-              'https://github.com/SketchyLucian/audiobridge-releases/releases/download/v1.0.5/AudioBridge-1.0.5-x64.msi',
+              'https://github.com/SketchyLucian/audiobridge/releases/download/v1.0.5/AudioBridge-1.0.5-x64.msi',
         },
         {
           'name': 'AudioBridge-1.0.5-android.apk',
           'size': 100,
           'browser_download_url':
-              'https://github.com/SketchyLucian/audiobridge-releases/releases/download/v1.0.5/AudioBridge-1.0.5-android.apk',
+              'https://github.com/SketchyLucian/audiobridge/releases/download/v1.0.5/AudioBridge-1.0.5-android.apk',
         },
       ],
     }, target: AppUpdateTarget.windows);
@@ -68,7 +68,7 @@ void main() {
         'tag_name': 'v1.0.5',
         'name': 'v1.0.5',
         'html_url':
-            'https://github.com/SketchyLucian/audiobridge-releases/releases/tag/v1.0.5',
+            'https://github.com/SketchyLucian/audiobridge/releases/tag/v1.0.5',
         'assets': [
           {
             'name': 'AudioBridge-1.0.5-android.apk',
@@ -82,7 +82,7 @@ void main() {
     );
   });
 
-  test('GitHub release parser rejects the private source repository', () {
+  test('GitHub release parser rejects another GitHub repository', () {
     final service = GitHubUpdateService();
 
     expect(
@@ -90,7 +90,7 @@ void main() {
         'tag_name': 'v1.0.5',
         'name': 'v1.0.5',
         'html_url':
-            'https://github.com/SketchyLucian/audiobridge/releases/tag/v1.0.5',
+            'https://github.com/SketchyLucian/audiobridge-releases/releases/tag/v1.0.5',
         'assets': const [],
       }, target: AppUpdateTarget.windows),
       throwsA(isA<AppUpdateException>()),
@@ -118,7 +118,7 @@ void main() {
       'tag_name': 'v1.0.5-preview',
       'name': 'Preview',
       'html_url':
-          'https://github.com/SketchyLucian/audiobridge-releases/releases/tag/v1.0.5-preview',
+          'https://github.com/SketchyLucian/audiobridge/releases/tag/v1.0.5-preview',
       'assets': const [],
     }, target: AppUpdateTarget.android);
 

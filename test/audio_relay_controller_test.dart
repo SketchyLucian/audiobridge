@@ -2028,7 +2028,7 @@ void main() {
     controller.dispose();
   });
 
-  test('soundboard opens bundled call microphone setup', () async {
+  test('soundboard opens VB-CABLE download page when no cable is found', () async {
     final engine = _FakeAudioRelayEngine();
     final controller = AudioRelayController(engine: engine)
       ..role = RelayRole.sender
@@ -2041,9 +2041,58 @@ void main() {
     expect(engine.calls, ['launchVirtualMicSetup']);
     expect(
       controller.soundboardMessage,
-      'Setup opened. Install the driver, reboot Windows, then reopen AudioBridge.',
+      'Opened VB-CABLE download page. Install it, reboot Windows, then refresh devices.',
     );
     expect(controller.soundboardSetupBusy, false);
+
+    controller.dispose();
+  });
+
+  test('soundboard refreshes audio devices without restarting the app', () async {
+    final engine = _FakeAudioRelayEngine(
+      capabilities: _soundboardPhysicalOnlyCapabilities,
+    );
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..capabilities = _soundboardPhysicalOnlyCapabilities;
+
+    expect(controller.soundboardOutputDevices, isEmpty);
+
+    engine.capabilities = _soundboardCapabilities;
+    await controller.refreshSoundboardDevices();
+
+    expect(controller.soundboardOutputDevices, hasLength(1));
+    expect(controller.selectedSoundboardOutputDevice?.id, 'route-1');
+    expect(controller.soundboardMessage, 'Audio devices refreshed.');
+    expect(controller.soundboardDevicesRefreshing, false);
+
+    controller.updateSoundboardMicBridgeEnabled(true);
+    expect(controller.soundboardMicBridgeEnabled, true);
+
+    engine.capabilities = _soundboardPhysicalOnlyCapabilities;
+    await controller.refreshSoundboardDevices();
+
+    expect(controller.soundboardOutputDevices, isEmpty);
+    expect(controller.selectedSoundboardOutputDevice, isNull);
+    expect(controller.soundboardMicBridgeEnabled, false);
+    expect(controller.soundboardMessage, 'No virtual cable detected.');
+
+    controller.dispose();
+  });
+
+  test('stopAll resets physical microphone bridge toggle', () async {
+    final engine = _FakeAudioRelayEngine();
+    final controller = AudioRelayController(engine: engine)
+      ..role = RelayRole.sender
+      ..capabilities = _soundboardCapabilities;
+
+    controller.selectSoundboardOutputDevice('route-1');
+    controller.updateSoundboardMicBridgeEnabled(true);
+    expect(controller.soundboardMicBridgeEnabled, true);
+
+    await controller.stopAll();
+
+    expect(controller.soundboardMicBridgeEnabled, false);
 
     controller.dispose();
   });
@@ -3006,9 +3055,10 @@ void main() {
     ).readAsStringSync();
 
     expect(releaseWorkflow, contains('publish_github_release.ps1'));
-    expect(releaseWorkflow, contains('-AndroidSigningKeyReset'));
+    expect(releaseWorkflow, contains('secrets.GITHUB_TOKEN'));
     expect(releaseWorkflow, contains('AudioBridge-\$version-x64.msi'));
     expect(releaseWorkflow, contains('AudioBridge-\$version-android.apk'));
+    expect(publisher, contains("Repository = 'audiobridge'"));
     expect(publisher, contains('ExpectedName \$expectedMsiName'));
     expect(publisher, contains('ExpectedName \$expectedApkName'));
     expect(publisher, contains("draft = \$true"));
@@ -3169,12 +3219,12 @@ AppUpdateRelease _updateRelease({
     tagName: tagName,
     version: tagName.replaceFirst('v', ''),
     pageUrl: Uri.parse(
-      'https://github.com/SketchyLucian/audiobridge-releases/releases/tag/$tagName',
+      'https://github.com/SketchyLucian/audiobridge/releases/tag/$tagName',
     ),
     asset: AppUpdateAsset(
       name: assetName,
       downloadUrl: Uri.parse(
-        'https://github.com/SketchyLucian/audiobridge-releases/releases/download/$tagName/$assetName',
+        'https://github.com/SketchyLucian/audiobridge/releases/download/$tagName/$assetName',
       ),
       sizeBytes: 3,
       target: target,
@@ -3197,7 +3247,7 @@ class _FakeAudioRelayEngine implements AudioRelayEngine {
 
   final PlatformException? prepareUsbError;
   final PlatformException? virtualMicSetupError;
-  final PlatformAudioCapabilities capabilities;
+  PlatformAudioCapabilities capabilities;
   final Completer<void>? capabilitiesGate;
   final List<String> calls = [];
   final List<AudioProfile> profiles = [];
